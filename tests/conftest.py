@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 import torch
 
+from magic_torch.precision import DEVICE, DTYPE, CDTYPE
+
 # Path to Fortran reference data
 FORTRAN_REF = Path(__file__).parent.parent / "fortran_ref"
 
@@ -55,7 +57,7 @@ def _compute_snake_to_standard_perm(l_max: int, minc: int = 1) -> torch.Tensor:
 
 
 # Precompute the permutation (l_max=16 for the benchmark)
-_SNAKE2ST = _compute_snake_to_standard_perm(l_max=16, minc=1)
+_SNAKE2ST = _compute_snake_to_standard_perm(l_max=16, minc=1).to(DEVICE)
 
 # Names of field arrays that use LM ordering (first dimension is lm_max)
 _LM_FIELD_NAMES = {
@@ -84,13 +86,13 @@ def load_ref(name: str, reorder_lm: bool = None) -> torch.Tensor:
     """
     arr = np.load(FORTRAN_REF / f"{name}.npy")
     if arr.ndim == 0:
-        return torch.tensor(arr.item())
+        return torch.tensor(arr.item(), device=DEVICE, dtype=DTYPE)
     if np.issubdtype(arr.dtype, np.integer):
-        t = torch.from_numpy(arr.copy()).long()
+        t = torch.from_numpy(arr.copy()).long().to(DEVICE)
     elif np.issubdtype(arr.dtype, np.complexfloating):
-        t = torch.from_numpy(arr.copy()).to(torch.complex128)
+        t = torch.from_numpy(arr.copy()).to(CDTYPE).to(DEVICE)
     else:
-        t = torch.from_numpy(arr.copy()).to(torch.float64)
+        t = torch.from_numpy(arr.copy()).to(DTYPE).to(DEVICE)
 
     # Reorder LM dimension if this is a field array
     should_reorder = reorder_lm if reorder_lm is not None else (name in _LM_FIELD_NAMES)

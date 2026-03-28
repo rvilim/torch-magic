@@ -28,7 +28,7 @@ def prepare_mat(a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
     """
     a = a.clone()
     n = a.shape[0]
-    ip = torch.zeros(n, dtype=torch.long, device=DEVICE)
+    ip = torch.zeros(n, dtype=torch.long, device=a.device)
     info = 0
 
     for k in range(n - 1):
@@ -62,7 +62,7 @@ def prepare_mat(a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
         return a, ip, info
 
     # Store 1/diagonal
-    diag_idx = torch.arange(n, device=DEVICE)
+    diag_idx = torch.arange(n, device=a.device)
     a[diag_idx, diag_idx] = 1.0 / a[diag_idx, diag_idx]
 
     return a, ip, info
@@ -196,3 +196,37 @@ def solve_mat(a: torch.Tensor, ip: torch.Tensor,
         return solve_mat_complex(a, ip, rhs)
     else:
         return solve_mat_real(a, ip, rhs)
+
+
+def chunked_solve_complex(inv_by_l, l_index, rhs_complex, chunk_size=512):
+    """Batched solve using unique per-l real inverses, chunked to bound memory.
+
+    Instead of precomputing (lm_max, N, N) expanded inverses, stores only
+    (l_max+1, N, N) unique inverses and expands in chunks at solve time.
+
+    Uses view_as_real/view_as_complex for float64 bmm (no complex gemm).
+
+    Args:
+        inv_by_l: (l_max+1, N, N) float64 — unique inverse per l degree
+        l_index: (lm_max,) long — maps each lm mode to its l value
+        rhs_complex: (lm_max, N) complex — right-hand side
+        chunk_size: max lm modes per chunk (bounds peak memory)
+
+    Returns:
+        (lm_max, N) complex — solution
+    """
+    rhs_real = torch.view_as_real(rhs_complex)  # (lm_max, N, 2) — zero-copy
+    lm_max = rhs_real.shape[0]
+
+    if lm_max <= chunk_size:
+        # Single pass — no loop, same as before
+        out_real = torch.bmm(inv_by_l[l_index], rhs_real)
+        return torch.view_as_complex(out_real)
+
+    out_real = torch.empty_like(rhs_real)
+    for start in range(0, lm_max, chunk_size):
+        end = min(start + chunk_size, lm_max)
+        out_real[start:end] = torch.bmm(
+            inv_by_l[l_index[start:end]], rhs_real[start:end]
+        )
+    return torch.view_as_complex(out_real)

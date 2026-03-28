@@ -1,28 +1,43 @@
 """Parameters for the dynamo_benchmark case, matching Fortran input.nml + truncation."""
 
-# --- Grid parameters (from input.nml &grid) ---
-n_r_max = 33
-n_cheb_max = 33
-l_max = 16
-m_max = 16
+import os
+
+
+def _prime_decomposition(n):
+    """Find smallest m >= n with only factors 2, 3, 5 (matches truncation.f90)."""
+    dist_min = 1e9
+    best = n
+    for i in range(13):
+        for j in range(7):
+            for k in range(7):
+                val = 2**i * 3**j * 5**k
+                dist = val - n
+                if 0 <= dist < dist_min:
+                    dist_min = dist
+                    best = val
+    return best
+
+
+# --- Grid parameters (from input.nml &grid, overridable via env vars) ---
+l_max = int(os.environ.get("MAGIC_LMAX", "16"))
+m_max = l_max
 m_min = 0
 minc = 1
 nalias = 20
-n_r_ic_max = 17
-n_cheb_ic_max = 17
+
+n_r_max = int(os.environ.get("MAGIC_NR", str(2 * l_max + 1)))
+n_cheb_max = n_r_max
+n_r_ic_max = (n_r_max + 1) // 2
+n_cheb_ic_max = n_r_ic_max
 
 # --- Derived grid parameters (from truncation.f90 initialize_truncation) ---
-# l_max given (!=0), so:
-#   n_theta_max = (30*l_max)/nalias = (30*16)/20 = 24
-#   n_phi_tot = 2*n_theta_max = 48  (already good prime decomposition: 2^4 * 3)
-#   n_phi_max = n_phi_tot/minc = 48
-n_theta_max = 24
-n_phi_tot = 48
-n_phi_max = 48
-n_m_max = m_max // minc + 1  # 17
+n_phi_tot = _prime_decomposition(2 * ((30 * l_max) // nalias))
+n_phi_max = n_phi_tot // minc
+n_theta_max = n_phi_tot // 2
+n_m_max = m_max // minc + 1
 
-# lm_max = sum_{m=0}^{16} (16-m+1) = 17*18/2 = 153
-lm_max = 153
+# lm_max = (l_max+1)*(l_max+2)/2
+lm_max = (l_max + 1) * (l_max + 2) // 2
 
 n_r_tot = n_r_max  # no conducting inner core in this benchmark path
 

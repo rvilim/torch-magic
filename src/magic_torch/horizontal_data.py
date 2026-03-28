@@ -18,10 +18,11 @@ def _gauleg(x_min: float, x_max: float, n: int):
 
     Returns theta_ord (colatitudes in radians) and gauss (weights).
     Matches the gauleg subroutine in horizontal.f90 exactly.
+    Built on CPU to avoid GPU sync overhead from scalar loops.
     """
-    eps = 10.0 * torch.finfo(torch.float64).eps
-    theta_ord = torch.zeros(n, dtype=DTYPE, device=DEVICE)
-    gauss = torch.zeros(n, dtype=DTYPE, device=DEVICE)
+    eps = 10.0 * torch.finfo(DTYPE).eps
+    theta_ord = torch.zeros(n, dtype=DTYPE, device="cpu")
+    gauss = torch.zeros(n, dtype=DTYPE, device="cpu")
 
     m = (n + 1) // 2
     xm = 0.5 * (x_max + x_min)
@@ -48,7 +49,7 @@ def _gauleg(x_min: float, x_max: float, n: int):
         gauss[i - 1] = 2.0 * xl / ((1.0 - z * z) * pp * pp)
         gauss[n - i] = gauss[i - 1]
 
-    return theta_ord, gauss
+    return theta_ord.to(DEVICE), gauss.to(DEVICE)
 
 
 # Compute Gauss-Legendre quadrature
@@ -79,46 +80,54 @@ cosn_theta_E2_grid = cosTheta_grid * O_sin_theta_E2_grid
 # Phi grid
 phi = torch.arange(n_phi_max, dtype=DTYPE, device=DEVICE) * (2.0 * pi / (n_phi_max * minc))
 
-# --- LM-dependent arrays ---
-# dPhi = i*m
-dPhi = torch.zeros(lm_max, dtype=CDTYPE, device=DEVICE)
-dLh = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
-dTheta1S = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
-dTheta1A = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
-dTheta2S = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
-dTheta2A = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
-dTheta3S = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
-dTheta3A = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
-dTheta4S = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
-dTheta4A = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
+# --- LM-dependent arrays (built on CPU, transferred to DEVICE) ---
 
 
-def _clm(l: int, m: int) -> float:
-    """Coupling coefficient clm = sqrt((l+m)(l-m) / ((2l-1)(2l+1)))."""
-    if l == 0:
-        return 0.0
-    return math.sqrt(float((l + m) * (l - m)) / float((2 * l - 1) * (2 * l + 1)))
+def _clm(l, m):
+    """Coupling coefficient clm = sqrt((l+m)(l-m) / ((2l-1)(2l+1))). Vectorized."""
+    result = torch.zeros_like(l, dtype=DTYPE)
+    mask = l > 0
+    lm = l[mask].to(DTYPE)
+    mm = m[mask].to(DTYPE)
+    result[mask] = torch.sqrt((lm + mm) * (lm - mm) / ((2 * lm - 1) * (2 * lm + 1)))
+    return result
 
 
 def _build_lm_arrays():
-    """Build LM-dependent coupling arrays."""
-    for lm in range(lm_max):
-        l = st_lm2l[lm].item()
-        m = st_lm2m[lm].item()
+    """Build LM-dependent coupling arrays — vectorized, on CPU then transfer."""
+    l = st_lm2l.cpu().clone()
+    m = st_lm2m.cpu().clone()
+    lf = l.to(DTYPE)
+    mf = m.to(DTYPE)
 
-        dPhi[lm] = complex(0.0, float(m))
-        dLh[lm] = float(l * (l + 1))
-        dTheta1S[lm] = float(l + 1) * _clm(l, m)
-        dTheta1A[lm] = float(l) * _clm(l + 1, m)
-        dTheta2S[lm] = float(l - 1) * _clm(l, m)
-        dTheta2A[lm] = float(l + 2) * _clm(l + 1, m)
-        dTheta3S[lm] = float((l - 1) * (l + 1)) * _clm(l, m)
-        dTheta3A[lm] = float(l * (l + 2)) * _clm(l + 1, m)
-        dTheta4S[lm] = dTheta1S[lm].item() * float((l - 1) * l)
-        dTheta4A[lm] = dTheta1A[lm].item() * float((l + 1) * (l + 2))
+    clm_l = _clm(l, m)      # clm(l, m)
+    clm_lp1 = _clm(l + 1, m)  # clm(l+1, m)
+
+    _dPhi = torch.zeros(lm_max, dtype=CDTYPE, device="cpu")
+    _dPhi.imag = mf
+
+    _dLh = lf * (lf + 1)
+    _dTheta1S = (lf + 1) * clm_l
+    _dTheta1A = lf * clm_lp1
+    _dTheta2S = (lf - 1) * clm_l
+    _dTheta2A = (lf + 2) * clm_lp1
+    _dTheta3S = (lf - 1) * (lf + 1) * clm_l
+    _dTheta3A = lf * (lf + 2) * clm_lp1
+    _dTheta4S = _dTheta1S * (lf - 1) * lf
+    _dTheta4A = _dTheta1A * (lf + 1) * (lf + 2)
+
+    return (_dPhi.to(DEVICE), _dLh.to(DEVICE),
+            _dTheta1S.to(DEVICE), _dTheta1A.to(DEVICE),
+            _dTheta2S.to(DEVICE), _dTheta2A.to(DEVICE),
+            _dTheta3S.to(DEVICE), _dTheta3A.to(DEVICE),
+            _dTheta4S.to(DEVICE), _dTheta4A.to(DEVICE))
 
 
-_build_lm_arrays()
+(dPhi, dLh,
+ dTheta1S, dTheta1A,
+ dTheta2S, dTheta2A,
+ dTheta3S, dTheta3A,
+ dTheta4S, dTheta4A) = _build_lm_arrays()
 
 # Hyperdiffusion (all 1.0 for the benchmark — no hyperdiffusion)
 hdif_B = torch.ones(l_max + 1, dtype=DTYPE, device=DEVICE)

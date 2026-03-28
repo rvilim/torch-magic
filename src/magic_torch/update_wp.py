@@ -19,7 +19,7 @@ from .radial_functions import or1, or2, or3, rgrav
 from .horizontal_data import dLh, hdif_V
 from .pre_calculations import BuoFac
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_complex, solve_mat_real
+from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
 from .cosine_transform import costf
 from .radial_derivatives import get_dr, get_dddr
 
@@ -52,8 +52,8 @@ _wpMat_ip = [None] * (l_max + 1)
 _wpMat_fac_row = [None] * (l_max + 1)  # row preconditioning
 _wpMat_fac_col = [None] * (l_max + 1)  # column preconditioning
 
-# Batched combined inverse: (lm_max, 2N, 2N) complex — l=0 rows are zero
-_wp_inv_all = None
+# Unique inverse per l degree: (l_max+1, 2N, 2N) float64 — l=0 is zero
+_wp_inv_by_l = None
 
 
 def build_p0_matrix():
@@ -66,20 +66,22 @@ def build_p0_matrix():
     global _p0Mat_lu, _p0Mat_ip
     N = n_r_max
 
-    dat = torch.zeros(N, N, dtype=DTYPE, device=DEVICE)
+    # Build on CPU (scalar loops in prepare_mat)
+    cpu = torch.device("cpu")
+    _rMat = rMat.to(cpu)
+    _drMat = drMat.to(cpu)
+    _rnorm = rnorm.to(cpu) if isinstance(rnorm, torch.Tensor) else rnorm
+    _bfac = boundary_fac.to(cpu) if isinstance(boundary_fac, torch.Tensor) else boundary_fac
 
-    # Bulk: dp/dr equation (beta=0)
-    dat[1:, :] = rnorm * drMat[1:, :]
-
-    # BC: p(r_cmb) = 0
-    dat[0, :] = rnorm * rMat[0, :]
-
-    # Boundary factor
-    dat[:, 0] = dat[:, 0] * boundary_fac
-    dat[:, N - 1] = dat[:, N - 1] * boundary_fac
+    dat = torch.zeros(N, N, dtype=DTYPE, device=cpu)
+    dat[1:, :] = _rnorm * _drMat[1:, :]
+    dat[0, :] = _rnorm * _rMat[0, :]
+    dat[:, 0] = dat[:, 0] * _bfac
+    dat[:, N - 1] = dat[:, N - 1] * _bfac
 
     lu, ip, info = prepare_mat(dat)
     assert info == 0, "Singular p0Mat"
+    # Keep on CPU — solve_mat_real uses scalar Python loops
     _p0Mat_lu = lu
     _p0Mat_ip = ip
 
@@ -93,84 +95,68 @@ def build_wp_matrices(wimp_lin0: float):
 
     Must be called whenever dt changes.
     """
+    global _wp_inv_by_l
     N = n_r_max
-    or1_col = or1.unsqueeze(1)
-    or2_col = or2.unsqueeze(1)
-    or3_col = or3.unsqueeze(1)
+
+    # Build on CPU (scalar loops in prepare_mat/solve_mat_real)
+    cpu = torch.device("cpu")
+    _rMat = rMat.to(cpu)
+    _drMat = drMat.to(cpu)
+    _d2rMat = d2rMat.to(cpu)
+    _d3rMat = d3rMat.to(cpu)
+    _or1 = or1.to(cpu)
+    _or2 = or2.to(cpu)
+    _or3 = or3.to(cpu)
+    _rnorm = rnorm.to(cpu) if isinstance(rnorm, torch.Tensor) else rnorm
+    _bfac = boundary_fac.to(cpu) if isinstance(boundary_fac, torch.Tensor) else boundary_fac
+    or2_col = _or2.unsqueeze(1)
+    or3_col = _or3.unsqueeze(1)
+
+    eye = torch.eye(2 * N, dtype=DTYPE, device=cpu)
+    inv_by_l = torch.zeros(l_max + 1, 2 * N, 2 * N, dtype=DTYPE, device=cpu)
 
     for l in range(1, l_max + 1):
         dL = float(l * (l + 1))
         hdif_l = hdif_V[l].item()
 
-        dat = torch.zeros(2 * N, 2 * N, dtype=DTYPE, device=DEVICE)
+        dat = torch.zeros(2 * N, 2 * N, dtype=DTYPE, device=cpu)
 
-        # === W equation (rows 0..N-1, interior rows 1..N-2) ===
-        # w-w block: dLh*or2*(rMat - wimp*hdif*(d2rMat - dLh*or2*rMat))
-        dat[1:N-1, :N] = rnorm * dL * or2_col[1:N-1] * (
-            rMat[1:N-1] - wimp_lin0 * hdif_l * (
-                d2rMat[1:N-1] - dL * or2_col[1:N-1] * rMat[1:N-1]
+        dat[1:N-1, :N] = _rnorm * dL * or2_col[1:N-1] * (
+            _rMat[1:N-1] - wimp_lin0 * hdif_l * (
+                _d2rMat[1:N-1] - dL * or2_col[1:N-1] * _rMat[1:N-1]
             )
         )
+        dat[1:N-1, N:] = _rnorm * wimp_lin0 * _drMat[1:N-1]
 
-        # w-p block: wimp * drMat (beta=0)
-        dat[1:N-1, N:] = rnorm * wimp_lin0 * drMat[1:N-1]
-
-        # === P equation (rows N..2N-1, interior rows N+1..2N-2) ===
-        # p-w block: -dLh*or2*drMat + wimp*hdif*dLh*or2*(d3rMat - dLh*or2*drMat + 2*dLh*or3*rMat)
-        dat[N+1:2*N-1, :N] = rnorm * dL * or2_col[1:N-1] * (
-            -drMat[1:N-1] + wimp_lin0 * hdif_l * (
-                d3rMat[1:N-1] - dL * or2_col[1:N-1] * drMat[1:N-1]
-                + two * dL * or3_col[1:N-1] * rMat[1:N-1]
+        dat[N+1:2*N-1, :N] = _rnorm * dL * or2_col[1:N-1] * (
+            -_drMat[1:N-1] + wimp_lin0 * hdif_l * (
+                _d3rMat[1:N-1] - dL * or2_col[1:N-1] * _drMat[1:N-1]
+                + two * dL * or3_col[1:N-1] * _rMat[1:N-1]
             )
         )
+        dat[N+1:2*N-1, N:] = -_rnorm * wimp_lin0 * dL * or2_col[1:N-1] * _rMat[1:N-1]
 
-        # p-p block: -wimp * dLh * or2 * rMat
-        dat[N+1:2*N-1, N:] = -rnorm * wimp_lin0 * dL * or2_col[1:N-1] * rMat[1:N-1]
+        dat[0, :N] = _rnorm * _rMat[0, :]
+        dat[N-1, :N] = _rnorm * _rMat[N-1, :]
+        dat[N, :N] = _rnorm * _drMat[0, :]
+        dat[2*N-1, :N] = _rnorm * _drMat[N-1, :]
 
-        # === Boundary conditions ===
-        # Row 0 (CMB w=0): rnorm * rMat[0,:]
-        dat[0, :N] = rnorm * rMat[0, :]
-        # Row N-1 (ICB w=0): rnorm * rMat[N-1,:]
-        dat[N-1, :N] = rnorm * rMat[N-1, :]
-        # Row N (CMB dw/dr=0, no-slip): rnorm * drMat[0,:]
-        dat[N, :N] = rnorm * drMat[0, :]
-        # Row 2N-1 (ICB dw/dr=0, no-slip): rnorm * drMat[N-1,:]
-        dat[2*N-1, :N] = rnorm * drMat[N-1, :]
-        # p columns in BC rows are zero (already)
-
-        # === Boundary factor on first/last Chebyshev columns of each block ===
         for blk_start in [0, N]:
-            dat[:, blk_start] = dat[:, blk_start] * boundary_fac
-            dat[:, blk_start + N - 1] = dat[:, blk_start + N - 1] * boundary_fac
+            dat[:, blk_start] = dat[:, blk_start] * _bfac
+            dat[:, blk_start + N - 1] = dat[:, blk_start + N - 1] * _bfac
 
-        # === Two-pass preconditioning (row then column) ===
-        # Row scaling
         fac_row = 1.0 / dat.abs().max(dim=1).values
         dat = fac_row.unsqueeze(1) * dat
-
-        # Column scaling
         fac_col = 1.0 / dat.abs().max(dim=0).values
         dat = dat * fac_col.unsqueeze(0)
 
-        # LU factorize
         lu, ip, info = prepare_mat(dat)
         assert info == 0, f"Singular wpMat for l={l}, info={info}"
 
-        _wpMat_lu[l] = lu
-        _wpMat_ip[l] = ip
-        _wpMat_fac_row[l] = fac_row
-        _wpMat_fac_col[l] = fac_col
+        inv_precond = solve_mat_real(lu, ip, eye)
+        inv_by_l[l] = fac_col.unsqueeze(1) * inv_precond * fac_row.unsqueeze(0)
 
-    # Precompute batched combined inverse (l=0 stays zero → w(l=0)=0)
-    # combined_inv = fac_col[:, None] * inv(precondA) * fac_row[None, :]
-    global _wp_inv_all
-    N = n_r_max
-    eye = torch.eye(2 * N, dtype=DTYPE, device=DEVICE)
-    wp_inv_by_l = torch.zeros(l_max + 1, 2 * N, 2 * N, dtype=DTYPE, device=DEVICE)
-    for l in range(1, l_max + 1):
-        inv_precond = solve_mat_real(_wpMat_lu[l], _wpMat_ip[l], eye)
-        wp_inv_by_l[l] = _wpMat_fac_col[l].unsqueeze(1) * inv_precond * _wpMat_fac_row[l].unsqueeze(0)
-    _wp_inv_all = wp_inv_by_l[st_lm2l]  # (lm_max, 2N, 2N) float64 — kept real for fast bmm
+    _wp_inv_by_l = inv_by_l.to(DEVICE)
 
 
 def finish_exp_pol(dw_exp, dVxVhLM):
@@ -229,9 +215,8 @@ def updateWP(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
     # BCs: all zero (w=0, dw/dr=0 at both boundaries) — already zero
     # l=0 modes get zero solution (inv is zero for l=0)
 
-    # Batched solve via precomputed inverse
-    # Real bmm: inverse is float64, use view_as_real for ~4x speedup
-    sol = torch.view_as_complex(torch.bmm(_wp_inv_all, torch.view_as_real(rhs_combined)))
+    # Chunked batched solve via per-l inverses
+    sol = chunked_solve_complex(_wp_inv_by_l, st_lm2l, rhs_combined)
     sol[_m0_mask] = sol[_m0_mask].real.to(CDTYPE)
 
     # Extract w and p Chebyshev coefficients
@@ -239,7 +224,8 @@ def updateWP(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
     p_cheb = sol[:, N:]
 
     # l=0 pressure from p0Mat (overwrite the zero from batched solve)
-    p_cheb[lm0, :] = solve_mat_real(_p0Mat_lu, _p0Mat_ip, p0_rhs).to(CDTYPE)
+    # p0Mat LU factors live on CPU (scalar Python loops in solve_mat_real)
+    p_cheb[lm0, :] = solve_mat_real(_p0Mat_lu, _p0Mat_ip, p0_rhs.cpu()).to(CDTYPE).to(DEVICE)
 
     # 3. Convert to physical space
     w_LMloc[:] = costf(w_cheb)

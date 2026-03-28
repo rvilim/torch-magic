@@ -18,7 +18,7 @@ from .radial_functions import or1, or2
 from .horizontal_data import dLh, hdif_S
 from .pre_calculations import opr
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_complex, solve_mat_real
+from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
 from .cosine_transform import costf
 from .radial_derivatives import get_dr, get_ddr
 
@@ -51,8 +51,8 @@ _sMat_lu = [None] * (l_max + 1)
 _sMat_ip = [None] * (l_max + 1)
 _sMat_fac = [None] * (l_max + 1)
 
-# Batched combined inverse: (lm_max, N, N) complex — precomputed at build time
-_s_inv_all = None
+# Unique inverse per l degree: (l_max+1, N, N) float64
+_s_inv_by_l = None
 
 
 def build_s_matrices(wimp_lin0: float):
@@ -65,48 +65,49 @@ def build_s_matrices(wimp_lin0: float):
 
     Must be called whenever dt changes.
     """
-    global _s_inv_all
+    global _s_inv_by_l
     N = n_r_max
-    or1_col = or1.unsqueeze(1)  # (N, 1) for row-dependent broadcasting
-    or2_col = or2.unsqueeze(1)
+
+    # Build on CPU (prepare_mat/solve_mat_real use Python scalar loops that
+    # are catastrophically slow on GPU due to per-element sync).
+    cpu = torch.device("cpu")
+    _rMat = rMat.to(cpu)
+    _drMat = drMat.to(cpu)
+    _d2rMat = d2rMat.to(cpu)
+    _or1 = or1.to(cpu)
+    _or2 = or2.to(cpu)
+    _rnorm = rnorm.to(cpu) if isinstance(rnorm, torch.Tensor) else rnorm
+    _bfac = boundary_fac.to(cpu) if isinstance(boundary_fac, torch.Tensor) else boundary_fac
+    or1_col = _or1.unsqueeze(1)
+    or2_col = _or2.unsqueeze(1)
+
+    eye = torch.eye(N, dtype=DTYPE, device=cpu)
+    inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
 
     for l in range(l_max + 1):
         dL = float(l * (l + 1))
         hdif_l = hdif_S[l].item()
 
-        # Interior: identity minus implicit diffusion operator
-        dat = rnorm * (rMat - wimp_lin0 * opr * hdif_l * (
-            d2rMat + two * or1_col * drMat - dL * or2_col * rMat
+        dat = _rnorm * (_rMat - wimp_lin0 * opr * hdif_l * (
+            _d2rMat + two * or1_col * _drMat - dL * or2_col * _rMat
         ))
 
-        # Dirichlet BCs (ktops=1, kbots=1)
-        dat[0, :] = rnorm * rMat[0, :]
-        dat[N - 1, :] = rnorm * rMat[N - 1, :]
+        dat[0, :] = _rnorm * _rMat[0, :]
+        dat[N - 1, :] = _rnorm * _rMat[N - 1, :]
 
-        # Chebyshev boundary factor on first/last columns
-        dat[:, 0] = dat[:, 0] * boundary_fac
-        dat[:, N - 1] = dat[:, N - 1] * boundary_fac
+        dat[:, 0] = dat[:, 0] * _bfac
+        dat[:, N - 1] = dat[:, N - 1] * _bfac
 
-        # Row preconditioning (WITH_PRECOND_S)
         fac = 1.0 / dat.abs().max(dim=1).values
         dat = fac.unsqueeze(1) * dat
 
-        # LU factorize
         lu, ip, info = prepare_mat(dat)
         assert info == 0, f"Singular sMat for l={l}, info={info}"
 
-        _sMat_lu[l] = lu
-        _sMat_ip[l] = ip
-        _sMat_fac[l] = fac
+        inv_precond = solve_mat_real(lu, ip, eye)
+        inv_by_l[l] = inv_precond * fac.unsqueeze(0)
 
-    # Precompute batched combined inverse: inv(precondA) @ diag(fac) for each l,
-    # then expand to all lm modes via st_lm2l indexing.
-    eye = torch.eye(N, dtype=DTYPE, device=DEVICE)
-    inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=DEVICE)
-    for l in range(l_max + 1):
-        inv_precond = solve_mat_real(_sMat_lu[l], _sMat_ip[l], eye)
-        inv_by_l[l] = inv_precond * _sMat_fac[l].unsqueeze(0)
-    _s_inv_all = inv_by_l[st_lm2l]  # (lm_max, N, N) float64 — kept real for fast bmm
+    _s_inv_by_l = inv_by_l.to(DEVICE)
 
 
 def finish_exp_entropy(ds_exp, dVSrLM):
@@ -142,11 +143,10 @@ def updateS(s_LMloc, ds_LMloc, dsdt, tscheme):
     # 1. Assemble IMEX RHS (physical-space values at grid points)
     rhs = tscheme.set_imex_rhs(dsdt)  # (lm_max, n_r_max)
 
-    # 2. Batched solve: set BCs, then matmul with precomputed inverse
-    # Real bmm: inverse is float64, use view_as_real for ~2.5x speedup
+    # 2. Batched solve: set BCs, then chunked matmul with per-l inverses
     rhs[:, 0] = _tops
     rhs[:, N - 1] = _bots
-    s_cheb = torch.view_as_complex(torch.bmm(_s_inv_all, torch.view_as_real(rhs)))
+    s_cheb = chunked_solve_complex(_s_inv_by_l, st_lm2l, rhs)
     s_cheb[_m0_mask] = s_cheb[_m0_mask].real.to(CDTYPE)
 
     # 3. Convert Chebyshev coefficients to physical space

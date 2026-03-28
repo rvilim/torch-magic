@@ -13,6 +13,7 @@ All timings on CPU (Apple Silicon), single-threaded, dynamo benchmark (l_max=16,
 | 2026-03-28 15:00       | Float64 real bmm (view_as_real trick)         | 0.0067s   | 0.0035s           | 1.8x             | 90x                |
 | 2026-03-28 17:00       | torch.compile on get_nl (fused element-wise)  | ~14% faster| 0.0035s           | 1.14x            | ~100x              |
 | 2026-03-28 18:00       | Pre-allocated velocity buffers                 | 0.0074s   | 0.0035s           | ~1.03x           | ~103x              |
+| 2026-03-28 22:00       | MPS (Apple GPU) support + CPU-build init        | see table | —                 | —                | —                  |
 
 ## What each change did
 
@@ -107,3 +108,15 @@ Current Python is **~2.1x slower** than Fortran on CPU.
 - Pre-allocate at module level, only assign bulk slices — eliminates per-step `torch.zeros` overhead
 - Measured: velocity assembly 0.36ms → 0.19ms (47% reduction for that operation)
 - Also hoisted `dLh_2d`, `or2_2d`, `or2_bulk_2d` broadcast arrays to module level
+
+### MPS (Apple GPU) support + resolution sweep
+
+Enabled MPS by building all initialization tensors on CPU (avoiding GPU→CPU sync from scalar Python loops). Also chunked the batched solver bmm to store only `(l_max+1, N, N)` unique per-l inverses instead of `(lm_max, N, N)`.
+
+**Resolution sweep results:**
+
+| l_max | n_r | lm_max | grid     | CPU f64 ms | MPS f32 ms | Fortran ms | MPS vs CPU | MPS vs Fortran |
+|-------|-----|--------|----------|-----------|------------|------------|------------|----------------|
+| 16    | 33  | 153    | 24×48    | 8.2       | 11.1       | 3.8        | 0.74×      | 0.34×          |
+| 32    | 65  | 561    | 48×96    | 45.7      | 19.5       | 36.2       | **2.3×**   | **1.9×**       |
+| 64    | 129 | 2145   | 96×192   | 375.4     | 89.3       | 411.0      | **4.2×**   | **4.6×**       |

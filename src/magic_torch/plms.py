@@ -39,8 +39,8 @@ def plm_theta(theta: float, max_degree: int, min_order: int,
         dnorm = osq4pi
     sq2 = math.sqrt(2.0)
 
-    plma = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
-    dtheta_plma = torch.zeros(lm_max, dtype=DTYPE, device=DEVICE)
+    plma = torch.zeros(lm_max, dtype=DTYPE, device="cpu")
+    dtheta_plma = torch.zeros(lm_max, dtype=DTYPE, device="cpu")
 
     cos_theta = math.cos(theta)
     sin_theta = math.sin(theta)
@@ -165,28 +165,33 @@ def build_plm_matrices():
         wdPlm: shape (lm_max, n_theta_max//2) — 2*pi*gauss*dPlm
     """
     n_theta_NHS = n_theta_max // 2
-    Plm = torch.zeros(lm_max, n_theta_NHS, dtype=DTYPE, device=DEVICE)
-    dPlm = torch.zeros(lm_max, n_theta_NHS, dtype=DTYPE, device=DEVICE)
-    wPlm = torch.zeros(lm_max, n_theta_NHS, dtype=DTYPE, device=DEVICE)
-    wdPlm = torch.zeros(lm_max, n_theta_NHS, dtype=DTYPE, device=DEVICE)
+    # Build on CPU (plm_theta uses scalar Python loops)
+    Plm = torch.zeros(lm_max, n_theta_NHS, dtype=DTYPE, device="cpu")
+    dPlm = torch.zeros(lm_max, n_theta_NHS, dtype=DTYPE, device="cpu")
+    wPlm = torch.zeros(lm_max, n_theta_NHS, dtype=DTYPE, device="cpu")
+    wdPlm = torch.zeros(lm_max, n_theta_NHS, dtype=DTYPE, device="cpu")
+
+    # theta_ord and gauss may be on DEVICE; extract values on CPU
+    _theta = theta_ord.cpu()
+    _gauss = gauss.cpu()
 
     for n_theta in range(n_theta_NHS):
-        colat = theta_ord[n_theta].item()
+        colat = _theta[n_theta].item()
         plma, dtheta_plma = plm_theta(colat, l_max, m_min, m_max, minc, norm=2)
         Plm[:, n_theta] = plma
         dPlm[:, n_theta] = dtheta_plma
-        wPlm[:, n_theta] = 2.0 * math.pi * gauss[n_theta] * plma
-        wdPlm[:, n_theta] = 2.0 * math.pi * gauss[n_theta] * dtheta_plma
+        wPlm[:, n_theta] = 2.0 * math.pi * _gauss[n_theta] * plma
+        wdPlm[:, n_theta] = 2.0 * math.pi * _gauss[n_theta] * dtheta_plma
 
-    return Plm, dPlm, wPlm, wdPlm
+    return Plm.to(DEVICE), dPlm.to(DEVICE), wPlm.to(DEVICE), wdPlm.to(DEVICE)
 
 
 # Build the matrices at module load time
 Plm, dPlm, wPlm, wdPlm = build_plm_matrices()
 
 # Build lStart/lStop index arrays (0-based)
-lStart = torch.zeros(n_theta_max, dtype=torch.long, device=DEVICE)  # oversized but fine
-lStop = torch.zeros(n_theta_max, dtype=torch.long, device=DEVICE)
+lStart = torch.zeros(n_theta_max, dtype=torch.long, device="cpu")  # oversized but fine
+lStop = torch.zeros(n_theta_max, dtype=torch.long, device="cpu")
 
 _lstart_list = []
 _lstop_list = []

@@ -18,7 +18,7 @@ from .radial_functions import or1, or2
 from .horizontal_data import dLh, hdif_B
 from .pre_calculations import opm
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_complex, solve_mat_real
+from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
 from .cosine_transform import costf
 from .radial_derivatives import get_dr, get_ddr
 
@@ -48,9 +48,9 @@ _jMat_lu = [None] * (l_max + 1)
 _jMat_ip = [None] * (l_max + 1)
 _jMat_fac = [None] * (l_max + 1)
 
-# Batched combined inverses: (lm_max, N, N) complex — l=0 rows are zero
-_b_inv_all = None
-_j_inv_all = None
+# Unique inverses per l degree: (l_max+1, N, N) float64 — l=0 is zero
+_b_inv_by_l = None
+_j_inv_by_l = None
 
 
 def build_b_matrices(wimp_lin0: float):
@@ -64,97 +64,73 @@ def build_b_matrices(wimp_lin0: float):
 
     Must be called whenever dt changes.
     """
+    global _b_inv_by_l, _j_inv_by_l
     N = n_r_max
-    or1_col = or1.unsqueeze(1)  # (N, 1)
-    or2_col = or2.unsqueeze(1)  # (N, 1)
+
+    # Build on CPU (scalar loops in prepare_mat/solve_mat_real)
+    cpu = torch.device("cpu")
+    _rMat = rMat.to(cpu)
+    _drMat = drMat.to(cpu)
+    _d2rMat = d2rMat.to(cpu)
+    _or1 = or1.to(cpu)
+    _or2 = or2.to(cpu)
+    _rnorm = rnorm.to(cpu) if isinstance(rnorm, torch.Tensor) else rnorm
+    _bfac = boundary_fac.to(cpu) if isinstance(boundary_fac, torch.Tensor) else boundary_fac
+    or1_col = _or1.unsqueeze(1)
+    or2_col = _or2.unsqueeze(1)
+
+    eye = torch.eye(N, dtype=DTYPE, device=cpu)
+    b_inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
+    j_inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
 
     for l in range(1, l_max + 1):
         dL = float(l * (l + 1))
         hdif_l = hdif_B[l].item()
 
         # === bMat (poloidal magnetic field) ===
-        dat_b = torch.zeros(N, N, dtype=DTYPE, device=DEVICE)
-
-        # Interior rows (1..N-2): dLh*or2*(I - wimp*opm*hdif*(d2 - dLh*or2))
-        dat_b[1:N-1, :] = rnorm * dL * or2_col[1:N-1] * (
-            rMat[1:N-1] - wimp_lin0 * opm * hdif_l * (
-                d2rMat[1:N-1] - dL * or2_col[1:N-1] * rMat[1:N-1]
+        dat_b = torch.zeros(N, N, dtype=DTYPE, device=cpu)
+        dat_b[1:N-1, :] = _rnorm * dL * or2_col[1:N-1] * (
+            _rMat[1:N-1] - wimp_lin0 * opm * hdif_l * (
+                _d2rMat[1:N-1] - dL * or2_col[1:N-1] * _rMat[1:N-1]
             )
         )
-
-        # CMB BC (row 0): potential field matching db/dr + l/r * b = 0
-        # ktopb=1, ktopv=2, conductance_ma=0:
-        #   drMat(0,:) + l*or1(0)*rMat(0,:)
-        dat_b[0, :] = rnorm * (
-            drMat[0, :] + float(l) * or1[0] * rMat[0, :]
+        dat_b[0, :] = _rnorm * (
+            _drMat[0, :] + float(l) * _or1[0] * _rMat[0, :]
         )
-
-        # ICB BC (row N-1): potential field matching db/dr - (l+1)/r * b = 0
-        # kbotb=1:
-        #   drMat(N-1,:) - (l+1)*or1(N-1)*rMat(N-1,:)
-        dat_b[N-1, :] = rnorm * (
-            drMat[N-1, :] - float(l + 1) * or1[N-1] * rMat[N-1, :]
+        dat_b[N-1, :] = _rnorm * (
+            _drMat[N-1, :] - float(l + 1) * _or1[N-1] * _rMat[N-1, :]
         )
-
-        # Boundary factor on first/last Chebyshev columns
-        dat_b[:, 0] = dat_b[:, 0] * boundary_fac
-        dat_b[:, N-1] = dat_b[:, N-1] * boundary_fac
-
-        # Row preconditioning (WITH_PRECOND_BJ)
+        dat_b[:, 0] = dat_b[:, 0] * _bfac
+        dat_b[:, N-1] = dat_b[:, N-1] * _bfac
         fac_b = 1.0 / dat_b.abs().max(dim=1).values
         dat_b = fac_b.unsqueeze(1) * dat_b
 
         lu_b, ip_b, info_b = prepare_mat(dat_b)
         assert info_b == 0, f"Singular bMat for l={l}, info={info_b}"
-
-        _bMat_lu[l] = lu_b
-        _bMat_ip[l] = ip_b
-        _bMat_fac[l] = fac_b
+        b_inv_precond = solve_mat_real(lu_b, ip_b, eye)
+        b_inv_by_l[l] = b_inv_precond * fac_b.unsqueeze(0)
 
         # === jMat (toroidal magnetic field) ===
-        dat_j = torch.zeros(N, N, dtype=DTYPE, device=DEVICE)
-
-        # Interior rows: identical to bMat for Boussinesq (dLlambda=0)
-        dat_j[1:N-1, :] = rnorm * dL * or2_col[1:N-1] * (
-            rMat[1:N-1] - wimp_lin0 * opm * hdif_l * (
-                d2rMat[1:N-1] - dL * or2_col[1:N-1] * rMat[1:N-1]
+        dat_j = torch.zeros(N, N, dtype=DTYPE, device=cpu)
+        dat_j[1:N-1, :] = _rnorm * dL * or2_col[1:N-1] * (
+            _rMat[1:N-1] - wimp_lin0 * opm * hdif_l * (
+                _d2rMat[1:N-1] - dL * or2_col[1:N-1] * _rMat[1:N-1]
             )
         )
-
-        # CMB BC (row 0): j=0 (insulating, conductance_ma=0)
-        dat_j[0, :] = rnorm * rMat[0, :]
-
-        # ICB BC (row N-1): j=0 (insulating)
-        dat_j[N-1, :] = rnorm * rMat[N-1, :]
-
-        # Boundary factor
-        dat_j[:, 0] = dat_j[:, 0] * boundary_fac
-        dat_j[:, N-1] = dat_j[:, N-1] * boundary_fac
-
-        # Row preconditioning
+        dat_j[0, :] = _rnorm * _rMat[0, :]
+        dat_j[N-1, :] = _rnorm * _rMat[N-1, :]
+        dat_j[:, 0] = dat_j[:, 0] * _bfac
+        dat_j[:, N-1] = dat_j[:, N-1] * _bfac
         fac_j = 1.0 / dat_j.abs().max(dim=1).values
         dat_j = fac_j.unsqueeze(1) * dat_j
 
         lu_j, ip_j, info_j = prepare_mat(dat_j)
         assert info_j == 0, f"Singular jMat for l={l}, info={info_j}"
+        j_inv_precond = solve_mat_real(lu_j, ip_j, eye)
+        j_inv_by_l[l] = j_inv_precond * fac_j.unsqueeze(0)
 
-        _jMat_lu[l] = lu_j
-        _jMat_ip[l] = ip_j
-        _jMat_fac[l] = fac_j
-
-    # Precompute batched combined inverses (l=0 stays zero → b(l=0)=j(l=0)=0)
-    global _b_inv_all, _j_inv_all
-    N = n_r_max
-    eye = torch.eye(N, dtype=DTYPE, device=DEVICE)
-    b_inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=DEVICE)
-    j_inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=DEVICE)
-    for l in range(1, l_max + 1):
-        b_inv_precond = solve_mat_real(_bMat_lu[l], _bMat_ip[l], eye)
-        b_inv_by_l[l] = b_inv_precond * _bMat_fac[l].unsqueeze(0)
-        j_inv_precond = solve_mat_real(_jMat_lu[l], _jMat_ip[l], eye)
-        j_inv_by_l[l] = j_inv_precond * _jMat_fac[l].unsqueeze(0)
-    _b_inv_all = b_inv_by_l[st_lm2l]  # (lm_max, N, N) float64 — kept real for fast bmm
-    _j_inv_all = j_inv_by_l[st_lm2l]  # (lm_max, N, N) float64
+    _b_inv_by_l = b_inv_by_l.to(DEVICE)
+    _j_inv_by_l = j_inv_by_l.to(DEVICE)
 
 
 def finish_exp_mag(dj_exp, dVxBhLM):
@@ -188,16 +164,15 @@ def updateB(b_LMloc, db_LMloc, ddb_LMloc, aj_LMloc, dj_LMloc, ddj_LMloc,
     rhs_b = tscheme.set_imex_rhs(dbdt)  # (lm_max, n_r_max)
     rhs_j = tscheme.set_imex_rhs(djdt)  # (lm_max, n_r_max)
 
-    # 2. Batched solve: BCs=0, then matmul with precomputed inverse
-    # Real bmm: inverses are float64, use view_as_real for ~2.5x speedup
+    # 2. Batched solve: BCs=0, then chunked matmul with per-l inverses
     rhs_b[:, 0] = 0.0
     rhs_b[:, N - 1] = 0.0
-    b_cheb = torch.view_as_complex(torch.bmm(_b_inv_all, torch.view_as_real(rhs_b)))
+    b_cheb = chunked_solve_complex(_b_inv_by_l, st_lm2l, rhs_b)
     b_cheb[_m0_mask] = b_cheb[_m0_mask].real.to(CDTYPE)
 
     rhs_j[:, 0] = 0.0
     rhs_j[:, N - 1] = 0.0
-    j_cheb = torch.view_as_complex(torch.bmm(_j_inv_all, torch.view_as_real(rhs_j)))
+    j_cheb = chunked_solve_complex(_j_inv_by_l, st_lm2l, rhs_j)
     j_cheb[_m0_mask] = j_cheb[_m0_mask].real.to(CDTYPE)
 
     # 3. Convert to physical space

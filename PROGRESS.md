@@ -420,3 +420,88 @@ Detailed breakdown of every sub-operation in one time step:
 The slowdown is uniform across all phases (radial_loop 2.0×, lm_loop 2.2×). Root cause: **per-tensor-operation dispatch overhead**. Every tensor op (add, multiply, bmm, fft) goes through Python function call → PyTorch dispatcher → memory allocation → kernel launch before doing actual math. For (153, 33) complex arrays (~5000 elements), this overhead (~3-5μs) dominates the ~20-50ns of actual compute by 100×. With ~3000-4000 ops per step, this accounts for the full 3-4ms gap.
 
 ### All 1472 tests pass.
+
+---
+
+## Resolution Sweep & Chunked BMM Solvers (2026-03-28)
+
+### Configurable resolution via env vars
+**Files**: `params.py`, `benchmark.py` (new)
+
+Made resolution configurable without code changes. `params.py` now reads `MAGIC_LMAX` and `MAGIC_NR` environment variables and derives all grid quantities automatically:
+- `l_max`, `m_max` from `MAGIC_LMAX` (default 16)
+- `n_r_max` from `MAGIC_NR` (default `2*l_max + 1`)
+- `n_phi_tot` via `_prime_decomposition()` matching Fortran's `truncation.f90` (smallest n >= target with only factors 2, 3, 5)
+- All downstream quantities (`n_theta_max`, `n_phi_max`, `n_m_max`, `lm_max`, `n_r_ic_max`, etc.)
+
+Defaults reproduce the original l_max=16 values exactly. All 1472 tests still pass.
+
+### Chunked BMM implicit solvers
+**Files**: `algebra.py`, `update_s.py`, `update_z.py`, `update_wp.py`, `update_b.py`
+
+**Problem**: The previous approach precomputed expanded inverse matrices `(lm_max, N, N)` for each solver. At l_max=128 (lm_max=8385, N=257), each solver needed ~4.4 GB; the WP solver with its 2N×2N matrices needed ~17.6 GB. Total: ~30 GB — far exceeding available memory, causing the process to be killed.
+
+**Solution**: Store only `(l_max+1, N, N)` unique inverses per solver (one per l degree, since all (l,m) modes with the same l share an identical matrix). At solve time, `chunked_solve_complex()` in `algebra.py` indexes `inv_by_l[st_lm2l[start:end]]` in chunks of 512 lm modes and does `torch.bmm` per chunk. This bounds peak memory to ~270 MB per chunk regardless of resolution.
+
+Memory comparison:
+
+| l_max | lm_max | Old (expanded) per solver | New (unique) stored | New peak transient/chunk |
+|-------|--------|--------------------------|--------------------|-----------------------|
+| 16    | 153    | 1.3 MB                   | 0.14 MB            | 1.3 MB (single pass)  |
+| 64    | 2145   | 285 MB                   | 1.1 MB             | 34 MB                 |
+| 128   | 8385   | 4.4 GB                   | 4.3 MB             | 270 MB                |
+
+For l_max=16 (lm_max=153 < chunk_size=512), the code takes a fast single-pass branch with no loop — identical codepath to before. No performance regression: 7.56 ms/step (was 7.4 ms, within noise).
+
+The `view_as_real`/`view_as_complex` trick is preserved inside `chunked_solve_complex` so we still get float64 dgemm rather than complex128 zgemm.
+
+### Resolution sweep benchmark
+**File**: `benchmark.py` (new)
+
+Sweep script that runs Python (CPU/MPS) and Fortran across configurable resolutions via subprocesses. Each resolution runs in its own process (since params are module-level). Supports `--lmax`, `--steps`, `--warmup`, `--no-fortran`, `--no-mps`, `--no-cpu` flags.
+
+For Fortran: generates a temporary `input.nml` per resolution, runs `magic.exe` from a temp dir, parses `log.<tag>` for wall-clock time. Note: the modified Fortran binary has dump_arrays code that adds ~1ms overhead at l_max=16.
+
+### Results: Python CPU vs Fortran
+
+| l_max | n_r | lm_max | grid     | CPU ms/step | Fortran ms/step | Python/Fortran |
+|-------|-----|--------|----------|-------------|-----------------|----------------|
+| 16    | 33  | 153    | 24×48    | 7.7         | 4.2             | 0.54×          |
+| 32    | 65  | 561    | 48×96    | 46.4        | 36.4            | 0.78×          |
+| 64    | 129 | 2145   | 96×192   | 378.7       | 414.0           | **1.09×**      |
+| 128   | 257 | 8385   | 192×384  | 4110        | 6075            | **1.48×**      |
+
+Key finding: **Python overtakes Fortran at l_max=64** and the advantage grows with resolution. At l_max=16, PyTorch's per-op dispatch overhead dominates (the known 2.1× gap). At higher resolutions, the actual compute (batched bmm, FFT) dominates and PyTorch's optimized BLAS kernels win.
+
+### MPS (Apple GPU, float32) Support
+
+**Problem**: MPS was hanging at l_max≥64 due to GPU→CPU sync overhead from Python scalar loops during module initialization. Every `tensor[i] = value` write to an MPS tensor triggers a sync.
+
+**Root cause modules** (all had scalar Python loops writing to DEVICE tensors):
+- `blocking.py`: LM mapping construction — `for lm in range(lm_max)` with element writes
+- `horizontal_data.py`: `_gauleg()` Gauss-Legendre iteration + `_build_lm_arrays()` coupling coefficients
+- `plms.py`: `plm_theta()` Legendre polynomial recurrence + `build_plm_matrices()` loop over theta
+- `chebyshev.py`: `_build_der_mats()` column recursion + `_build_dr_boundary()` scalar loop
+- `algebra.py`: `prepare_mat()` LU pivot array and diagonal store used `device=DEVICE`
+- `init_fields.py`: `ps_cond()` matrix construction (already fixed in chunked-bmm work)
+- All 4 update_*.py solver build functions (already fixed in chunked-bmm work)
+
+**Fix**: Build all initialization tensors on CPU, transfer to DEVICE at the end. Also vectorized `_build_lm_arrays()` in horizontal_data.py (eliminated the `for lm in range(lm_max)` loop entirely using tensor ops for `_clm`, `dLh`, `dTheta*`).
+
+**Files changed**: `blocking.py`, `horizontal_data.py`, `plms.py`, `chebyshev.py`, `algebra.py`
+
+### Results: Python CPU vs MPS vs Fortran
+
+| l_max | n_r | lm_max | grid     | CPU ms/step | MPS ms/step | Fortran ms/step |
+|-------|-----|--------|----------|-------------|-------------|-----------------|
+| 16    | 33  | 153    | 24×48    | 8.2         | 11.1        | 3.8             |
+| 32    | 65  | 561    | 48×96    | 45.7        | 19.5        | 36.2            |
+| 64    | 129 | 2145   | 96×192   | 375.4       | **89.3**    | 411.0           |
+
+Key findings:
+- **MPS overtakes CPU at l_max=32** (19.5ms vs 45.7ms, 2.3× faster)
+- **MPS is 4.6× faster than Fortran at l_max=64** (89ms vs 411ms)
+- At l_max=16, MPS is slower than CPU (11ms vs 8ms) due to MPS kernel launch overhead for small tensors
+- MPS uses float32 (Apple GPU limitation) — numerical differences expected but acceptable for benchmarking
+
+### All 1472 tests still pass (l_max=16 regression verified).

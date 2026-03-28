@@ -6,7 +6,7 @@ Crank-Nicolson implicit terms, and old state values.
 
 import torch
 
-from .precision import CDTYPE, DEVICE
+from .precision import CDTYPE, DTYPE, DEVICE
 from .params import lm_max, n_r_max
 from .time_scheme import tscheme
 
@@ -35,9 +35,9 @@ class TimeScalar:
     """
 
     def __init__(self, nold: int, nexp: int, nimp: int):
-        self.impl = torch.zeros(nimp, dtype=torch.float64, device=DEVICE)
-        self.expl = torch.zeros(nexp, dtype=torch.float64, device=DEVICE)
-        self.old = torch.zeros(nold, dtype=torch.float64, device=DEVICE)
+        self.impl = torch.zeros(nimp, dtype=DTYPE, device=DEVICE)
+        self.expl = torch.zeros(nexp, dtype=DTYPE, device=DEVICE)
+        self.old = torch.zeros(nold, dtype=DTYPE, device=DEVICE)
 
 
 # Time derivative arrays for each field equation

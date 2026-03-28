@@ -18,11 +18,13 @@ from .params import l_max, m_max, m_min, minc, lm_max
 
 def _build_standard_mapping():
     """Build standard (m-major) LM mapping matching get_standard_lm_blocking."""
-    lm2 = torch.full((l_max + 1, l_max + 1), -1, dtype=torch.long, device=DEVICE)
-    lm2l = torch.zeros(lm_max, dtype=torch.long, device=DEVICE)
-    lm2m = torch.zeros(lm_max, dtype=torch.long, device=DEVICE)
-    lm2lmS = torch.zeros(lm_max, dtype=torch.long, device=DEVICE)
-    lm2lmA = torch.zeros(lm_max, dtype=torch.long, device=DEVICE)
+    # Build on CPU to avoid GPU sync overhead from scalar loops
+    cpu = "cpu"
+    lm2 = torch.full((l_max + 1, l_max + 1), -1, dtype=torch.long, device=cpu)
+    lm2l = torch.zeros(lm_max, dtype=torch.long, device=cpu)
+    lm2m = torch.zeros(lm_max, dtype=torch.long, device=cpu)
+    lm2lmS = torch.zeros(lm_max, dtype=torch.long, device=cpu)
+    lm2lmA = torch.zeros(lm_max, dtype=torch.long, device=cpu)
 
     lm = 0
     for m in range(m_min, m_max + 1, minc):
@@ -46,16 +48,18 @@ def _build_standard_mapping():
         else:
             lm2lmA[lm] = -1
 
-    return lm2, lm2l, lm2m, lm2lmS, lm2lmA
+    return (lm2.to(DEVICE), lm2l.to(DEVICE), lm2m.to(DEVICE),
+            lm2lmS.to(DEVICE), lm2lmA.to(DEVICE))
 
 
 def _build_lorder_mapping():
     """Build l-order LM mapping matching get_lorder_lm_blocking."""
-    lm2 = torch.full((l_max + 1, l_max + 1), -1, dtype=torch.long, device=DEVICE)
-    lm2l = torch.zeros(lm_max, dtype=torch.long, device=DEVICE)
-    lm2m = torch.zeros(lm_max, dtype=torch.long, device=DEVICE)
-    lm2lmS = torch.zeros(lm_max, dtype=torch.long, device=DEVICE)
-    lm2lmA = torch.zeros(lm_max, dtype=torch.long, device=DEVICE)
+    cpu = "cpu"
+    lm2 = torch.full((l_max + 1, l_max + 1), -1, dtype=torch.long, device=cpu)
+    lm2l = torch.zeros(lm_max, dtype=torch.long, device=cpu)
+    lm2m = torch.zeros(lm_max, dtype=torch.long, device=cpu)
+    lm2lmS = torch.zeros(lm_max, dtype=torch.long, device=cpu)
+    lm2lmA = torch.zeros(lm_max, dtype=torch.long, device=cpu)
 
     lm = 0
     for l in range(m_min, l_max + 1):
@@ -79,7 +83,8 @@ def _build_lorder_mapping():
         else:
             lm2lmA[lm] = -1
 
-    return lm2, lm2l, lm2m, lm2lmS, lm2lmA
+    return (lm2.to(DEVICE), lm2l.to(DEVICE), lm2m.to(DEVICE),
+            lm2lmS.to(DEVICE), lm2lmA.to(DEVICE))
 
 
 # Standard mapping (st_map) — used as default lm2/lm2l/lm2m pointers

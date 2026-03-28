@@ -26,8 +26,8 @@ def test_cnab2_weights_constant_dt():
     assert ts.wimp_lin[1].item() == (1.0 - alpha) * dt
 
     # Explicit AB2: wexp[0] = 1.5*dt, wexp[1] = -0.5*dt (when dt1==dt2)
-    torch.testing.assert_close(ts.wexp[0], torch.tensor(1.5 * dt, dtype=torch.float64), atol=0, rtol=1e-15)
-    torch.testing.assert_close(ts.wexp[1], torch.tensor(-0.5 * dt, dtype=torch.float64), atol=0, rtol=1e-15)
+    torch.testing.assert_close(ts.wexp[0], torch.tensor(1.5 * dt, dtype=ts.wexp[0].dtype), atol=0, rtol=1e-15)
+    torch.testing.assert_close(ts.wexp[1], torch.tensor(-0.5 * dt, dtype=ts.wexp[0].dtype), atol=0, rtol=1e-15)
 
 
 def test_cnab2_weights_varying_dt():

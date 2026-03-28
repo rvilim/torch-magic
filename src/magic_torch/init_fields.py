@@ -35,71 +35,62 @@ def ps_cond():
         (s0, p0): each shape (n_r_max,) in physical (radial) space
     """
     N = n_r_max
-    ps0Mat = torch.zeros(2 * N, 2 * N, dtype=DTYPE, device=DEVICE)
 
-    # --- Entropy diffusion (entropy equation, NOT l_temperature_diff) ---
-    # ps0Mat[n_r, n_r_out] = rnorm * opr * kappa * (d2rMat + (2/r) * drMat)
-    # For Boussinesq: kappa=1, opr=1, beta=0, dLtemp0=0, dLkappa=0
-    for nr in range(N):
-        for nc in range(N):
-            ps0Mat[nr, nc] = rnorm * opr * (
-                d2rMat[nr, nc] + two * or1[nr] * drMat[nr, nc]
-            )
-            # No pressure coupling in entropy equation for Boussinesq
-            ps0Mat[nr, nc + N] = 0.0
+    # Build and solve on CPU (prepare_mat/solve_mat_real use Python scalar loops)
+    cpu = torch.device("cpu")
+    _rMat = rMat.to(cpu)
+    _drMat = drMat.to(cpu)
+    _d2rMat = d2rMat.to(cpu)
+    _or1 = or1.to(cpu)
+    _rgrav = rgrav.to(cpu)
+    _rho0 = rho0.to(cpu)
+    _rnorm = rnorm.to(cpu) if isinstance(rnorm, torch.Tensor) else rnorm
+    _bfac = boundary_fac.to(cpu) if isinstance(boundary_fac, torch.Tensor) else boundary_fac
 
-            # Hydrostatic equilibrium: -rho0 * BuoFac * rgrav * rMat
-            ps0Mat[nr + N, nc] = -rnorm * rho0[nr] * BuoFac * rgrav[nr] * rMat[nr, nc]
+    ps0Mat = torch.zeros(2 * N, 2 * N, dtype=DTYPE, device=cpu)
 
-            # Pressure gradient: drMat (beta=0)
-            ps0Mat[nr + N, nc + N] = rnorm * drMat[nr, nc]
+    # Entropy diffusion block (vectorized)
+    ps0Mat[:N, :N] = _rnorm * opr * (
+        _d2rMat + two * _or1.unsqueeze(1) * _drMat
+    )
+    # Hydrostatic equilibrium block
+    ps0Mat[N:, :N] = -_rnorm * (_rho0 * BuoFac * _rgrav).unsqueeze(1) * _rMat
+    # Pressure gradient block
+    ps0Mat[N:, N:] = _rnorm * _drMat
 
-    # --- Boundary conditions ---
-    # CMB (row 0): s0(r_cmb) = tops(0,0), ktops=1 (fixed entropy)
-    ps0Mat[0, :N] = rnorm * rMat[0, :]
+    # Boundary conditions
+    ps0Mat[0, :N] = _rnorm * _rMat[0, :]
     ps0Mat[0, N:] = 0.0
-
-    # ICB (row N-1): s0(r_icb) = bots(0,0), kbots=1 (fixed entropy)
-    ps0Mat[N - 1, :N] = rnorm * rMat[N - 1, :]
+    ps0Mat[N - 1, :N] = _rnorm * _rMat[N - 1, :]
     ps0Mat[N - 1, N:] = 0.0
-
-    # Pressure BC (row N): p0(r_cmb) = 0  (Boussinesq, ViscHeatFac*ThExpNb=0)
     ps0Mat[N, :N] = 0.0
-    ps0Mat[N, N:] = rnorm * rMat[0, :]
+    ps0Mat[N, N:] = _rnorm * _rMat[0, :]
 
-    # --- Boundary factor scaling (columns 0, N-1, N, 2N-1) ---
-    for nr in range(2 * N):
-        ps0Mat[nr, 0] *= boundary_fac
-        ps0Mat[nr, N - 1] *= boundary_fac
-        ps0Mat[nr, N] *= boundary_fac
-        ps0Mat[nr, 2 * N - 1] *= boundary_fac
+    # Boundary factor scaling (columns 0, N-1, N, 2N-1)
+    for col in [0, N - 1, N, 2 * N - 1]:
+        ps0Mat[:, col] *= _bfac
 
-    # --- Row scaling for conditioning ---
+    # Row scaling for conditioning
     ps0Mat_fac = 1.0 / ps0Mat.abs().max(dim=1).values
-
     ps0Mat = ps0Mat * ps0Mat_fac.unsqueeze(1)
 
-    # --- LU factorize ---
+    # LU factorize
     a_lu, ip, info = prepare_mat(ps0Mat)
     assert info == 0, f'Singular ps0Mat, info={info}'
 
-    # --- RHS ---
-    rhs = torch.zeros(2 * N, dtype=DTYPE, device=DEVICE)
-    # Interior: -epsc * epscProf * orho1 = 0 for benchmark (no internal heating)
-    # BCs:
-    rhs[0] = 0.0       # tops(0,0) = 0
-    rhs[N - 1] = sq4pi  # bots(0,0) = sqrt(4*pi)
-    rhs[N] = 0.0        # p0(r_cmb) = 0
-
-    # Scale RHS
+    # RHS
+    rhs = torch.zeros(2 * N, dtype=DTYPE, device=cpu)
+    rhs[0] = 0.0
+    rhs[N - 1] = sq4pi
+    rhs[N] = 0.0
     rhs = ps0Mat_fac * rhs
 
-    # --- Solve ---
+    # Solve
     rhs = solve_mat_real(a_lu, ip, rhs)
 
-    # --- Extract s0 and p0 ---
-    s0 = rhs[:N].clone()
-    p0 = rhs[N:].clone()
+    # --- Extract s0 and p0, move to target device ---
+    s0 = rhs[:N].clone().to(DEVICE)
+    p0 = rhs[N:].clone().to(DEVICE)
 
     # --- Transform to physical space ---
     s0 = costf(s0)
