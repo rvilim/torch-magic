@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+
+# Debug/scratch scripts
+debug_*.py
+
+# Data files
+fortran_ref/
+energy_comparison.csv
+
+# Environment
+.venv/
+.env
