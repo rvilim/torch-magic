@@ -8,6 +8,7 @@ dependencies = [
     "numpy",
     "pytest",
     "pyyaml>=6.0.3",
+    "modal>=1.4.0",
 ]
 
 [build-system]

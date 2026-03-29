@@ -115,8 +115,17 @@ Enabled MPS by building all initialization tensors on CPU (avoiding GPU→CPU sy
 
 **Resolution sweep results:**
 
-| l_max | n_r | lm_max | grid     | CPU f64 ms | MPS f32 ms | Fortran ms | MPS vs CPU | MPS vs Fortran |
-|-------|-----|--------|----------|-----------|------------|------------|------------|----------------|
-| 16    | 33  | 153    | 24×48    | 8.2       | 11.1       | 3.8        | 0.74×      | 0.34×          |
-| 32    | 65  | 561    | 48×96    | 45.7      | 19.5       | 36.2       | **2.3×**   | **1.9×**       |
-| 64    | 129 | 2145   | 96×192   | 375.4     | 89.3       | 411.0      | **4.2×**   | **4.6×**       |
+| l_max | n_r | lm_max | grid      | CPU f64 ms | MPS f32 ms | Fortran ms | CPU vs Fortran | MPS vs Fortran |
+|-------|-----|--------|-----------|-----------|------------|------------|----------------|----------------|
+| 16    | 33  | 153    | 24×48     | 8.2       | 11.1       | 3.8        | 0.46×          | 0.34×          |
+| 32    | 65  | 561    | 48×96     | 45.7      | 19.5       | 36.2       | 0.79×          | **1.9×**       |
+| 64    | 129 | 2145   | 96×192    | 375.4     | 55         | 411.0      | 1.1×           | **7.5×**       |
+| 128   | 257 | 8385   | 192×384   | 2667      | 405        | 6000       | **2.3×**       | **14.8×**      |
+
+### Packed BMM solver (2025-03-28)
+Replaced expand-and-bmm (`inv[l_index]` → `(lm_max, N, N)` bmm) with packed approach:
+sort RHS by l → scatter to `(L, max_m, N, 2)` → reshape → single `(L, N, N) @ (L, N, max_m*2)` bmm → gather back.
+All pack/unpack indices precomputed and cached. No Python loops at solve time.
+- l=64 MPS: 89ms → 55ms (lm_loop 1.6×)
+- l=128 MPS: 975ms → 405ms (lm_loop 6.5×: 675ms → 104ms)
+- l=128 profile: radial_loop 303ms (SHT 252ms + get_nl 17ms), lm_loop 104ms

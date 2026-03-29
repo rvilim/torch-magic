@@ -492,16 +492,44 @@ Key finding: **Python overtakes Fortran at l_max=64** and the advantage grows wi
 
 ### Results: Python CPU vs MPS vs Fortran
 
-| l_max | n_r | lm_max | grid     | CPU ms/step | MPS ms/step | Fortran ms/step |
-|-------|-----|--------|----------|-------------|-------------|-----------------|
-| 16    | 33  | 153    | 24×48    | 8.2         | 11.1        | 3.8             |
-| 32    | 65  | 561    | 48×96    | 45.7        | 19.5        | 36.2            |
-| 64    | 129 | 2145   | 96×192   | 375.4       | **89.3**    | 411.0           |
+| l_max | n_r | lm_max | grid      | CPU ms/step | MPS ms/step | Fortran ms/step |
+|-------|-----|--------|-----------|-------------|-------------|-----------------|
+| 16    | 33  | 153    | 24×48     | 8.2         | 11.1        | 3.8             |
+| 32    | 65  | 561    | 48×96     | 45.7        | 19.5        | 36.2            |
+| 64    | 129 | 2145   | 96×192    | 375.4       | **55**      | 411.0           |
+| 128   | 257 | 8385   | 192×384   | 2667        | **405**     | 6000            |
 
 Key findings:
-- **MPS overtakes CPU at l_max=32** (19.5ms vs 45.7ms, 2.3× faster)
-- **MPS is 4.6× faster than Fortran at l_max=64** (89ms vs 411ms)
-- At l_max=16, MPS is slower than CPU (11ms vs 8ms) due to MPS kernel launch overhead for small tensors
+- **PyTorch CPU overtakes Fortran at l_max=128** (2.67s vs 6.0s, 2.3× faster)
+- **MPS is 14.8× faster than Fortran at l_max=128** (405ms vs 6000ms)
+- **MPS is 7.5× faster than Fortran at l_max=64** (55ms vs 411ms)
+- MPS overtakes CPU at l_max=32 (19.5ms vs 45.7ms)
+- At l_max=16, MPS is slower than CPU (11ms vs 8ms) due to MPS kernel launch overhead
 - MPS uses float32 (Apple GPU limitation) — numerical differences expected but acceptable for benchmarking
+- l=128 bottleneck is SHT bmm (252ms/step on MPS, ~75% of total)
 
 ### All 1472 tests still pass (l_max=16 regression verified).
+
+---
+
+## 2025-03-28: Packed BMM solver for high-resolution GPU runs
+
+**Files changed**: `algebra.py`
+
+**Problem**: At l_max=128, the implicit solvers (lm_loop) were extremely slow on MPS (675ms/step). The bottleneck was `chunked_solve_complex` which expanded the per-l inverse matrices from `(l_max+1, N, N)` to `(lm_max, N, N)` — at l=128 that's 8385 copies of 257×257 matrices, creating a huge bmm.
+
+**Solution**: Packed bmm approach. Instead of expanding inverses, pack the RHS by l-degree:
+1. Sort RHS by l-value (precomputed permutation)
+2. Scatter into `(l_max+1, max_modes, N, 2)` via flat index — zero-padded
+3. Reshape to `(l_max+1, N, max_modes*2)` for bmm
+4. Single bmm: `(129, 257, 257) @ (129, 257, 258)` instead of `(8385, 257, 257) @ (8385, 257, 2)`
+5. Unpack via reverse gather+unsort
+
+The bmm is 22× faster (14ms vs 314ms for WP-sized matrices). Pack/unpack indices are precomputed and cached.
+
+**Results**:
+- lm_loop at l=128 MPS: **675ms → 104ms** (6.5× speedup)
+- Full step at l=128 MPS: **975ms → 405ms** (2.4× speedup)
+- l=64 MPS improved too: 89ms → 55ms (1.6× speedup)
+- CPU l=16: no regression (7.5ms, same as before)
+- All 1472 tests pass on CPU

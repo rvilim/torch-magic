@@ -198,11 +198,64 @@ def solve_mat(a: torch.Tensor, ip: torch.Tensor,
         return solve_mat_real(a, ip, rhs)
 
 
-def chunked_solve_complex(inv_by_l, l_index, rhs_complex, chunk_size=512):
-    """Batched solve using unique per-l real inverses, chunked to bound memory.
+def _build_pack_indices(l_index):
+    """Precompute packing/unpacking indices for packed bmm solver.
 
-    Instead of precomputing (lm_max, N, N) expanded inverses, stores only
-    (l_max+1, N, N) unique inverses and expands in chunks at solve time.
+    Instead of expanding (l_max+1, N, N) → (lm_max, N, N) via l_index,
+    we pack the RHS into (l_max+1, N, max_modes*2) and do a single bmm
+    of shape (l_max+1, N, N) @ (l_max+1, N, max_modes*2).
+
+    All index tensors are built on CPU for precomputation.
+    """
+    l_cpu = l_index.cpu()
+    l_max_plus_1 = l_cpu.max().item() + 1
+    lm_max = l_cpu.shape[0]
+
+    counts = torch.bincount(l_cpu, minlength=l_max_plus_1)
+    max_modes = counts.max().item()
+
+    # Sort lm indices by l value for contiguous packing
+    sorted_idx = l_cpu.argsort(stable=True)
+    offsets = torch.cumsum(counts, 0) - counts
+
+    # Build flat pack index: pack_idx[i] = l_sorted[i] * max_modes + pos_in_group[i]
+    # pos_in_group = arange within each l-group
+    l_sorted = l_cpu[sorted_idx]
+    pos_in_group = torch.zeros(lm_max, dtype=torch.long)
+    for l in range(l_max_plus_1):
+        o = offsets[l].item()
+        c = counts[l].item()
+        if c > 0:
+            pos_in_group[o:o + c] = torch.arange(c)
+    pack_idx = l_sorted * max_modes + pos_in_group  # (lm_max,)
+
+    return {
+        "sorted_idx": sorted_idx,
+        "pack_idx": pack_idx,
+        "max_modes": max_modes,
+        "l_max_plus_1": l_max_plus_1,
+        "lm_max": lm_max,
+    }
+
+
+# Cache for pack indices (keyed by l_index data_ptr — same tensor reused)
+_pack_cache: dict[int, dict] = {}
+
+
+def _get_pack_indices(l_index):
+    """Get or build cached pack indices for a given l_index tensor."""
+    key = l_index.data_ptr()
+    if key not in _pack_cache:
+        _pack_cache[key] = _build_pack_indices(l_index)
+    return _pack_cache[key]
+
+
+def chunked_solve_complex(inv_by_l, l_index, rhs_complex, chunk_size=512):
+    """Batched solve using packed bmm for GPU efficiency.
+
+    Packs RHS by l-degree into (l_max+1, N, max_modes*2) and does a single
+    bmm of (l_max+1, N, N) @ (l_max+1, N, max_modes*2), avoiding the
+    expensive expansion of inv_by_l from (l_max+1) to (lm_max) matrices.
 
     Uses view_as_real/view_as_complex for float64 bmm (no complex gemm).
 
@@ -210,23 +263,33 @@ def chunked_solve_complex(inv_by_l, l_index, rhs_complex, chunk_size=512):
         inv_by_l: (l_max+1, N, N) float64 — unique inverse per l degree
         l_index: (lm_max,) long — maps each lm mode to its l value
         rhs_complex: (lm_max, N) complex — right-hand side
-        chunk_size: max lm modes per chunk (bounds peak memory)
 
     Returns:
         (lm_max, N) complex — solution
     """
     rhs_real = torch.view_as_real(rhs_complex)  # (lm_max, N, 2) — zero-copy
-    lm_max = rhs_real.shape[0]
+    lm_max, N, _ = rhs_real.shape
 
-    if lm_max <= chunk_size:
-        # Single pass — no loop, same as before
-        out_real = torch.bmm(inv_by_l[l_index], rhs_real)
-        return torch.view_as_complex(out_real)
+    pi = _get_pack_indices(l_index)
+    L = pi["l_max_plus_1"]
+    max_m = pi["max_modes"]
+    sorted_idx = pi["sorted_idx"]  # CPU long tensor
+    pack_idx = pi["pack_idx"]  # CPU long tensor
 
+    # Pack: sort by l, then scatter into (L*max_m, N, 2) via flat index
+    rhs_sorted = rhs_real[sorted_idx]  # (lm_max, N, 2)
+    rhs_packed_flat = torch.zeros(L * max_m, N, 2, dtype=rhs_real.dtype, device=rhs_real.device)
+    rhs_packed_flat[pack_idx] = rhs_sorted
+    # Reshape to (L, max_m, N, 2) → permute to (L, N, max_m, 2) → reshape to (L, N, max_m*2)
+    rhs_packed = rhs_packed_flat.reshape(L, max_m, N, 2).permute(0, 2, 1, 3).reshape(L, N, max_m * 2)
+
+    # Single bmm: (L, N, N) @ (L, N, max_m*2) → (L, N, max_m*2)
+    out_packed = torch.bmm(inv_by_l, rhs_packed)
+
+    # Unpack: reverse the packing
+    out_flat = out_packed.reshape(L, N, max_m, 2).permute(0, 2, 1, 3).reshape(L * max_m, N, 2)
+    out_sorted = out_flat[pack_idx]  # gather back (lm_max, N, 2)
     out_real = torch.empty_like(rhs_real)
-    for start in range(0, lm_max, chunk_size):
-        end = min(start + chunk_size, lm_max)
-        out_real[start:end] = torch.bmm(
-            inv_by_l[l_index[start:end]], rhs_real[start:end]
-        )
+    out_real[sorted_idx] = out_sorted  # unsort
+
     return torch.view_as_complex(out_real)

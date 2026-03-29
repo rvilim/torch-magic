@@ -1,0 +1,22 @@
+# Christensen et al. 2001 dynamo benchmark case 1
+# Ra=1e5, Ek=1e-3, Pr=1, Pm=5
+# Config for Modal cloud GPU runs
+
+# Grid / physics
+l_max: 64
+n_r_max: 129         # 2*l_max+1
+
+# Time stepping
+n_steps: 1000000
+dt: 1.0e-4
+
+# Output
+output_dir: ./output/benchmark
+log_every: 10         # write diagnostics every N steps
+checkpoint_every: 100 # save checkpoint every N steps
+
+# Device
+device: cuda
+
+# Restart (optional)
+restart: null          # path to checkpoint .pt file
