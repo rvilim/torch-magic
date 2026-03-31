@@ -93,10 +93,11 @@ def _ensure_init():
                 f.aj_LMloc[:, nR], f.dj_LMloc[:, nR])
             sc[nR] = scal_to_spat(f.s_LMloc[:, nR])
 
+    xic = torch.zeros_like(sc)  # no composition for dynamo benchmark
     (Advr, Advt, Advp, VSr, VSt, VSp,
-     VxBr, VxBt, VxBp) = get_nl(
+     VxBr, VxBt, VxBp, VXir, VXit, VXip) = get_nl(
         vrc, vtc, vpc, cvrc, cvtc, cvpc,
-        sc, brc, btc, bpc, cbrc, cbtc, cbpc)
+        sc, brc, btc, bpc, cbrc, cbtc, cbpc, xic)
 
     _state.update({
         'brc': brc, 'btc': btc, 'bpc': bpc,

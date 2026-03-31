@@ -113,14 +113,83 @@ Current Python is **~2.1x slower** than Fortran on CPU.
 
 Enabled MPS by building all initialization tensors on CPU (avoiding GPU→CPU sync from scalar Python loops). Also chunked the batched solver bmm to store only `(l_max+1, N, N)` unique per-l inverses instead of `(lm_max, N, N)`.
 
-**Resolution sweep results:**
+**Resolution sweep results (2026-03-29, Apple M-series, single-thread Fortran, CNAB2 insulating IC):**
 
-| l_max | n_r | lm_max | grid      | CPU f64 ms | MPS f32 ms | Fortran ms | CPU vs Fortran | MPS vs Fortran |
-|-------|-----|--------|-----------|-----------|------------|------------|----------------|----------------|
-| 16    | 33  | 153    | 24×48     | 8.2       | 11.1       | 3.8        | 0.46×          | 0.34×          |
-| 32    | 65  | 561    | 48×96     | 45.7      | 19.5       | 36.2       | 0.79×          | **1.9×**       |
-| 64    | 129 | 2145   | 96×192    | 375.4     | 55         | 411.0      | 1.1×           | **7.5×**       |
-| 128   | 257 | 8385   | 192×384   | 2667      | 405        | 6000       | **2.3×**       | **14.8×**      |
+Steady-state ms/step (excludes first step with matrix build). Fortran: gfortran-15 serial. CPU: PyTorch f64. MPS: PyTorch f32.
+
+| l_max | n_r | lm_max | grid      | Fortran ms | CPU f64 ms | MPS f32 ms | CPU vs Fortran | MPS vs Fortran | MPS vs CPU |
+|-------|-----|--------|-----------|-----------|-----------|------------|----------------|----------------|------------|
+| 16    | 33  | 153    | 24×48     | 10.8      | 8.1       | 15.2       | 1.3×           | 0.7×           | 0.5×       |
+| 32    | 65  | 561    | 48×96     | 34.6      | 36.7      | 16.3       | 0.9×           | **2.1×**       | **2.3×**   |
+| 64    | 129 | 2145   | 96×192    | 399       | 279       | 55.2       | **1.4×**       | **7.2×**       | **5.1×**   |
+| 128   | 257 | 8385   | 192×384   | 5749      | 2833      | 411        | **2.0×**       | **14.0×**      | **6.9×**   |
+
+Key observations:
+- MPS crossover vs CPU at l~28, vs Fortran at l~24
+- CPU beats Fortran at all resolutions except l=32 (dispatch overhead vs BLAS efficiency)
+- At l=128: MPS is 14× faster than Fortran, 6.9× faster than CPU
+- MPS scales much better than CPU/Fortran (GPU parallelism dominates at larger sizes)
+
+### doubleDiffusion benchmark (2026-03-29)
+
+BPR353 DIRK (4-stage, 3 with radial_loop) + composition field (xi). No magnetic field (mode=1).
+l_max=64, n_r_max=33, minc=4, n_cheb_max=31. Restart from saturated checkpoint.
+
+| Backend | ms/step | vs Fortran |
+|---------|---------|------------|
+| Fortran (gfortran-15, serial) | 52.9 | 1.0× |
+| Python CPU (f64) | 56.4 | 0.94× (1.07× slower) |
+| Python MPS (f32) baseline | 53.7 | 0.98× (1.01× slower) |
+| Python MPS (f32) optimized | 21.6 | **2.45×** faster |
+
+Energy comparison (1000 steps):
+- e_kin_pol max rel err: 2.4e-10
+- e_kin_tor max rel err: 4.1e-9
+- e_mag: exactly zero (mode=1, no magnetic field)
+- Errors constant over 1000 steps (steady state, not growing)
+
+Note: BPR353 has 3 radial_loop stages per step vs 1 for CNAB2, so per-step time is ~3× the CNAB2 cost at same resolution. The l=64 CNAB2 time is ~279ms/step (from resolution sweep above, n_r=129), while DD BPR353 at l=64 is only 56ms/step because n_r=33 (much smaller radial grid).
+
+### doubleDiffusion MPS optimization (2026-03-29)
+
+Fused lm_loop pipeline + solver cache optimizations for MPS dispatch overhead reduction:
+
+| Change | DD MPS ms/step | vs previous |
+|--------|---------------|-------------|
+| Baseline (sequential solvers) | 53.7 | — |
+| Mega-tensor views (cat-free RHS) | ~50 | ~7% |
+| Fused lm_loop + deferred costf + unified D123 | 33.9 | 1.5× |
+| GPU-resident pack indices + pre-allocated solver buffers | 27.0 | 1.25× |
+| p0Mat GPU inverse + in-place add + precomputed constants | 21.6 | 1.25× |
+
+Final: **21.6ms/step MPS** vs 52.9ms Fortran = **2.45× faster than Fortran**, 2.6× faster than Python CPU (57ms).
+
+Per-stage breakdown (BPR353, 4 stages avg):
+- radial_loop: 2.72ms/call × 3 stages = 8.2ms
+- lm_loop: 3.70ms/call × 4 stages = 14.8ms
+- overhead: ~0.6ms
+- Total: ~21.6ms/step
+
+### Anelastic benchmark (hydro_bench_anel_lowres) (2026-03-29)
+
+Anelastic hydrodynamic benchmark: strat=5 (polytropic), polind=2, no magnetic field (mode=1).
+l_max=16, n_r_max=33, minc=1, CNAB2 time scheme. Non-curl advection (11 grid-space fields).
+
+| Backend | ms/step | vs Fortran |
+|---------|---------|------------|
+| Fortran (gfortran-15, serial) | 2.86 | 1.0× |
+| Python CPU (f64) | 7.23 | 0.40× (2.5× slower) |
+| Python MPS (f32) | 10.71 | 0.27× (3.7× slower) |
+
+Notes:
+- 200 steps measured, excluding first step (matrix build + JIT warmup)
+- Anelastic adds density weighting (`orho1`, `beta`, variable `temp0`) and non-curl advection (11 grid-space fields vs 6)
+- No magnetic field: updateB disabled, so lm_loop has only S+Z+WP solvers
+- MPS `torch.compile` disabled for `get_nl_anel` (too many Metal shader arguments)
+- At l=16 the problem is too small for GPU — dispatch overhead dominates
+- CPU 2.5× slower than Fortran (vs 2.1× for Boussinesq dynamo), consistent with dispatch overhead
+- Fortran anelastic is faster per-step than Boussinesq dynamo (2.86 vs 3.48 ms) because no magnetic field
+- MPS crossover vs Fortran expected at l~24-32 (same as Boussinesq, see resolution sweep above)
 
 ### Packed BMM solver (2025-03-28)
 Replaced expand-and-bmm (`inv[l_index]` → `(lm_max, N, N)` bmm) with packed approach:
@@ -129,3 +198,32 @@ All pack/unpack indices precomputed and cached. No Python loops at solve time.
 - l=64 MPS: 89ms → 55ms (lm_loop 1.6×)
 - l=128 MPS: 975ms → 405ms (lm_loop 6.5×: 675ms → 104ms)
 - l=128 profile: radial_loop 303ms (SHT 252ms + get_nl 17ms), lm_loop 104ms
+
+### Full-resolution anelastic (hydro_bench_anel, l=143, n_r=97) (2026-03-29)
+
+Anelastic hydrodynamic benchmark at full resolution: strat=5, polind=2, mode=1 (no mag).
+l_max=143, n_r_max=97, n_cheb_max=95, n_theta=216, n_phi=432, lm_max=10440.
+CNAB2 time scheme, AM corrections enabled (l_correct_AMz, l_correct_AMe).
+
+| Backend | ms/step | Notes |
+|---------|---------|-------|
+| Python CPU (f64) | ~1011 | 300 steps, matches Fortran reference.out |
+
+| Fortran (gfortran-15, serial) | 2222 | Baseline |
+| Python CPU (f64) | 991 | **2.2× faster than Fortran** |
+| Python MPS (f32) | 276 | **8.1× faster than Fortran** |
+
+20 steps measured, excluding first step (matrix build + JIT warmup).
+Fortran timing from MagIC log "Mean wall time for one pure time step".
+
+Key observations:
+- CPU is now **faster** than Fortran at this resolution (BLAS efficiency dominates dispatch overhead)
+- MPS is 8.1× faster than Fortran — GPU parallelism fully utilized at this problem size
+- MPS is 3.6× faster than CPU
+- Fortran r-loop dominates: 2024ms (91%) — SHT at high l is compute-bound
+- Fortran breakdown: Spec→Spat 1274ms, Spat→Spec 685ms, LM solves 112ms
+
+Energy validation (300 steps at l=143, compared to Fortran reference.out):
+- e_kin_pol max rel err: 4.1e-9
+- e_kin_tor max rel err: 4.6e-9
+- Agreement to ~9 significant digits over 300 steps

@@ -198,14 +198,14 @@ def solve_mat(a: torch.Tensor, ip: torch.Tensor,
         return solve_mat_real(a, ip, rhs)
 
 
-def _build_pack_indices(l_index):
+def _build_pack_indices(l_index, device=None):
     """Precompute packing/unpacking indices for packed bmm solver.
 
     Instead of expanding (l_max+1, N, N) → (lm_max, N, N) via l_index,
     we pack the RHS into (l_max+1, N, max_modes*2) and do a single bmm
     of shape (l_max+1, N, N) @ (l_max+1, N, max_modes*2).
 
-    All index tensors are built on CPU for precomputation.
+    Index tensors are moved to `device` to avoid per-call CPU→GPU transfers.
     """
     l_cpu = l_index.cpu()
     l_max_plus_1 = l_cpu.max().item() + 1
@@ -229,25 +229,43 @@ def _build_pack_indices(l_index):
             pos_in_group[o:o + c] = torch.arange(c)
     pack_idx = l_sorted * max_modes + pos_in_group  # (lm_max,)
 
+    # Combined scatter/gather index: maps lm-order directly to packed position
+    # Eliminates separate sort + scatter steps (2 ops → 1 op each direction)
+    combined_idx = torch.empty(lm_max, dtype=torch.long)
+    combined_idx[sorted_idx] = pack_idx  # combined_idx[lm_mode] = packed_position
+
+    # Move index tensors to target device (avoids CPU→GPU transfer per call)
+    if device is not None:
+        combined_idx = combined_idx.to(device)
+
     return {
-        "sorted_idx": sorted_idx,
-        "pack_idx": pack_idx,
+        "combined_idx": combined_idx,
         "max_modes": max_modes,
         "l_max_plus_1": l_max_plus_1,
         "lm_max": lm_max,
     }
 
 
-# Cache for pack indices (keyed by l_index data_ptr — same tensor reused)
-_pack_cache: dict[int, dict] = {}
+# Cache for solver state: pack indices + pre-allocated buffers
+# Keyed by (l_index data_ptr, N_rhs_cols) to support different RHS widths
+_solver_cache: dict[tuple[int, int], dict] = {}
 
 
-def _get_pack_indices(l_index):
-    """Get or build cached pack indices for a given l_index tensor."""
-    key = l_index.data_ptr()
-    if key not in _pack_cache:
-        _pack_cache[key] = _build_pack_indices(l_index)
-    return _pack_cache[key]
+def _get_solver_state(inv_by_l, l_index, N_cols):
+    """Get or build cached solver state (indices + buffers) for given configuration."""
+    key = (l_index.data_ptr(), N_cols)
+    if key not in _solver_cache:
+        device = inv_by_l.device
+        pi = _build_pack_indices(l_index, device=device)
+        L = pi["l_max_plus_1"]
+        max_m = pi["max_modes"]
+        lm = pi["lm_max"]
+        dtype = inv_by_l.dtype
+        # Pre-allocate input packing buffer on device (output not pre-allocated:
+        # empty_like is cheaper than clone since it skips zeroing)
+        pi["rhs_packed_flat"] = torch.zeros(L * max_m, N_cols, 2, dtype=dtype, device=device)
+        _solver_cache[key] = pi
+    return _solver_cache[key]
 
 
 def chunked_solve_complex(inv_by_l, l_index, rhs_complex, chunk_size=512):
@@ -258,6 +276,8 @@ def chunked_solve_complex(inv_by_l, l_index, rhs_complex, chunk_size=512):
     expensive expansion of inv_by_l from (l_max+1) to (lm_max) matrices.
 
     Uses view_as_real/view_as_complex for float64 bmm (no complex gemm).
+    Pre-allocated buffers and device-resident combined index minimize
+    MPS dispatch overhead (single scatter + single gather, no sort step).
 
     Args:
         inv_by_l: (l_max+1, N, N) float64 — unique inverse per l degree
@@ -268,28 +288,23 @@ def chunked_solve_complex(inv_by_l, l_index, rhs_complex, chunk_size=512):
         (lm_max, N) complex — solution
     """
     rhs_real = torch.view_as_real(rhs_complex)  # (lm_max, N, 2) — zero-copy
-    lm_max, N, _ = rhs_real.shape
+    N = rhs_real.shape[1]
 
-    pi = _get_pack_indices(l_index)
-    L = pi["l_max_plus_1"]
-    max_m = pi["max_modes"]
-    sorted_idx = pi["sorted_idx"]  # CPU long tensor
-    pack_idx = pi["pack_idx"]  # CPU long tensor
+    ss = _get_solver_state(inv_by_l, l_index, N)
+    L = ss["l_max_plus_1"]
+    max_m = ss["max_modes"]
+    cidx = ss["combined_idx"]  # device tensor: lm-order → packed position
+    rhs_packed_flat = ss["rhs_packed_flat"]  # pre-allocated (L*max_m, N, 2)
 
-    # Pack: sort by l, then scatter into (L*max_m, N, 2) via flat index
-    rhs_sorted = rhs_real[sorted_idx]  # (lm_max, N, 2)
-    rhs_packed_flat = torch.zeros(L * max_m, N, 2, dtype=rhs_real.dtype, device=rhs_real.device)
-    rhs_packed_flat[pack_idx] = rhs_sorted
-    # Reshape to (L, max_m, N, 2) → permute to (L, N, max_m, 2) → reshape to (L, N, max_m*2)
+    # Pack: scatter directly from lm-order to packed layout (1 op, not 2)
+    rhs_packed_flat[cidx] = rhs_real
     rhs_packed = rhs_packed_flat.reshape(L, max_m, N, 2).permute(0, 2, 1, 3).reshape(L, N, max_m * 2)
 
     # Single bmm: (L, N, N) @ (L, N, max_m*2) → (L, N, max_m*2)
     out_packed = torch.bmm(inv_by_l, rhs_packed)
 
-    # Unpack: reverse the packing
+    # Unpack: gather directly from packed layout to lm-order (1 op, not 2)
     out_flat = out_packed.reshape(L, N, max_m, 2).permute(0, 2, 1, 3).reshape(L * max_m, N, 2)
-    out_sorted = out_flat[pack_idx]  # gather back (lm_max, N, 2)
-    out_real = torch.empty_like(rhs_real)
-    out_real[sorted_idx] = out_sorted  # unsort
+    out_real = out_flat[cidx]  # new tensor (no clone needed)
 
     return torch.view_as_complex(out_real)

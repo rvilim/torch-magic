@@ -29,7 +29,7 @@ _or2_3 = or2.reshape(n_r_max, 1, 1)
 
 @torch.compile
 def get_nl(vrc, vtc, vpc, cvrc, cvtc, cvpc,
-           sc, brc, btc, bpc, cbrc, cbtc, cbpc):
+           sc, brc, btc, bpc, cbrc, cbtc, cbpc, xic):
     """Compute all nonlinear products in grid space.
 
     Uses l_adv_curl=.true. formulation: advection = -(curl u) × u.
@@ -42,11 +42,13 @@ def get_nl(vrc, vtc, vpc, cvrc, cvtc, cvpc,
         sc: entropy
         brc, btc, bpc: magnetic field components
         cbrc, cbtc, cbpc: current density (curl B) components
+        xic: composition (zeros when inactive)
 
     Returns:
         Advr, Advt, Advp: momentum equation RHS (advection + Lorentz)
         VSr, VSt, VSp: entropy advection vector v*S
         VxBr, VxBt, VxBp: induction v×B
+        VXir, VXit, VXip: composition advection vector v*Xi
     """
     # --- Lorentz force: (curl B) × B ---
     LFr = LFfac * _Ost2 * (cbtc * bpc - cbpc * btc)
@@ -73,4 +75,9 @@ def get_nl(vrc, vtc, vpc, cvrc, cvtc, cvpc,
     VxBt = _or4_3 * (vpc * brc - vrc * bpc)
     VxBp = _or4_3 * (vrc * btc - vtc * brc)
 
-    return Advr, Advt, Advp, VSr, VSt, VSp, VxBr, VxBt, VxBp
+    # --- Composition advection: v*Xi (same structure as entropy) ---
+    VXir = vrc * xic
+    VXit = _or2_3 * vtc * xic
+    VXip = _or2_3 * vpc * xic
+
+    return Advr, Advt, Advp, VSr, VSt, VSp, VxBr, VxBt, VxBp, VXir, VXit, VXip

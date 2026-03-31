@@ -11,7 +11,7 @@ import torch
 
 from .precision import DTYPE, CDTYPE, DEVICE
 from .chebyshev import drMat, d2rMat, d3rMat, drx, ddrx, dddrx, rnorm, boundary_fac
-from .params import n_r_max, n_cheb_max
+from .params import n_r_max, n_cheb_max, l_cond_ic
 from .cosine_transform import costf
 
 
@@ -62,10 +62,19 @@ def _build_diff_matrices():
 
     D_k = d^k_rMat @ rMat^{-1} gives the k-th derivative operator
     in physical space.
+
+    When n_cheb_max < n_r_max, high Chebyshev modes are zeroed out
+    (spectral truncation), matching the Fortran get_dcheb behavior.
     """
     from .chebyshev import rMat
 
     rMat_inv = torch.linalg.inv(rMat)
+
+    # Spectral truncation: zero out high-order Chebyshev modes
+    if n_cheb_max < n_r_max:
+        rMat_inv = rMat_inv.clone()
+        rMat_inv[n_cheb_max:, :] = 0.0
+
     D1 = drMat @ rMat_inv
     D2 = d2rMat @ rMat_inv
     D3 = d3rMat @ rMat_inv
@@ -125,3 +134,46 @@ def get_dr_costf(f: torch.Tensor) -> torch.Tensor:
     # Apply mapping correction
     df = drx * df
     return df
+
+
+# --- IC (inner core) derivatives using even Chebyshev polynomials ---
+
+def _build_ic_diff_matrices():
+    """Build IC differentiation matrices D1_ic, D2_ic.
+
+    Uses the even Chebyshev polynomial matrices: cheb_ic, dcheb_ic, d2cheb_ic.
+    D_k = d^k_cheb_ic @ inv(cheb_ic) maps grid values to k-th derivative values.
+    """
+    from .radial_functions import cheb_ic, dcheb_ic, d2cheb_ic
+    cheb_inv = torch.linalg.inv(cheb_ic)
+    # D maps grid values to derivatives: df = f @ D
+    # f = coeff @ cheb_ic → coeff = f @ inv(cheb_ic)
+    # df = coeff @ dcheb_ic = f @ inv(cheb_ic) @ dcheb_ic
+    D1 = cheb_inv @ dcheb_ic
+    D2 = cheb_inv @ d2cheb_ic
+    return D1, D2
+
+
+if l_cond_ic:
+    _D1_ic_real, _D2_ic_real = _build_ic_diff_matrices()
+    _D1_ic = _D1_ic_real.to(CDTYPE).to(DEVICE)
+    _D2_ic = _D2_ic_real.to(CDTYPE).to(DEVICE)
+else:
+    _D1_ic = None
+    _D2_ic = None
+
+
+def get_ddr_even(f: torch.Tensor):
+    """First and second radial derivatives for IC fields using even Chebyshev.
+
+    Matches get_ddr_even from radial_derivatives_even.f90.
+
+    Args:
+        f: shape (..., n_r_ic_max) complex IC field values at grid points
+
+    Returns:
+        (df, ddf): both shape (..., n_r_ic_max)
+    """
+    df = f @ _D1_ic
+    ddf = f @ _D2_ic
+    return df, ddf

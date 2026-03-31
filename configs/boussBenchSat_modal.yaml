@@ -1,0 +1,35 @@
+# Christensen et al. 2001 dynamo benchmark case 1 — saturated state
+# BPR353 DIRK, conducting+rotating inner core, minc=4
+# Ra=1.1e5, Ek=1e-3, Pr=1, Pm=5
+# Config for Modal cloud GPU runs
+
+# Grid
+l_max: 64
+n_r_max: 33
+n_cheb_max: 31
+minc: 4
+
+# Inner core (n_r_ic_max auto-computed as (n_r_max+1)//2 = 17)
+n_cheb_ic_max: 15
+sigma_ratio: 1.0
+kbotb: 3
+nRotIC: 1
+
+# Physics
+ra: 1.1e5
+
+# Time stepping
+time_scheme: BPR353
+n_steps: 1000000
+dt: 2.0e-4
+
+# Output
+output_dir: ./output/boussBenchSat
+log_every: 10
+checkpoint_every: 100
+
+# Device
+device: cuda
+
+# Restart from Fortran checkpoint (uploaded to Modal volume)
+fortran_restart: ../samples/boussBenchSat/checkpoint_end.start

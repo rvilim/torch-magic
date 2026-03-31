@@ -8,7 +8,7 @@ import torch
 
 from .precision import CDTYPE, DEVICE
 from .constants import zero
-from .params import lm_max, n_r_max, l_mag, l_heat
+from .params import lm_max, n_r_max, n_r_ic_max, l_mag, l_heat, l_cond_ic
 
 
 def _zeros():
@@ -31,6 +31,10 @@ dp_LMloc = _zeros()
 s_LMloc = _zeros()
 ds_LMloc = _zeros()
 
+# Composition (always allocated, zero when inactive)
+xi_LMloc = _zeros()
+dxi_LMloc = _zeros()
+
 # Magnetic field potentials (only if l_mag)
 b_LMloc = _zeros()
 db_LMloc = _zeros()
@@ -38,6 +42,22 @@ ddb_LMloc = _zeros()
 aj_LMloc = _zeros()    # toroidal magnetic (j = curl B)
 dj_LMloc = _zeros()
 ddj_LMloc = _zeros()
+
+# Inner core magnetic field potentials (only if l_cond_ic)
+if l_cond_ic:
+    b_ic = torch.zeros(lm_max, n_r_ic_max, dtype=CDTYPE, device=DEVICE)
+    db_ic = torch.zeros(lm_max, n_r_ic_max, dtype=CDTYPE, device=DEVICE)
+    ddb_ic = torch.zeros(lm_max, n_r_ic_max, dtype=CDTYPE, device=DEVICE)
+    aj_ic = torch.zeros(lm_max, n_r_ic_max, dtype=CDTYPE, device=DEVICE)
+    dj_ic = torch.zeros(lm_max, n_r_ic_max, dtype=CDTYPE, device=DEVICE)
+    ddj_ic = torch.zeros(lm_max, n_r_ic_max, dtype=CDTYPE, device=DEVICE)
+else:
+    b_ic = torch.zeros(lm_max, 1, dtype=CDTYPE, device=DEVICE)
+    db_ic = torch.zeros(lm_max, 1, dtype=CDTYPE, device=DEVICE)
+    ddb_ic = torch.zeros(lm_max, 1, dtype=CDTYPE, device=DEVICE)
+    aj_ic = torch.zeros(lm_max, 1, dtype=CDTYPE, device=DEVICE)
+    dj_ic = torch.zeros(lm_max, 1, dtype=CDTYPE, device=DEVICE)
+    ddj_ic = torch.zeros(lm_max, 1, dtype=CDTYPE, device=DEVICE)
 
 # Rotation rates
 omega_ic = 0.0

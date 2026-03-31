@@ -1,0 +1,33 @@
+# Double diffusion benchmark — convection only (mode=1)
+# Ra=4.8e4, Raxi=1.2e5, Ek=1e-3, Pr=0.3, Sc=3.0
+# BPR353 DIRK, no magnetic field, no IC rotation
+
+# Grid
+l_max: 64
+n_r_max: 33
+n_cheb_max: 31
+minc: 4
+
+# Physics
+mode: 1
+ra: 4.8e4
+raxi: 1.2e5
+ek: 1.0e-3
+pr: 0.3
+sc: 3.0
+
+# Time stepping
+time_scheme: BPR353
+n_steps: 1000
+dt: 3.0e-4
+
+# Output
+output_dir: ./output/doubleDiffusion_mps
+log_every: 10
+checkpoint_every: 0
+
+# Device
+device: mps
+
+# Restart from Fortran checkpoint
+fortran_restart: ../samples/doubleDiffusion/checkpoint_end.start

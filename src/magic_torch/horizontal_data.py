@@ -76,6 +76,13 @@ sinTheta_grid = torch.sin(theta_grid)
 cosTheta_grid = torch.cos(theta_grid)
 O_sin_theta_E2_grid = 1.0 / sinTheta_grid ** 2
 cosn_theta_E2_grid = cosTheta_grid * O_sin_theta_E2_grid
+gauss_grid = gauss[_grid_idx]  # Gauss weights in interleaved N/S order
+O_sin_theta_grid = 1.0 / sinTheta_grid  # 1/sin(theta) in interleaved order
+
+# n_theta_cal2ord: maps interleaved (calculation) order to geographic (sorted) order
+# Inverse of _grid_idx: _grid_idx maps geo→interleaved, n_theta_cal2ord maps interleaved→geo
+n_theta_cal2ord = torch.zeros(n_theta_max, dtype=torch.long, device=DEVICE)
+n_theta_cal2ord[_grid_idx] = torch.arange(n_theta_max, device=DEVICE)
 
 # Phi grid
 phi = torch.arange(n_phi_max, dtype=DTYPE, device=DEVICE) * (2.0 * pi / (n_phi_max * minc))

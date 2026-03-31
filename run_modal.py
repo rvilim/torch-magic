@@ -26,23 +26,53 @@ image = (
 )
 
 vol = modal.Volume.from_name("magic-output", create_if_missing=True)
+input_vol = modal.Volume.from_name("magic-input", create_if_missing=True)
 
 
 @app.function(
     image=image,
     gpu=GPU_TYPE,
     timeout=86400,
-    volumes={"/output": vol},
+    volumes={"/output": vol, "/input": input_vol},
 )
 def run_remote(cfg: dict, run_name: str):
     """Run the simulation inside a Modal container."""
     import sys
 
     # Set env vars BEFORE importing magic_torch
-    if "l_max" in cfg:
-        os.environ["MAGIC_LMAX"] = str(cfg["l_max"])
-    if "n_r_max" in cfg:
-        os.environ["MAGIC_NR"] = str(cfg["n_r_max"])
+    _CFG_TO_ENV = {
+        "l_max": "MAGIC_LMAX",
+        "n_r_max": "MAGIC_NR",
+        "n_cheb_max": "MAGIC_NCHEBMAX",
+        "minc": "MAGIC_MINC",
+        "n_cheb_ic_max": "MAGIC_NCHEBICMAX",
+        "sigma_ratio": "MAGIC_SIGMA_RATIO",
+        "kbotb": "MAGIC_KBOTB",
+        "nRotIC": "MAGIC_NROTIC",
+        "ra": "MAGIC_RA",
+        "time_scheme": "MAGIC_TIME_SCHEME",
+        "dt": "MAGIC_DTMAX",
+        "mode": "MAGIC_MODE",
+        "raxi": "MAGIC_RAXI",
+        "sc": "MAGIC_SC",
+        "strat": "MAGIC_STRAT",
+        "polind": "MAGIC_POLIND",
+        "g0": "MAGIC_G0",
+        "g1": "MAGIC_G1",
+        "g2": "MAGIC_G2",
+        "ktopv": "MAGIC_KTOPV",
+        "kbotv": "MAGIC_KBOTV",
+        "alpha": "MAGIC_ALPHA",
+        "ek": "MAGIC_EK",
+        "pr": "MAGIC_PR",
+        "l_correct_AMz": "MAGIC_L_CORRECT_AMZ",
+        "l_correct_AMe": "MAGIC_L_CORRECT_AME",
+        "init_s1": "MAGIC_INIT_S1",
+        "amp_s1": "MAGIC_AMP_S1",
+    }
+    for key, env_var in _CFG_TO_ENV.items():
+        if key in cfg:
+            os.environ[env_var] = str(cfg[key])
     os.environ["MAGIC_DEVICE"] = "cuda"
 
     sys.path.insert(0, "/root/src")
@@ -63,6 +93,18 @@ def run_remote(cfg: dict, run_name: str):
 def main(config: str):
     with open(config) as f:
         cfg = yaml.safe_load(f)
+
+    # Upload Fortran checkpoint to input volume if needed
+    fortran_restart = cfg.get("fortran_restart")
+    if fortran_restart and not fortran_restart.startswith("/input/"):
+        local_path = fortran_restart
+        remote_name = os.path.basename(local_path)
+        print(f"Uploading checkpoint {local_path} to Modal input volume...")
+        in_vol = modal.Volume.from_name("magic-input", create_if_missing=True)
+        with in_vol.batch_upload(force=True) as batch:
+            batch.put_file(local_path, f"/{remote_name}")
+        cfg["fortran_restart"] = f"/input/{remote_name}"
+        print(f"  Uploaded as /input/{remote_name}")
 
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"Launching Modal run: {run_name} (GPU: {GPU_TYPE})")

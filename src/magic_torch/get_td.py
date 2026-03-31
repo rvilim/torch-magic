@@ -187,6 +187,33 @@ def get_dsdt(VStLM, dVSrLM):
     return dsdt_partial, dVSrLM
 
 
+def get_dxidt(VXitLM, dVXirLM):
+    """Partial explicit terms for composition equation (before finish_exp).
+
+    Structurally identical to get_dsdt: dxidt_partial = dLh * VXitLM.
+
+    Args:
+        VXitLM: (lm_max, n_r_max) complex — S-component of spat_to_qst(VXi)
+        dVXirLM: (lm_max, n_r_max) complex — Q-component (ur*xi in SH)
+
+    Returns:
+        dxidt_partial: (lm_max, n_r_max) complex
+        dVXirLM: (lm_max, n_r_max) complex — for finish_exp_comp
+    """
+    dxidt_partial = _dLh * VXitLM
+
+    # Zero boundary points
+    dxidt_partial[:, 0] = 0.0
+    dxidt_partial[:, -1] = 0.0
+
+    # dVXirLM at boundaries should be zero
+    dVXirLM = dVXirLM.clone()
+    dVXirLM[:, 0] = 0.0
+    dVXirLM[:, -1] = 0.0
+
+    return dxidt_partial, dVXirLM
+
+
 def get_dbdt(VxBrLM, VxBtLM, VxBpLM):
     """Explicit terms for magnetic field equations (djdt partial, before finish_exp).
 

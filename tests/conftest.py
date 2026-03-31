@@ -1,5 +1,9 @@
 """Shared fixtures for Fortran reference comparison tests."""
 
+import os
+# Force CPU + float64 for reference comparisons (MPS only has float32)
+os.environ.setdefault("MAGIC_DEVICE", "cpu")
+
 from pathlib import Path
 import numpy as np
 import pytest
@@ -56,13 +60,14 @@ def _compute_snake_to_standard_perm(l_max: int, minc: int = 1) -> torch.Tensor:
     return perm
 
 
-# Precompute the permutation (l_max=16 for the benchmark)
+# Precompute permutations for each benchmark config
 _SNAKE2ST = _compute_snake_to_standard_perm(l_max=16, minc=1).to(DEVICE)
+_SNAKE2ST_BOUSS = _compute_snake_to_standard_perm(l_max=64, minc=4).to(DEVICE)
 
 # Names of field arrays that use LM ordering (first dimension is lm_max)
 _LM_FIELD_NAMES = {
     's_init', 'b_init', 'db_init', 'aj_init', 'w_init', 'dw_init', 'z_init',
-    'p_init', 'dp_init',
+    'dz_init', 'p_init', 'dp_init',
     's_step1', 'b_step1', 'db_step1', 'ddb_step1', 'aj_step1', 'dj_step1',
     'w_step1', 'dw_step1', 'ddw_step1', 'z_step1', 'dz_step1', 'p_step1',
     'dp_step1', 'ds_step1',
@@ -106,6 +111,82 @@ def load_ref(name: str, reorder_lm: bool = None) -> torch.Tensor:
             # t[snake_idx] -> result[st_idx] = t[snake_idx]
             result = torch.zeros_like(t)
             result[_SNAKE2ST] = t
+            return result
+
+    return t
+
+
+# Path to boussBenchSat Fortran reference data
+FORTRAN_REF_BOUSS = Path(__file__).parent.parent.parent / "samples" / "boussBenchSat" / "fortran_ref"
+
+# LM field names for boussBenchSat (IC fields included)
+_LM_FIELD_NAMES_BOUSS = _LM_FIELD_NAMES | {
+    *[f'{f}_init' for f in ('b_ic', 'db_ic', 'ddb_ic', 'aj_ic', 'dj_ic', 'ddj_ic')],
+    *[f'{f}_step{n}' for n in range(1, 102)
+      for f in ('b_ic', 'db_ic', 'ddb_ic', 'aj_ic', 'dj_ic', 'ddj_ic')],
+    'ddw_init', 'dj_init', 'ddb_init', 'ds_init',
+}
+
+
+def load_ref_bouss(name: str, reorder_lm: bool = None) -> torch.Tensor:
+    """Load a boussBenchSat Fortran reference array.
+
+    Uses l_max=64, minc=4 snake-to-standard permutation.
+    """
+    arr = np.load(FORTRAN_REF_BOUSS / f"{name}.npy")
+    if arr.ndim == 0:
+        return torch.tensor(arr.item(), device=DEVICE, dtype=DTYPE)
+    if np.issubdtype(arr.dtype, np.integer):
+        t = torch.from_numpy(arr.copy()).long().to(DEVICE)
+    elif np.issubdtype(arr.dtype, np.complexfloating):
+        t = torch.from_numpy(arr.copy()).to(CDTYPE).to(DEVICE)
+    else:
+        t = torch.from_numpy(arr.copy()).to(DTYPE).to(DEVICE)
+
+    should_reorder = reorder_lm if reorder_lm is not None else (name in _LM_FIELD_NAMES_BOUSS)
+    if should_reorder and t.shape[0] == len(_SNAKE2ST_BOUSS):
+        if t.ndim >= 1:
+            result = torch.zeros_like(t)
+            result[_SNAKE2ST_BOUSS] = t
+            return result
+
+    return t
+
+
+# Path to doubleDiffusion Fortran reference data
+FORTRAN_REF_DD = Path(__file__).parent.parent.parent / "samples" / "doubleDiffusion" / "fortran_ref"
+
+# LM field names for doubleDiffusion (no IC, but includes xi/dxi)
+_LM_FIELD_NAMES_DD = _LM_FIELD_NAMES | {
+    *[f'{f}_step{n}' for n in range(1, 102)
+      for f in ('xi', 'dxi')],
+    'xi_init', 'dxi_init',
+    'ddw_init', 'ddb_init', 'ds_init',
+    'dxidt_old', 'dxidt_impl', 'dxidt_expl', 'xi_imex_rhs',
+    'dVXirLM_nR17', 'VXitLM_nR17', 'VXipLM_nR17',
+}
+
+
+def load_ref_dd(name: str, reorder_lm: bool = None) -> torch.Tensor:
+    """Load a doubleDiffusion Fortran reference array.
+
+    Uses l_max=64, minc=4 snake-to-standard permutation (same as boussBenchSat).
+    """
+    arr = np.load(FORTRAN_REF_DD / f"{name}.npy")
+    if arr.ndim == 0:
+        return torch.tensor(arr.item(), device=DEVICE, dtype=DTYPE)
+    if np.issubdtype(arr.dtype, np.integer):
+        t = torch.from_numpy(arr.copy()).long().to(DEVICE)
+    elif np.issubdtype(arr.dtype, np.complexfloating):
+        t = torch.from_numpy(arr.copy()).to(CDTYPE).to(DEVICE)
+    else:
+        t = torch.from_numpy(arr.copy()).to(DTYPE).to(DEVICE)
+
+    should_reorder = reorder_lm if reorder_lm is not None else (name in _LM_FIELD_NAMES_DD)
+    if should_reorder and t.shape[0] == len(_SNAKE2ST_BOUSS):
+        if t.ndim >= 1:
+            result = torch.zeros_like(t)
+            result[_SNAKE2ST_BOUSS] = t
             return result
 
     return t

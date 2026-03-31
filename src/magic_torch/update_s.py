@@ -5,16 +5,16 @@ Implements:
 - finish_exp_entropy: Complete explicit nonlinear term (radial derivative)
 - updateS: Full IMEX solve + post-processing
 
-Boussinesq specialization: kappa=1, beta=0, dLtemp0=0, dLkappa=0, orho1=1.
+Handles both Boussinesq (kappa=1, beta=0) and anelastic (variable profiles).
 """
 
 import torch
 
 from .precision import DTYPE, CDTYPE, DEVICE
-from .params import n_r_max, lm_max, l_max
+from .params import n_r_max, lm_max, l_max, n_cheb_max, l_anel
 from .constants import sq4pi, two
 from .chebyshev import rMat, drMat, d2rMat, rnorm, boundary_fac
-from .radial_functions import or1, or2
+from .radial_functions import or1, or2, beta, dLtemp0, dLkappa, kappa, orho1
 from .horizontal_data import dLh, hdif_S
 from .pre_calculations import opr
 from .blocking import st_lm2, st_lm2l, st_lm2m
@@ -44,6 +44,12 @@ _hdif_lm = hdif_S[st_lm2l].to(CDTYPE).unsqueeze(1)  # (lm_max, 1)
 _dLh_lm = dLh.to(CDTYPE).unsqueeze(1)                # (lm_max, 1)
 _or1_r = or1.unsqueeze(0)                             # (1, n_r_max)
 _or2_r = or2.unsqueeze(0)                             # (1, n_r_max)
+_orho1_r = orho1.unsqueeze(0)                         # (1, n_r_max)
+
+# Anelastic first-derivative coefficient for implicit term
+# (beta + dLtemp0 + 2/r + dLkappa) — Boussinesq: just 2/r
+_s_impl_d1 = (beta + dLtemp0 + two * or1 + dLkappa).unsqueeze(0)  # (1, n_r_max)
+_kappa_r = kappa.unsqueeze(0)                         # (1, n_r_max)
 
 
 # --- LU-factored matrices storage (one per l degree) ---
@@ -84,16 +90,29 @@ def build_s_matrices(wimp_lin0: float):
     eye = torch.eye(N, dtype=DTYPE, device=cpu)
     inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
 
+    # Anelastic: first-derivative coefficient includes beta + dLtemp0 + dLkappa
+    # Boussinesq: beta=0, dLtemp0=0, dLkappa=0 → just 2/r
+    _beta = beta.to(cpu)
+    _dLtemp0 = dLtemp0.to(cpu)
+    _dLkappa = dLkappa.to(cpu)
+    _kappa = kappa.to(cpu)
+    d1_coeff = (_beta + _dLtemp0 + two * _or1 + _dLkappa).unsqueeze(1)  # (N, 1)
+    kappa_col = _kappa.unsqueeze(1)  # (N, 1)
+
     for l in range(l_max + 1):
         dL = float(l * (l + 1))
         hdif_l = hdif_S[l].item()
 
-        dat = _rnorm * (_rMat - wimp_lin0 * opr * hdif_l * (
-            _d2rMat + two * or1_col * _drMat - dL * or2_col * _rMat
+        dat = _rnorm * (_rMat - wimp_lin0 * opr * hdif_l * kappa_col * (
+            _d2rMat + d1_coeff * _drMat - dL * or2_col * _rMat
         ))
 
         dat[0, :] = _rnorm * _rMat[0, :]
         dat[N - 1, :] = _rnorm * _rMat[N - 1, :]
+
+        if n_cheb_max < N:
+            dat[0, n_cheb_max:N] = 0.0
+            dat[N - 1, n_cheb_max:N] = 0.0
 
         dat[:, 0] = dat[:, 0] * _bfac
         dat[:, N - 1] = dat[:, N - 1] * _bfac
@@ -113,9 +132,10 @@ def build_s_matrices(wimp_lin0: float):
 def finish_exp_entropy(ds_exp, dVSrLM):
     """Complete explicit entropy term by adding radial derivative of dVSrLM.
 
-    ds_exp = ds_exp - or2 * d(dVSrLM)/dr
-
-    Boussinesq: orho1=1, dentropy0=0 (no background entropy gradient).
+    Non-anelastic-liquid:
+        ds_exp = orho1 * (ds_exp - or2 * d(dVSrLM)/dr - dL*or2*dentropy0*w)
+    For Boussinesq: orho1=1, dentropy0=0 → ds_exp - or2*d(dVSrLM)/dr
+    For anelastic adiabatic: dentropy0=0 → orho1*(ds_exp - or2*d(dVSrLM)/dr)
 
     Args:
         ds_exp: (lm_max, n_r_max) complex — partial explicit term from get_dsdt
@@ -125,7 +145,10 @@ def finish_exp_entropy(ds_exp, dVSrLM):
         ds_exp: (lm_max, n_r_max) complex — completed explicit term
     """
     d_dVSrLM = get_dr(dVSrLM)
-    return ds_exp - _or2_r * d_dVSrLM
+    result = ds_exp - _or2_r * d_dVSrLM
+    if l_anel:
+        result = _orho1_r * result
+    return result
 
 
 def updateS(s_LMloc, ds_LMloc, dsdt, tscheme):
@@ -149,7 +172,11 @@ def updateS(s_LMloc, ds_LMloc, dsdt, tscheme):
     s_cheb = chunked_solve_complex(_s_inv_by_l, st_lm2l, rhs)
     s_cheb[_m0_mask] = s_cheb[_m0_mask].real.to(CDTYPE)
 
-    # 3. Convert Chebyshev coefficients to physical space
+    # 3. Truncate high Chebyshev modes (Fortran only stores n_cheb_max modes)
+    if n_cheb_max < N:
+        s_cheb[:, n_cheb_max:] = 0.0
+
+    # 4. Convert Chebyshev coefficients to physical space
     s_LMloc[:] = costf(s_cheb)
 
     # 4. Compute radial derivatives in physical space
@@ -159,11 +186,13 @@ def updateS(s_LMloc, ds_LMloc, dsdt, tscheme):
     # 5. Rotate IMEX time arrays (shift explicit history)
     tscheme.rotate_imex(dsdt)
 
-    # 6. Store current state as old (istage=1)
-    dsdt.old[:, :, 0] = s_LMloc.clone()
+    # 6. Store current state as old (always for CNAB2, only at wrap for DIRK)
+    if tscheme.store_old:
+        dsdt.old[:, :, 0] = s_LMloc.clone()
 
     # 7. Compute implicit diffusion term for next IMEX stage
-    # impl = opr * hdif_S(l) * (d2s + 2*or1*ds - l(l+1)*or2*s)
-    dsdt.impl[:, :, 0] = opr * _hdif_lm * (
-        d2s + two * _or1_r * ds_LMloc - _dLh_lm * _or2_r * s_LMloc
+    # impl = opr * hdif_S(l) * kappa * (d2s + (beta+dLtemp0+2/r+dLkappa)*ds - dLh*or2*s)
+    idx = tscheme.next_impl_idx
+    dsdt.impl[:, :, idx] = opr * _hdif_lm * _kappa_r * (
+        d2s + _s_impl_d1 * ds_LMloc - _dLh_lm * _or2_r * s_LMloc
     )
