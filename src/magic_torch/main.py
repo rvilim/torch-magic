@@ -45,7 +45,7 @@ from .params import (n_time_steps, dtmax, l_cond_ic, radratio, l_heat, l_mag,
                      l_power, l_hel, l_hemi)
 from .precision import CDTYPE, DEVICE
 from .time_scheme import tscheme
-from .pre_calculations import tScale, eScale
+from .pre_calculations import tScale, eScale, opm
 from .integration import rInt_R as _rInt_R_main
 from .radial_scheme import r_cmb, r_icb
 
@@ -606,9 +606,8 @@ def run(cfg=None):
             elsAnel_val = get_elsAnel(fields.b_LMloc, fields.db_LMloc, fields.aj_LMloc) if l_mag else 0.0
             e_mag_cmb_val = get_e_mag_cmb(fields.b_LMloc, fields.db_LMloc, fields.aj_LMloc) if l_mag else 0.0
 
+            # Compute par_cols for log accumulation (lvDiss/lbDiss filled after power block)
             par_cols = get_par_data(ek, em, dip_cols, dlm_v, dlm_b, elsAnel_val, e_mag_cmb_val)
-            write_par_line(f_par, t_out, par_cols)
-            f_par.flush()
 
             # Log time-averaging accumulation (output.f90:793-826)
             nonlocal log_e_kin_p_sum, log_e_kin_t_sum, log_e_mag_p_sum, log_e_mag_t_sum
@@ -754,6 +753,21 @@ def run(cfg=None):
 
                 # Reset timePassedLog after log call (output.f90:946)
                 timePassedLog = 0.0
+
+            # Update lvDiss/lbDiss in par_cols now that power values are available
+            import math as _math
+            try:
+                e_kin_total = e_kin_pol + e_kin_tor
+                if viscDiss != 0.0:
+                    par_cols[10] = _math.sqrt(2.0 * e_kin_total / abs(viscDiss))  # lvDiss
+                if l_mag and ohmDiss != 0.0:
+                    e_mag_total = e_mag_pol + e_mag_tor
+                    _e_mag_ic = (eic.e_p + eic.e_t) if eic is not None else 0.0
+                    par_cols[11] = _math.sqrt(2.0 * opm * (e_mag_total + _e_mag_ic) / abs(ohmDiss))  # lbDiss
+            except (UnboundLocalError, NameError):
+                pass  # viscDiss/ohmDiss not computed (l_power=False)
+            write_par_line(f_par, t_out, par_cols)
+            f_par.flush()
 
             # Accumulate radial profiles (step 0 IS included, matching Fortran)
             if accumulate:

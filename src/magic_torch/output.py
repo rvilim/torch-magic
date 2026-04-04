@@ -1430,6 +1430,9 @@ def get_par_data(ek, em, dip_cols, dlm_v, dlm_b,
                  elsAnel_val, e_mag_cmb_val):
     """Compute 19 par.TAG value columns (cols 2-20).
 
+    lvDiss (col 11) and lbDiss (col 12) are set to 0.0 here and updated
+    by the caller after power computation provides viscDiss/ohmDiss.
+
     Returns: list of 19 floats matching Fortran par.TAG columns 2-20.
     """
     e_kin = ek.e_p + ek.e_t
@@ -1486,12 +1489,16 @@ def get_par_data(ek, em, dip_cols, dlm_v, dlm_b,
         Dip = 0.0
         DipCMB = 0.0
 
-    # Not computed (Geos, dpV, dzV, lvDiss, lbDiss, ReEquat)
+    # Geos: needs l_par=true + cylindrical grid (not implemented)
     Geos = 0.0
+    # dpV, dzV: not implemented in Fortran either (output.f90:440-441)
     dpV = 0.0
     dzV = 0.0
+    # Dissipation lengthscales (output.f90:748-766)
+    # Set to 0.0 here; updated by caller after power computation provides viscDiss/ohmDiss
     lvDiss = 0.0
     lbDiss = 0.0
+    # ReEquat: needs ktopv=1 (no-slip top) + dPl0Eq array (not implemented)
     ReEquat = 0.0
 
     # Fortran column order (output.f90:773-788):

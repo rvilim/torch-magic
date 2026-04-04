@@ -100,7 +100,7 @@ _RTOL = {
     "e_mag_ic.start": 5e-4,
     "dipole.start": 5e-4,
     "heat.start": 1e-3,
-    "par.start": 5e-2,      # Geos/dpV/dzV not yet implemented
+    "par.start": 5e-2,
     "power.start": 5e-4,
     "u_square.start": 5e-4,
     "helicity.start": 5e-4,
@@ -132,21 +132,7 @@ def test_output_file(ref_sections, fname):
     assert len(test_vals) == len(ref_vals), (
         f"{fname}: length mismatch {len(test_vals)} vs {len(ref_vals)}")
 
-    if fname == "par.start":
-        # par.start has 20 columns per row. Some columns not yet implemented (output 0):
-        # col4=Geos, col9=dpV, col10=dzV, col11=lvDiss, col12=lbDiss, col19=ReEquat
-        n_cols = 20
-        mask = np.ones(len(test_vals), dtype=bool)
-        for row in range(len(test_vals) // n_cols):
-            for col in [4, 9, 10, 11, 12, 19]:
-                mask[row * n_cols + col] = False
-        np.testing.assert_allclose(
-            test_vals[mask], ref_vals[mask],
-            rtol=_RTOL[fname], atol=_ATOL,
-            err_msg=f"Mismatch in {fname} (Geos/dpV/dzV columns excluded)",
-        )
-    else:
-        np.testing.assert_allclose(
+    np.testing.assert_allclose(
             test_vals, ref_vals,
             rtol=_RTOL[fname], atol=_ATOL,
             err_msg=f"Mismatch in {fname}",
