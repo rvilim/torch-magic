@@ -95,10 +95,10 @@ g1 = _cfg_float("g1", "MAGIC_G1", 0.0)
 g2 = _cfg_float("g2", "MAGIC_G2", 0.0)
 
 # Boundary conditions
-ktops = 1  # fixed entropy at top
-kbots = 1  # fixed entropy at bottom
-ktopxi = 1  # fixed composition at top
-kbotxi = 1  # fixed composition at bottom
+ktops = _cfg_int("ktops", "MAGIC_KTOPS", 1)    # 1=fixed entropy, 2=fixed flux
+kbots = _cfg_int("kbots", "MAGIC_KBOTS", 1)    # 1=fixed entropy, 2=fixed flux
+ktopxi = _cfg_int("ktopxi", "MAGIC_KTOPXI", 1) # 1=fixed composition, 2=fixed flux
+kbotxi = _cfg_int("kbotxi", "MAGIC_KBOTXI", 1) # 1=fixed composition, 2=fixed flux
 ktopv = _cfg_int("ktopv", "MAGIC_KTOPV", 2)  # 1=stress-free, 2=no-slip
 kbotv = _cfg_int("kbotv", "MAGIC_KBOTV", 2)  # 1=stress-free, 2=no-slip
 kbotb = _cfg_int("kbotb", "MAGIC_KBOTB", 1)  # 1=insulating, 3=conducting IC
