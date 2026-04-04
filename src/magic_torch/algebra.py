@@ -1060,3 +1060,86 @@ def batched_thomas_solve(w_fwd_lm, inv_d_lm, du_lm, rhs):
         rhs[:, i] = (rhs[:, i] - du_lm[:, i] * rhs[:, i + 1]) * inv_d_lm[:, i]
 
     return rhs
+
+
+def precompute_pentadiag(dl2, dl1, d, du1, du2):
+    """Pre-compute pentadiag elimination weights from 5-band diagonals.
+
+    Forward sweep eliminates dl1 and dl2 entries. du2 is never modified.
+
+    Args:
+        dl2: (N-2,) second lower diagonal
+        dl1: (N-1,) first lower diagonal
+        d:   (N,)   main diagonal
+        du1: (N-1,) first upper diagonal
+        du2: (N-2,) second upper diagonal
+
+    Returns:
+        w1:       (N-1,) forward weights for first sub-diagonal
+        w2:       (N-2,) forward weights for second sub-diagonal
+        inv_d:    (N,)   reciprocal of modified diagonal
+        du1_mod:  (N-1,) modified first upper diagonal
+        du2:      (N-2,) original second upper diagonal (unchanged)
+    """
+    N = d.shape[0]
+    d_mod = d.clone()
+    du1_mod = du1.clone()
+    dl1_mod = dl1.clone()
+    w1 = torch.zeros(N - 1, dtype=d.dtype, device=d.device)
+    w2 = torch.zeros(N - 2, dtype=d.dtype, device=d.device)
+
+    for k in range(N - 2):
+        # Eliminate (k+1, k) using row k
+        w1[k] = dl1_mod[k] / d_mod[k]
+        d_mod[k + 1] -= w1[k] * du1_mod[k]
+        du1_mod[k + 1] -= w1[k] * du2[k]
+        # Eliminate (k+2, k) using row k
+        w2[k] = dl2[k] / d_mod[k]
+        dl1_mod[k + 1] -= w2[k] * du1_mod[k]
+        d_mod[k + 2] -= w2[k] * du2[k]
+
+    # Last step: only w1 for (N-1, N-2)
+    w1[N - 2] = dl1_mod[N - 2] / d_mod[N - 2]
+    d_mod[N - 1] -= w1[N - 2] * du1_mod[N - 2]
+
+    inv_d = 1.0 / d_mod
+    return w1, w2, inv_d, du1_mod, du2.clone()
+
+
+def batched_pentadiag_solve_precomp(w1_lm, w2_lm, inv_d_lm, du1_lm, du2_lm, rhs):
+    """Batched pentadiag solve with pre-computed elimination weights.
+
+    Sweeps over N radial points sequentially. At each step, ALL lm modes
+    are processed in parallel. Complex RHS with real weights.
+
+    Args:
+        w1_lm:   (lm_max, N-1) real — first sub-diag elimination weights
+        w2_lm:   (lm_max, N-2) real — second sub-diag elimination weights
+        inv_d_lm:(lm_max, N)   real — reciprocal modified diagonal
+        du1_lm:  (lm_max, N-1) real — modified first upper diagonal
+        du2_lm:  (lm_max, N-2) real — second upper diagonal
+        rhs:     (lm_max, N)   complex — right-hand side
+
+    Returns:
+        (lm_max, N) complex — solution
+    """
+    rhs = rhs.clone()
+    N = rhs.shape[1]
+
+    # Forward sweep: eliminate both sub-diagonals
+    for k in range(N - 2):
+        rhs[:, k + 1] -= w1_lm[:, k] * rhs[:, k]
+        rhs[:, k + 2] -= w2_lm[:, k] * rhs[:, k]
+    # Last w1 step
+    if N >= 2:
+        rhs[:, N - 1] -= w1_lm[:, N - 2] * rhs[:, N - 2]
+
+    # Backward sweep: solve upper triangular (d_mod, du1_mod, du2)
+    rhs[:, N - 1] *= inv_d_lm[:, N - 1]
+    if N >= 2:
+        rhs[:, N - 2] = (rhs[:, N - 2] - du1_lm[:, N - 2] * rhs[:, N - 1]) * inv_d_lm[:, N - 2]
+    for i in range(N - 3, -1, -1):
+        rhs[:, i] = (rhs[:, i] - du1_lm[:, i] * rhs[:, i + 1]
+                     - du2_lm[:, i] * rhs[:, i + 2]) * inv_d_lm[:, i]
+
+    return rhs

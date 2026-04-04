@@ -50,7 +50,7 @@ _im_dLh = (1j * st_lm2m.to(CDTYPE) * dLh.to(CDTYPE)).unsqueeze(1)  # (lm_max, 1)
 # Unique inverses per l degree — l=0 is zero
 _b_inv_by_l = None
 _j_inv_by_l = None
-# FD insulating: banded LU per l
+# FD insulating: banded LU per l (fallback for non-tridiag/pentadiag)
 _b_bands_by_l = None
 _b_piv_by_l = None
 _b_fac_by_l = None
@@ -59,6 +59,17 @@ _j_piv_by_l = None
 _j_fac_by_l = None
 _bj_kl = 0
 _bj_ku = 0
+# FD batched: pre-computed pentadiag for bMat, Thomas for jMat (per-lm expanded)
+_b_penta_w1 = None
+_b_penta_w2 = None
+_b_penta_inv_d = None
+_b_penta_du1 = None
+_b_penta_du2 = None
+_b_penta_fac = None
+_j_thomas_w_fwd = None
+_j_thomas_inv_d = None
+_j_thomas_du = None
+_j_thomas_fac = None
 # FD coupled IC: bordered-band per l
 _b_bordered_by_l = None
 _j_bordered_by_l = None
@@ -89,6 +100,8 @@ def _build_b_matrices_insulating(wimp_lin0: float):
     global _b_inv_by_l, _j_inv_by_l
     global _b_bands_by_l, _b_piv_by_l, _b_fac_by_l
     global _j_bands_by_l, _j_piv_by_l, _j_fac_by_l, _bj_kl, _bj_ku
+    global _b_penta_w1, _b_penta_w2, _b_penta_inv_d, _b_penta_du1, _b_penta_du2, _b_penta_fac
+    global _j_thomas_w_fwd, _j_thomas_inv_d, _j_thomas_du, _j_thomas_fac
     from .params import l_finite_diff, fd_order, fd_order_bound
     N = n_r_max
 
@@ -121,6 +134,20 @@ def _build_b_matrices_insulating(wimp_lin0: float):
     j_abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
     j_piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
     j_fac_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+    # Batched pentadiag/Thomas storage (filled in per-l loop)
+    _use_batched_bj = l_finite_diff and _bj_kl == 2 and _bj_ku == 2 and fd_order <= 2
+    if _use_batched_bj:
+        from .algebra import precompute_pentadiag, precompute_thomas
+        b_w1_all = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu)
+        b_w2_all = torch.zeros(l_max + 1, N - 2, dtype=DTYPE, device=cpu)
+        b_inv_d_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+        b_du1_all = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu)
+        b_du2_all = torch.zeros(l_max + 1, N - 2, dtype=DTYPE, device=cpu)
+        # jMat is tridiagonal (Dirichlet BCs) — use Thomas
+        j_w_all = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu)
+        j_inv_d_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+        j_du_all = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu)
+
     if l_finite_diff:
         # l=0 identity bands
         b_abd_all[0, _bj_kl + _bj_ku, :] = 1.0
@@ -161,6 +188,18 @@ def _build_b_matrices_insulating(wimp_lin0: float):
             b_abd_all[l] = abd_f
             b_piv_all[l] = piv
             b_fac_all[l] = fac_b
+            if _use_batched_bj:
+                dl2 = dat_b_precond[range(2, N), range(N - 2)]
+                dl1 = dat_b_precond[range(1, N), range(N - 1)]
+                d_b = dat_b_precond.diag()
+                du1 = dat_b_precond[range(N - 1), range(1, N)]
+                du2 = dat_b_precond[range(N - 2), range(2, N)]
+                w1, w2, inv_d, du1m, du2c = precompute_pentadiag(dl2, dl1, d_b, du1, du2)
+                b_w1_all[l] = w1
+                b_w2_all[l] = w2
+                b_inv_d_all[l] = inv_d
+                b_du1_all[l] = du1m
+                b_du2_all[l] = du2c
         else:
             lu_b, ip_b, info_b = prepare_mat(dat_b_precond)
             assert info_b == 0, f"Singular bMat for l={l}, info={info_b}"
@@ -192,6 +231,14 @@ def _build_b_matrices_insulating(wimp_lin0: float):
             j_abd_all[l] = abd_f
             j_piv_all[l] = piv
             j_fac_all[l] = fac_j
+            if _use_batched_bj:
+                dl_j = dat_j_precond[range(1, N), range(N - 1)]
+                d_j = dat_j_precond.diag()
+                du_j = dat_j_precond[range(N - 1), range(1, N)]
+                wj, inv_dj, duj = precompute_thomas(dl_j, d_j, du_j)
+                j_w_all[l] = wj
+                j_inv_d_all[l] = inv_dj
+                j_du_all[l] = duj
         else:
             lu_j, ip_j, info_j = prepare_mat(dat_j_precond)
             assert info_j == 0, f"Singular jMat for l={l}, info={info_j}"
@@ -207,6 +254,21 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         _j_fac_by_l = j_fac_all.to(DEVICE)
         _b_inv_by_l = None
         _j_inv_by_l = None
+        if _use_batched_bj:
+            # Expand per-l to per-lm for batched solve
+            _b_penta_w1 = b_w1_all[st_lm2l].to(DEVICE)
+            _b_penta_w2 = b_w2_all[st_lm2l].to(DEVICE)
+            _b_penta_inv_d = b_inv_d_all[st_lm2l].to(DEVICE)
+            _b_penta_du1 = b_du1_all[st_lm2l].to(DEVICE)
+            _b_penta_du2 = b_du2_all[st_lm2l].to(DEVICE)
+            _b_penta_fac = b_fac_all[st_lm2l].to(DEVICE)
+            _j_thomas_w_fwd = j_w_all[st_lm2l].to(DEVICE)
+            _j_thomas_inv_d = j_inv_d_all[st_lm2l].to(DEVICE)
+            _j_thomas_du = j_du_all[st_lm2l].to(DEVICE)
+            _j_thomas_fac = j_fac_all[st_lm2l].to(DEVICE)
+        else:
+            _b_penta_w1 = None
+            _j_thomas_w_fwd = None
     else:
         _b_inv_by_l = b_inv_by_l.to(DEVICE)
         _j_inv_by_l = j_inv_by_l.to(DEVICE)
@@ -486,7 +548,15 @@ def _updateB_insulating(b_LMloc, db_LMloc, ddb_LMloc,
     rhs_j[:, 0] = 0.0
     rhs_j[:, N - 1] = 0.0
 
-    if _b_bands_by_l is not None:
+    if _b_penta_w1 is not None:
+        # FD batched: pentadiag for bMat, Thomas for jMat
+        from .algebra import batched_pentadiag_solve_precomp as _bps, batched_thomas_solve as _bts
+        b_cheb = _bps(_b_penta_w1, _b_penta_w2, _b_penta_inv_d,
+                       _b_penta_du1, _b_penta_du2, _b_penta_fac * rhs_b)
+        j_cheb = _bts(_j_thomas_w_fwd, _j_thomas_inv_d, _j_thomas_du,
+                       _j_thomas_fac * rhs_j)
+    elif _b_bands_by_l is not None:
+        # FD fallback (non-pentadiag bandwidth)
         from .algebra import banded_solve_by_l
         b_cheb = banded_solve_by_l(
             _b_bands_by_l, _b_piv_by_l, st_lm2l, rhs_b,
