@@ -1957,7 +1957,9 @@ All FD tests compare Python-FD vs Fortran-FD (not vs Chebyshev — FD has O(h²)
 
 ### Remaining p0 error (fundamental, not a bug)
 
-After all fixes, l=0 pressure has a ~3.3e-13 relative error (2e-8 absolute). This comes from SHT roundoff in `dwdt.expl[lm=0]`: different summation order in Python's batched matmul vs Fortran's sequential loop gives ~1e-12 in explicit terms. This is fundamental and unavoidable — the RHS has a floor of ~1e-12, and the p0 solve amplifies it by the matrix condition number (~20).
+After all fixes, l=0 pressure has a ~3.3e-13 relative error (2e-8 absolute). The dominant source is entropy field FP differences amplified by the p0Mat condition number (~20). This is fundamental and unavoidable — well within all test tolerances, stable over time, and consistent with double-precision limits.
+
+Note: the FD boundary nonlinear terms issue previously listed here was investigated and found to be a non-issue. Fortran FD does NOT set nBc=0 at boundaries in the standard path (`l_parallel_solve` is hardcoded false, `l_single_matrix` is forced false for FD). Python's `bulk = slice(1, N-1)` correctly matches Fortran's boundary handling.
 
 ### Known limitations
 
@@ -2088,11 +2090,11 @@ Assessed by 5 independent audit agents cross-referencing code, tests, plan file,
 
 | # | Item | Severity | Details |
 |---|------|----------|---------|
-| 1 | `update_b.py` missing `lambda_`/`dLlambda` | Low | Insulating bMat/jMat hardcode `lambda=1, dLlambda=0`. Wrong for variable magnetic diffusivity. No test exercises this; `radial_functions.py` never sets non-trivial values. Same pattern as the xi/z10Mat fixes already applied. |
-| 2 | FD boundary nonlinear terms | Low | Fortran FD computes nonlinear terms at boundaries (`nBc=0`). Python unconditionally skips boundaries (`bulk = slice(1, N-1)`) and zeros boundary terms in `get_td.py`. Causes ~3.3e-13 p0 error, within tolerances. |
+| 1 | ~~`update_b.py` missing `lambda_`/`dLlambda`~~ | ~~Low~~ | **FIXED** (2026-04-04): Added lambda/dLlambda to all 11 locations. |
+| 2 | ~~FD boundary nonlinear terms~~ | ~~Low~~ | **NOT A BUG** (2026-04-04): Fortran FD does NOT set nBc=0 at boundaries. `l_parallel_solve` is hardcoded false, `l_single_matrix` is forced false for FD. Python's boundary handling is correct. |
 | 3 | No test for anelastic + composition | Low | The `update_xi.py` beta/orho1 fixes are unverifiable without a Fortran reference for anelastic + composition (strat>0, raxi>0). No existing sample exercises this combination. |
 | 4 | No test for FD + rotating IC | Medium | `samples/dynamo_benchmark_fd_rotIC/fortran_ref/` has 94 reference files but no dedicated test file. The `test_fd_multistep.py` covers some FD+rotIC fields but should be verified for completeness. |
-| 5 | Anelastic Chebyshev tolerances suspiciously loose | Medium | `test_anel_step.py` has `ddw` at 1.5% rtol, `dz` at 0.6% for just 3 steps. Both Python and Fortran use Chebyshev here (same scheme), so this disagreement may indicate a real bug rather than legitimate FP accumulation. Worth investigating. |
+| 5 | ~~Anelastic Chebyshev tolerances suspiciously loose~~ | ~~Medium~~ | **FIXED** (2026-04-03): Replaced precomputed inverse with batched LU solve. Errors dropped from 1e-3 to 1e-11. |
 
 ### Performance — CLAUDE.md rule violations
 
