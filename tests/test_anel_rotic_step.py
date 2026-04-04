@@ -78,7 +78,18 @@ def run_anel_rotic():
                     _results[name] = _results[name].to(torch.complex128)
 
 
-# Tolerances: same as test_anel_step.py (LU solve for WP)
+# Tolerances with documented precision limits.
+#
+# Pressure (p, dp): p0Mat condition number ~1e5 for anelastic strat=5.
+#   Expected: κ(p0Mat) × eps ≈ 1e5 × 2.2e-16 ≈ 2e-11 relative.
+#   |p| ~ 1e8, so abs errors look large but relative is ~7e-11.
+#
+# Derivatives at ICB (ddb, dj): Chebyshev spectral differentiation amplifies
+#   errors by ~N^(2k) at boundary points (k=derivative order).
+#   For N=33, d2: ~N^4 × eps ≈ 1.2e6 × 2.2e-16 ≈ 3e-10.
+#
+# Init p: ps0Mat (2N×2N coupled entropy-pressure) has κ ~1e8.
+#   Expected: κ × eps × ||p|| ≈ 1e8 × 2.2e-16 × 1e8 ≈ 2e-6 absolute.
 _STEP1_FIELDS = [
     ("w_step1", 1e-9, 1e-12),
     ("dw_step1", 1e-8, 1e-12),
@@ -87,11 +98,11 @@ _STEP1_FIELDS = [
     ("dz_step1", 1e-8, 1e-14),
     ("s_step1", 1e-11, 1e-13),
     ("ds_step1", 1e-9, 1e-11),
-    ("p_step1", 1e-2, 1e-8),
-    ("dp_step1", 1e-1, 1e-8),
+    ("p_step1", 1e-2, 1e-9),   # rel=6.7e-11; atol irrelevant (rtol × |p|~1e8 dominates)
+    ("dp_step1", 1e-1, 1e-9),  # rel=3.0e-11; atol irrelevant (rtol × |dp|~1e9 dominates)
     ("b_step1", 1e-13, 1e-13),
     ("db_step1", 1e-11, 1e-12),
-    ("ddb_step1", 1e-9, 1e-10),
+    ("ddb_step1", 1e-9, 1e-10),  # Chebyshev d2 amplification at ICB
     ("aj_step1", 1e-14, 1e-14),
     ("dj_step1", 1e-11, 1e-12),
 ]
@@ -102,12 +113,12 @@ _INIT_FIELDS = [
     ("z_init", 1e-14, 0),
     ("dz_init", 1e-14, 0),
     ("s_init", 1e-5, 1e-11),
-    ("p_init", 1e-5, 1e-11),
+    ("p_init", 1e-5, 1e-11),   # ps0Mat κ~1e8 → abs~1e-6 at |p|~1e8
     ("b_init", 1e-14, 1e-14),
     ("db_init", 1e-12, 1e-12),
-    ("ddb_init", 1e-8, 1e-9),
+    ("ddb_init", 1e-8, 1e-9),   # Chebyshev d2 amplification: N^4 × eps ≈ 3e-10
     ("aj_init", 1e-14, 1e-14),
-    ("dj_init", 1e-11, 1e-12),
+    ("dj_init", 1e-11, 1e-12),  # Chebyshev d1 at ICB
 ]
 
 
