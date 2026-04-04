@@ -505,8 +505,10 @@ def setup_initial_state():
         f.dxi_LMloc[:] = dxi
 
         d.dxidt.old[:, :, 0] = f.xi_LMloc.clone()
+        from .update_xi import _beta_r as _xi_beta_r
         d.dxidt.impl[:, :, 0] = osc * _hdif_Xi_lm * (
-            d2xi + two * _or1_r * dxi - _dLh_lm * _or2_r * f.xi_LMloc
+            d2xi + (_xi_beta_r + two * _or1_r) * dxi
+            - _dLh_lm * _or2_r * f.xi_LMloc
         )
 
     # --- Magnetic field: compute db, ddb, dj, ddj ---
@@ -560,11 +562,12 @@ def setup_initial_state():
         else:
             # old = c_dt_z10_ic * z10(ICB)
             d.domega_ic_dt.old[0] = c_dt_z10_ic * z10_icb
-            # impl = -visc*(2*or1*z10 - dz10) at ICB (Boussinesq: visc=1, beta=0)
-            from .radial_functions import visc as _visc
+            # impl = -visc*((2*or1 + beta)*z10 - dz10) at ICB
+            from .radial_functions import visc as _visc, beta as _beta_rf
             v_icb = _visc[n_r_max - 1].item()
+            beta_icb = _beta_rf[n_r_max - 1].item()
             dz10_icb = f.dz_LMloc[_l1m0, n_r_max - 1].real.item()
-            d.domega_ic_dt.impl[0] = -v_icb * (two * or1[n_r_max - 1].item() * z10_icb - dz10_icb)
+            d.domega_ic_dt.impl[0] = -v_icb * ((two * or1[n_r_max - 1].item() + beta_icb) * z10_icb - dz10_icb)
             # omega_ic = c_z10_omega_ic * z10(ICB) — should be 0 at init
             f.omega_ic = c_z10_omega_ic * z10_icb
 
