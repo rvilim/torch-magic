@@ -13,10 +13,11 @@ import torch
 
 from .precision import DTYPE, CDTYPE, DEVICE
 from .params import (n_r_max, n_r_ic_max, lm_max, l_max, init_b1, amp_b1,
-                     init_s1, amp_s1, radratio, l_cond_ic, l_mag, l_chemical_conv)
+                     init_s1, amp_s1, radratio, l_cond_ic, l_mag, l_chemical_conv,
+                     l_heat, l_SRIC, l_rot_ic, omega_ic1, nRotIC)
 from .constants import (pi, one, two, three, four, half, third, osq4pi,
                         sq4pi, zero)
-from .chebyshev import (r, r_cmb, r_icb, rMat, drMat, d2rMat,
+from .radial_scheme import (r, r_cmb, r_icb, rMat, drMat, d2rMat,
                         rnorm, boundary_fac)
 from .radial_functions import or1, rgrav, rho0, beta, dLtemp0, dLkappa, kappa
 from .params import l_anel
@@ -27,14 +28,31 @@ if l_anel:
                                    rgrav_f64, orho1_f64, ogrun, alpha0)
 from .pre_calculations import BuoFac, opr, osc, ChemFac
 from .algebra import prepare_mat, solve_mat_real
-from .cosine_transform import costf
+from .radial_scheme import costf
 from .blocking import st_lm2
 from .radial_derivatives import get_dr
 
-# Conduction state boundary diagnostics (set by initialize_fields)
+# Conduction state boundary diagnostics (set by initialize_fields or compute_cond_diagnostics)
 topcond = 0.0
 botcond = 0.0
 deltacond = 0.0
+
+
+def compute_cond_diagnostics():
+    """Compute topcond/botcond/deltacond from conduction state.
+
+    Called by initialize_fields() and by fortran_restart path.
+    Uses the analytical conduction profile (independent of field state).
+    """
+    global topcond, botcond, deltacond
+    if not l_heat:
+        return
+    # Compute conduction profile (returns physical-space values)
+    s0_phys, _ = ps_cond()
+    ds0 = get_dr(s0_phys.to(CDTYPE).unsqueeze(0)).squeeze(0).real
+    topcond = -osq4pi * ds0[0].item()
+    botcond = -osq4pi * ds0[-1].item()
+    deltacond = osq4pi * (s0_phys[-1] - s0_phys[0]).item()
 
 
 def _build_cheb_mats_f64():
@@ -173,8 +191,14 @@ def _ps_cond_anel():
     _bfac = boundary_fac
     f64 = torch.float64
 
-    # Build Chebyshev matrices in float64
-    _rMat, _drMat, _d2rMat = _build_cheb_mats_f64()
+    # Use actual scheme matrices (Chebyshev or FD) cast to float64
+    from .params import l_finite_diff
+    if l_finite_diff:
+        _rMat = rMat.to(f64).to('cpu')
+        _drMat = drMat.to(f64).to('cpu')
+        _d2rMat = d2rMat.to(f64).to('cpu')
+    else:
+        _rMat, _drMat, _d2rMat = _build_cheb_mats_f64()
 
     # Float64 profiles from radial_functions
     _or1 = or1_f64
@@ -215,26 +239,40 @@ def _ps_cond_anel():
     # Pressure BC (row N): Chebyshev integral constraint
     # when ViscHeatFac*ThExpNb != 0 and ktopp == 1
     if ViscHeatFac * ThExpNb != 0.0:
-        # work = ThExpNb * ViscHeatFac * ogrun * alpha0 * r^2 (physical space)
+        # work = ThExpNb * ViscHeatFac * ogrun * alpha0 * r^2 (for pressure cols)
         work_phys = ThExpNb * ViscHeatFac * _ogrun * _alpha0 * _r * _r
-        work = costf(work_phys)  # costf is self-inverse: physical → spectral
-        work = work * rnorm
-        work[0] = _bfac * work[0]
-        work[N - 1] = _bfac * work[N - 1]
-
-        # work2 = -ThExpNb * alpha0 * temp0 * rho0 * r^2 (physical space)
+        # work2 = -ThExpNb * alpha0 * temp0 * rho0 * r^2 (for entropy cols)
         work2_phys = -ThExpNb * _alpha0 * _temp0 * _rho0 * _r * _r
-        work2 = costf(work2_phys)
-        work2 = work2 * rnorm
-        work2[0] = _bfac * work2[0]
-        work2[N - 1] = _bfac * work2[N - 1]
 
-        # Chebyshev spectral integration kernel
-        K = _cheb_integ_kernel_f64(N)
+        if l_finite_diff:
+            # FD: trapezoidal integration (init_fields.f90:2387-2399)
+            ps0Mat[N, :N] = 0.0
+            ps0Mat[N, N:] = 0.0
+            # Interior points: 0.5 * f(r_i) * (r_{i+1} - r_{i-1})
+            for i in range(1, N - 1):
+                dr_trap = _r[i + 1] - _r[i - 1]
+                ps0Mat[N, i] = 0.5 * work2_phys[i] * dr_trap       # entropy col
+                ps0Mat[N, N + i] = 0.5 * work_phys[i] * dr_trap    # pressure col
+            # Endpoints
+            ps0Mat[N, 0] = 0.5 * work2_phys[0] * (_r[1] - _r[0])
+            ps0Mat[N, N] = 0.5 * work_phys[0] * (_r[1] - _r[0])
+            ps0Mat[N, N - 1] = 0.5 * work2_phys[N - 1] * (_r[N - 1] - _r[N - 2])
+            ps0Mat[N, 2 * N - 1] = 0.5 * work_phys[N - 1] * (_r[N - 1] - _r[N - 2])
+        else:
+            # Chebyshev: spectral integration kernel
+            work = costf(work_phys)  # physical → spectral
+            work = work * rnorm
+            work[0] = _bfac * work[0]
+            work[N - 1] = _bfac * work[N - 1]
 
-        # Row N: integral constraint
-        ps0Mat[N, N:] = K @ work    # pressure columns
-        ps0Mat[N, :N] = K @ work2   # entropy columns
+            work2 = costf(work2_phys)
+            work2 = work2 * rnorm
+            work2[0] = _bfac * work2[0]
+            work2[N - 1] = _bfac * work2[N - 1]
+
+            K = _cheb_integ_kernel_f64(N)
+            ps0Mat[N, N:] = K @ work    # pressure columns
+            ps0Mat[N, :N] = K @ work2   # entropy columns
     else:
         # Standard pressure BC: p(r_cmb) = 0
         ps0Mat[N, :N] = 0.0
@@ -469,22 +507,16 @@ def initialize_fields():
         fields.ddj_ic.zero_()
 
     # Initialize entropy and pressure
-    initS(fields.s_LMloc, fields.p_LMloc)
+    if l_heat:
+        initS(fields.s_LMloc, fields.p_LMloc)
 
-    # Compute conduction state boundary diagnostics (startFields.f90:172-175)
-    # For Boussinesq entropy diffusion: topcond = -osq4pi * ds0(CMB)
-    global topcond, botcond, deltacond
-    s0_phys = fields.s_LMloc[0, :].real  # l=0,m=0 conduction state in physical space
-    ds0 = get_dr(s0_phys.to(CDTYPE)).real
-    topcond = -osq4pi * ds0[0].item()
-    botcond = -osq4pi * ds0[-1].item()
-    deltacond = osq4pi * (s0_phys[-1] - s0_phys[0]).item()
+        # Compute conduction state boundary diagnostics (startFields.f90:172-175)
+        compute_cond_diagnostics()
 
     # Initialize composition field
     if l_chemical_conv:
         xi0, p_xi0 = xi_cond()
         fields.xi_LMloc[0, :] = xi0.to(CDTYPE)
-        # Add composition contribution to pressure (l=0,m=0)
         fields.p_LMloc[0, :] += p_xi0.to(CDTYPE)
 
     # Initialize magnetic field
@@ -494,4 +526,10 @@ def initialize_fields():
         else:
             initB(fields.b_LMloc, fields.aj_LMloc)
 
-    # omega_ic = 0, omega_ma = 0 (default for benchmark)
+    # Initialize IC/MA rotation (initV in Fortran)
+    # For l_SRIC (nRotIC=-1): set omega_ic = omega_ic1 and z10(ICB) = omega_ic/c_z10_omega_ic
+    if l_SRIC or (l_rot_ic and omega_ic1 != 0.0):
+        from .pre_calculations import c_z10_omega_ic
+        fields.omega_ic = omega_ic1
+        l1m0 = st_lm2[1, 0].item()
+        fields.z_LMloc[l1m0, n_r_max - 1] = complex(omega_ic1 / c_z10_omega_ic, 0.0)

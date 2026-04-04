@@ -13,9 +13,9 @@ Anelastic: variable profiles, stress-free BCs via ktopv/kbotv.
 import torch
 
 from .precision import DTYPE, CDTYPE, DEVICE
-from .params import n_r_max, lm_max, l_max, n_cheb_max, l_anel, ktopv, kbotv
+from .params import n_r_max, lm_max, l_max, n_cheb_max, l_anel, ktopv, kbotv, l_finite_diff
 from .constants import two, three, third, four
-from .chebyshev import rMat, drMat, d2rMat, d3rMat, rnorm, boundary_fac
+from .radial_scheme import rMat, drMat, d2rMat, d3rMat, rnorm, boundary_fac
 from .radial_functions import (
     or1, or2, or3, rgrav, rho0,
     beta, dbeta, ddbeta, visc, dLvisc, ddLvisc, orho1,
@@ -25,10 +25,13 @@ from .horizontal_data import dLh, hdif_V
 from .pre_calculations import BuoFac, ChemFac
 
 # Flag: use integral BC for p0 (anelastic with viscous heating)
-_l_p0_integ_bc = (ViscHeatFac * ThExpNb != 0.0)
+# Fortran uses integral BC only for Chebyshev; FD falls back to Dirichlet
+# (updateWP.f90 get_p0Mat lines 2592-2607: FD sets dat(1,:)=rMat(1,:))
+from .params import l_finite_diff as _l_fd_p0
+_l_p0_integ_bc = (ViscHeatFac * ThExpNb != 0.0) and not _l_fd_p0
 from .blocking import st_lm2, st_lm2l, st_lm2m
 from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
-from .cosine_transform import costf
+from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_dddr
 
 
@@ -68,6 +71,7 @@ _lm_l0 = st_lm2[0, 0].item()
 _p0Mat_lu = None
 _p0Mat_ip = None
 _p0Mat_inv = None  # (N, N) float64 on DEVICE — precomputed inverse for GPU solve
+_p0Mat_bands = None  # (dl, d, du) tridiagonal bands for FD — on DEVICE
 
 # --- l>=1 coupled (w,p) matrices ---
 _wpMat_lu = [None] * (l_max + 1)
@@ -79,6 +83,7 @@ _wpMat_fac_col = [None] * (l_max + 1)  # column preconditioning
 _wp_inv_by_l = None
 
 
+
 def build_p0_matrix():
     """Build and LU-factorize the l=0 pressure matrix.
 
@@ -86,7 +91,7 @@ def build_p0_matrix():
     Row 0: Dirichlet p=0 (Boussinesq) or Chebyshev integral constraint (anelastic
            with ViscHeatFac*ThExpNb != 0).
     """
-    global _p0Mat_lu, _p0Mat_ip, _p0Mat_inv
+    global _p0Mat_lu, _p0Mat_ip, _p0Mat_inv, _p0Mat_bands
     N = n_r_max
 
     # Build on CPU (scalar loops in prepare_mat)
@@ -101,13 +106,31 @@ def build_p0_matrix():
     # Bulk: dp/dr - beta*p = 0  (anelastic mass conservation)
     dat[1:, :] = _rnorm * (_drMat[1:, :] - _beta[1:].unsqueeze(1) * _rMat[1:, :])
 
+    # FD override: last row uses first-order backward difference.
+    # Fortran get_p0Mat only overrides columns N-1 and N-2. The drMat
+    # boundary stencil at other columns survives in the dense matrix.
+    # But Fortran then extracts into type_bandmat with n_bands=order+1,
+    # which silently drops entries outside the band. We must match this
+    # by zeroing entries that fall outside the Fortran band.
+    if l_finite_diff:
+        from .radial_scheme import r as _r
+        from .params import fd_order as _fd_order_p0
+        _r_cpu = _r.to(cpu)
+        delr = _r_cpu[N - 1] - _r_cpu[N - 2]
+        # Override the two first-order entries
+        dat[N - 1, N - 1] = 1.0 / delr - _beta[N - 1]
+        dat[N - 1, N - 2] = -1.0 / delr
+        # Zero entries outside the Fortran band (n_bands = order+1, kl = order//2)
+        p0_kl = _fd_order_p0 // 2
+        dat[N - 1, :N - 1 - p0_kl] = 0.0
+
     # Row 0 boundary condition
     if _l_p0_integ_bc:
         # Chebyshev integral constraint: ∫ ThExpNb*ViscHeatFac*ogrun*alpha0*r²*p dr = const
         # (updateWP.f90 get_p0Mat lines 2565-2585)
         from .init_fields import _cheb_integ_kernel_f64
         from .radial_functions import ViscHeatFac, ThExpNb, ogrun, alpha0
-        from .chebyshev import r
+        from .radial_scheme import r
         work_phys = ThExpNb * ViscHeatFac * ogrun * alpha0 * r * r
         work = costf(work_phys.to(cpu))
         work = work * _rnorm
@@ -125,18 +148,67 @@ def build_p0_matrix():
     dat[:, 0] = dat[:, 0] * _bfac
     dat[:, N - 1] = dat[:, N - 1] * _bfac
 
-    lu, ip, info = prepare_mat(dat)
-    assert info == 0, "Singular p0Mat"
-    # Keep on CPU — solve_mat_real uses scalar Python loops
-    _p0Mat_lu = lu
-    _p0Mat_ip = ip
+    if l_finite_diff:
+        # FD: match Fortran's solver exactly.
+        # Fortran type_bandmat with n_bands=3 uses prepare_tridiag/solve_tridiag.
+        # Fortran type_bandmat with n_bands>3 uses prepare_band/solve_band.
+        from .params import fd_order as _fd_order_p0_build
+        p0_kl = _fd_order_p0_build // 2
+        p0_ku = p0_kl
+        n_bands_p0 = _fd_order_p0_build + 1
+        if n_bands_p0 == 3:
+            # Tridiagonal: use prepare_tridiag (matches Fortran exactly)
+            from .algebra import prepare_tridiag, extract_tridiag
+            dl, d, du = extract_tridiag(dat)
+            dl, d, du, du2, pivot, info = prepare_tridiag(dl, d, du)
+            assert info == 0, f"Singular p0Mat (tridiag), info={info}"
+            _p0Mat_bands = ('tridiag', dl, d, du, du2, pivot)
+        else:
+            # Wider band: use prepare_band (matches Fortran exactly)
+            from .algebra import dense_to_band_storage, prepare_band
+            abd = dense_to_band_storage(dat, p0_kl, p0_ku)
+            abd_f, piv, info = prepare_band(abd, N, p0_kl, p0_ku)
+            assert info == 0, f"Singular p0Mat (banded), info={info}"
+            _p0Mat_bands = ('band', abd_f, piv, N, p0_kl, p0_ku)
+        _p0Mat_inv = None
+        _p0Mat_lu = None
+        _p0Mat_ip = None
+    else:
+        # Chebyshev: dense LU + precomputed inverse
+        lu, ip, info = prepare_mat(dat)
+        assert info == 0, "Singular p0Mat"
+        _p0Mat_lu = lu
+        _p0Mat_ip = ip
+        eye = torch.eye(N, dtype=DTYPE, device=cpu)
+        inv_cols = []
+        for i in range(N):
+            inv_cols.append(solve_mat_real(lu, ip, eye[:, i]))
+        _p0Mat_inv = torch.stack(inv_cols, dim=1).to(device=DEVICE)
+        _p0Mat_bands = None
 
-    # Precompute inverse on GPU for fast p0 solve (avoids CPU↔GPU sync per step)
-    eye = torch.eye(N, dtype=DTYPE, device=cpu)
-    inv_cols = []
-    for i in range(N):
-        inv_cols.append(solve_mat_real(lu, ip, eye[:, i]))
-    _p0Mat_inv = torch.stack(inv_cols, dim=1).to(device=DEVICE)
+
+def solve_p0(p0_rhs: torch.Tensor) -> torch.Tensor:
+    """Solve the l=0 pressure system.
+
+    FD: banded LU solve (matching Fortran's tridiagonal solver).
+    Chebyshev: precomputed dense inverse.
+
+    Args:
+        p0_rhs: (N,) real RHS
+
+    Returns:
+        (N,) real solution
+    """
+    if _p0Mat_bands is not None:
+        if _p0Mat_bands[0] == 'tridiag':
+            from .algebra import solve_tridiag_real
+            _, dl, d, du, du2, pivot = _p0Mat_bands
+            return solve_tridiag_real(dl, d, du, du2, pivot, p0_rhs)
+        else:
+            from .algebra import solve_band_real
+            _, abd_f, piv, n, kl, ku = _p0Mat_bands
+            return solve_band_real(abd_f, n, kl, ku, piv, p0_rhs)
+    return _p0Mat_inv @ p0_rhs
 
 
 def build_wp_matrices(wimp_lin0: float):
@@ -326,7 +398,7 @@ def updateWP(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
     # Row 0: integral BC or Dirichlet
     if _l_p0_integ_bc:
         from .radial_functions import alpha0, temp0
-        from .chebyshev import r
+        from .radial_scheme import r
         from .integration import rInt_R
         work = ThExpNb * alpha0 * temp0 * rho0 * r * r * s_LMloc[lm0].real
         p0_rhs[0] = rInt_R(work)
@@ -360,7 +432,7 @@ def updateWP(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
     p_cheb = sol[:, N:]
 
     # l=0 pressure from p0Mat (GPU matmul, no CPU↔GPU sync)
-    p_cheb[lm0, :] = (_p0Mat_inv @ p0_rhs).to(CDTYPE)
+    p_cheb[lm0, :] = solve_p0(p0_rhs).to(CDTYPE)
 
     # 3. Truncate high Chebyshev modes (Fortran only stores n_cheb_max modes)
     if n_cheb_max < N:

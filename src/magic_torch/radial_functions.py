@@ -13,7 +13,7 @@ from .precision import DTYPE, DEVICE
 from .params import (n_r_max, n_r_ic_max, radratio, l_cond_ic,
                      l_anel, strat, polind, g0, g1, g2, l_mag,
                      ra, ek, pr, prmag, mode, l_max)
-from .chebyshev import r, r_cmb, r_icb
+from .radial_scheme import r, r_cmb, r_icb
 
 # Inverse radial functions
 or1 = 1.0 / r          # 1/r
@@ -71,12 +71,10 @@ ThExpNb = 1.0  # default from Namelists.f90:1398
 if l_anel:
     # --- Polytropic reference state (radial.f90:622-725) ---
     # Compute in float64 on CPU for machine precision, then cast to DTYPE/DEVICE.
-    # Recompute r in float64 (the module-level r may be float32 on MPS).
+    # Use the actual grid from radial_scheme (Chebyshev CGL or FD stretched).
     _rcmb = float(r_cmb)
     _ricb = float(r_icb)
-    _k64 = torch.arange(n_r_max, dtype=torch.float64)
-    _xcheb64 = torch.cos(math.pi * _k64 / (n_r_max - 1))
-    _r64 = 0.5 * (_rcmb - _ricb) * _xcheb64 + 0.5 * (_ricb + _rcmb)
+    _r64 = r.to(torch.float64).to('cpu')
     _or1_64 = 1.0 / _r64
     _or2_64 = _or1_64 * _or1_64
     _or3_64 = _or2_64 * _or1_64

@@ -12,14 +12,15 @@ import torch
 from .precision import DTYPE, CDTYPE, DEVICE
 from .params import (n_r_max, lm_max, l_max, n_theta_max, n_phi_max, alpha,
                      l_cond_ic, l_rot_ic, l_mag, l_chemical_conv, l_anel,
-                     l_correct_AMz, l_correct_AMe)
+                     l_correct_AMz, l_correct_AMe, l_heat, l_SRIC,
+                     l_double_curl, l_finite_diff)
 from .courant import courant_check, dt_courant
 from .radial_functions import or2
 from .horizontal_data import dLh, hdif_S, hdif_V, hdif_B, hdif_Xi
 from .pre_calculations import opr, opm, BuoFac, ChemFac, CorFac, LFfac, l_z10mat, osc
 from .blocking import st_lm2l, st_lm2m
 from .radial_derivatives import get_dr, get_ddr, get_dddr
-from .cosine_transform import costf
+from .radial_scheme import costf
 from .time_scheme import tscheme
 from . import fields
 from . import dt_fields
@@ -27,11 +28,12 @@ from .sht import (scal_to_spat, scal_to_SH, torpol_to_spat,
                   torpol_to_curl_spat, spat_to_sphertor,
                   pol_to_grad_spat, pol_to_curlr_spat, torpol_to_dphspat)
 from .get_nl import get_nl
-from .get_td import get_dwdt, get_dzdt, get_dpdt, get_dsdt, get_dbdt
+from .get_td import get_dwdt, get_dwdt_double_curl, get_dzdt, get_dpdt, get_dsdt, get_dbdt
 from .update_s import (build_s_matrices, finish_exp_entropy, updateS)
 from .update_z import (build_z_matrices, updateZ, finish_exp_tor)
-from .update_wp import (build_p0_matrix, build_wp_matrices, updateWP)
+from .update_wp import (build_p0_matrix, build_wp_matrices, updateWP, finish_exp_pol)
 from .update_b import (build_b_matrices, finish_exp_mag, updateB, finish_exp_mag_ic)
+from .update_w_doublecurl import (build_w_matrices, updateW, get_w_old, get_w_impl)
 from .constants import two, three, third, four
 import math
 
@@ -85,6 +87,9 @@ from .algebra import chunked_solve_complex
 from .params import n_cheb_max
 
 _m0_mask = (st_lm2m == 0)  # (lm_max,) bool
+
+# Lorentz torque on IC from most recent radial_loop (for rot.TAG output)
+lorentz_torque_ic_last = 0.0
 
 # Combined D1+D2 matrix for single matmul (saves 1 dispatch per call)
 _D12_T = torch.cat([_D1_cd.T, _D2_cd.T], dim=1)  # (N, 2N)
@@ -252,7 +257,7 @@ def _fused_lm_loop_fast():
     w_cheb = sol_wp[:, :N]
     p_cheb = sol_wp[:, N:]
     # l=0 pressure from p0Mat (GPU matmul, no CPU↔GPU sync)
-    p_cheb[lm0, :] = (update_wp._p0Mat_inv @ p0_rhs).to(CDTYPE)
+    p_cheb[lm0, :] = update_wp.solve_p0(p0_rhs).to(CDTYPE)
     if n_cheb_max < N:
         w_cheb[:, n_cheb_max:] = 0.0
         p_cheb[:, n_cheb_max:] = 0.0
@@ -332,6 +337,16 @@ def _fused_lm_loop_fast():
             - _two_dLh_or3 * f.w_LMloc
         )
     )
+    # Fortran get_pol_rhs_imp loops over l>0, interior radial points only.
+    # l=0 zeroing is load-bearing: the WP batched solve processes all lm,
+    # and nonzero l=0 impl would corrupt w_cheb[lm0] (p0Mat only fixes p).
+    # Boundary zeroing is cosmetic (rhs_combined[:, 1:N-1] skips them).
+    d.dwdt.impl[update_wp._lm_l0, :, impl_idx] = 0
+    d.dpdt.impl[update_wp._lm_l0, :, impl_idx] = 0
+    d.dwdt.impl[:, 0, impl_idx] = 0
+    d.dwdt.impl[:, -1, impl_idx] = 0
+    d.dpdt.impl[:, 0, impl_idx] = 0
+    d.dpdt.impl[:, -1, impl_idx] = 0
 
 
 
@@ -361,22 +376,23 @@ def setup_initial_state():
         ta.expl.zero_()
 
     # --- Entropy: compute ds, d2s ---
-    ds, d2s = get_ddr(f.s_LMloc)
-    f.ds_LMloc[:] = ds
+    if l_heat:
+        ds, d2s = get_ddr(f.s_LMloc)
+        f.ds_LMloc[:] = ds
 
-    # dsdt.old = s
-    d.dsdt.old[:, :, 0] = f.s_LMloc.clone()
+        # dsdt.old = s
+        d.dsdt.old[:, :, 0] = f.s_LMloc.clone()
 
-    # dsdt.impl = opr * hdif_S * kappa * (d2s + (beta+dLtemp0+2/r+dLkappa)*ds - dLh*or2*s)
-    if l_anel:
-        from .update_s import _kappa_r, _s_impl_d1
-        d.dsdt.impl[:, :, 0] = opr * _hdif_S_lm * _kappa_r * (
-            d2s + _s_impl_d1 * ds - _dLh_lm * _or2_r * f.s_LMloc
-        )
-    else:
-        d.dsdt.impl[:, :, 0] = opr * _hdif_S_lm * (
-            d2s + two * _or1_r * ds - _dLh_lm * _or2_r * f.s_LMloc
-        )
+        # dsdt.impl = opr * hdif_S * kappa * (d2s + (beta+dLtemp0+2/r+dLkappa)*ds - dLh*or2*s)
+        if l_anel:
+            from .update_s import _kappa_r, _s_impl_d1
+            d.dsdt.impl[:, :, 0] = opr * _hdif_S_lm * _kappa_r * (
+                d2s + _s_impl_d1 * ds - _dLh_lm * _or2_r * f.s_LMloc
+            )
+        else:
+            d.dsdt.impl[:, :, 0] = opr * _hdif_S_lm * (
+                d2s + two * _or1_r * ds - _dLh_lm * _or2_r * f.s_LMloc
+            )
 
     # --- Toroidal velocity: compute dz, d2z ---
     dz, d2z = get_ddr(f.z_LMloc)
@@ -397,63 +413,91 @@ def setup_initial_state():
             d2z - _dLh_lm * _or2_r * f.z_LMloc
         )
 
-    # --- Poloidal velocity + pressure: compute dw, ddw, dddw, dp ---
-    dw, ddw, dddw = get_dddr(f.w_LMloc)
+    # --- Poloidal velocity + pressure: compute dw, ddw, dp ---
+    dw, ddw = get_ddr(f.w_LMloc)
     f.dw_LMloc[:] = dw
     f.ddw_LMloc[:] = ddw
-    dp = get_dr(f.p_LMloc)
-    f.dp_LMloc[:] = dp
+    if not l_double_curl:
+        # Non-double-curl needs dddw for dpdt.impl, dp for dwdt.impl
+        dddw = get_dddr(f.w_LMloc)[2]  # 3rd output of get_dddr
+        dp = get_dr(f.p_LMloc)
+        f.dp_LMloc[:] = dp
 
-    # dwdt.old = dLh * or2 * w
-    d.dwdt.old[:, :, 0] = _dLh_lm * _or2_r * f.w_LMloc
+    if l_double_curl:
+        # Double-curl: dddw, ddddw via chaining D1(D2(w)), D2(D2(w))
+        # Matches Fortran get_pol_rhs_imp (get_ddr(w)→dw,ddw; get_ddr(ddw)→dddw,ddddw)
+        dddw, ddddw = get_ddr(ddw)
+        d.dwdt.old[:, :, 0] = get_w_old(f.w_LMloc, dw, ddw)
+        d.dwdt.impl[:, :, 0] = get_w_impl(
+            f.w_LMloc, dw, ddw, dddw, ddddw,
+            f.s_LMloc, f.xi_LMloc if l_chemical_conv else None)
+        # l=0 and boundary zeroing
+        from .update_wp import _lm_l0
+        d.dwdt.impl[_lm_l0, :, 0] = 0
+        d.dwdt.impl[:, 0, 0] = 0
+        d.dwdt.impl[:, -1, 0] = 0
+        # dpdt is not time-stepped in double-curl — leave at zero
+    else:
+        # Standard coupled w+p formulation
+        # dwdt.old = dLh * or2 * w
+        d.dwdt.old[:, :, 0] = _dLh_lm * _or2_r * f.w_LMloc
 
-    # dpdt.old = -dLh * or2 * dw
-    d.dpdt.old[:, :, 0] = -_dLh_lm * _or2_r * dw
+        # dpdt.old = -dLh * or2 * dw
+        d.dpdt.old[:, :, 0] = -_dLh_lm * _or2_r * dw
 
-    # dwdt.impl and dpdt.impl: full anelastic terms from update_wp.py
-    if l_anel:
-        from .update_wp import (
-            _visc_r as _wp_visc, _beta_r as _wp_beta,
-            _dLvisc_r as _wp_dLvisc, _dbeta_r as _wp_dbeta,
-            _rho0_r as _wp_rho0,
-        )
-        Dif_w = _hdif_V_lm * _dLh_lm * _or2_r * _wp_visc * (
-            ddw
-            + (two * _wp_dLvisc - third * _wp_beta) * dw
-            - (_dLh_lm * _or2_r
-               + four * third * (_wp_dbeta + _wp_dLvisc * _wp_beta
-                                 + (three * _wp_dLvisc + _wp_beta) * _or1_r))
-            * f.w_LMloc
-        )
-        Pre = -dp + _wp_beta * f.p_LMloc
-        Buo = BuoFac * _wp_rho0 * _rgrav_r * f.s_LMloc
-        if l_chemical_conv:
-            Buo = Buo + ChemFac * _wp_rho0 * _rgrav_r * f.xi_LMloc
-        d.dwdt.impl[:, :, 0] = Pre + Dif_w + Buo
-
-        d.dpdt.impl[:, :, 0] = (
-            _dLh_lm * _or2_r * f.p_LMloc
-            + _hdif_V_lm * _wp_visc * _dLh_lm * _or2_r * (
-                -dddw
-                + (_wp_beta - _wp_dLvisc) * ddw
-                + (_dLh_lm * _or2_r + _wp_dLvisc * _wp_beta + _wp_dbeta
-                   + two * (_wp_dLvisc + _wp_beta) * _or1_r) * dw
-                - _dLh_lm * _or2_r
-                * (two * _or1_r + two * third * _wp_beta + _wp_dLvisc)
+        # dwdt.impl and dpdt.impl: full anelastic terms from update_wp.py
+        if l_anel:
+            from .update_wp import (
+                _visc_r as _wp_visc, _beta_r as _wp_beta,
+                _dLvisc_r as _wp_dLvisc, _dbeta_r as _wp_dbeta,
+                _rho0_r as _wp_rho0,
+            )
+            Dif_w = _hdif_V_lm * _dLh_lm * _or2_r * _wp_visc * (
+                ddw
+                + (two * _wp_dLvisc - third * _wp_beta) * dw
+                - (_dLh_lm * _or2_r
+                   + four * third * (_wp_dbeta + _wp_dLvisc * _wp_beta
+                                     + (three * _wp_dLvisc + _wp_beta) * _or1_r))
                 * f.w_LMloc
             )
-        )
-    else:
-        Dif_w = _hdif_V_lm * _dLh_lm * _or2_r * (ddw - _dLh_lm * _or2_r * f.w_LMloc)
-        d.dwdt.impl[:, :, 0] = -dp + Dif_w + BuoFac * _rgrav_r * f.s_LMloc
-        if l_chemical_conv:
-            d.dwdt.impl[:, :, 0] += ChemFac * _rgrav_r * f.xi_LMloc
+            Pre = -dp + _wp_beta * f.p_LMloc
+            Buo = BuoFac * _wp_rho0 * _rgrav_r * f.s_LMloc
+            if l_chemical_conv:
+                Buo = Buo + ChemFac * _wp_rho0 * _rgrav_r * f.xi_LMloc
+            d.dwdt.impl[:, :, 0] = Pre + Dif_w + Buo
 
-        d.dpdt.impl[:, :, 0] = (_dLh_lm * _or2_r * f.p_LMloc
-                                + _hdif_V_lm * _dLh_lm * _or2_r * (
-                                    -dddw + _dLh_lm * _or2_r * dw
-                                    - two * _dLh_lm * _or3_r * f.w_LMloc
-                                ))
+            d.dpdt.impl[:, :, 0] = (
+                _dLh_lm * _or2_r * f.p_LMloc
+                + _hdif_V_lm * _wp_visc * _dLh_lm * _or2_r * (
+                    -dddw
+                    + (_wp_beta - _wp_dLvisc) * ddw
+                    + (_dLh_lm * _or2_r + _wp_dLvisc * _wp_beta + _wp_dbeta
+                       + two * (_wp_dLvisc + _wp_beta) * _or1_r) * dw
+                    - _dLh_lm * _or2_r
+                    * (two * _or1_r + two * third * _wp_beta + _wp_dLvisc)
+                    * f.w_LMloc
+                )
+            )
+        else:
+            Dif_w = _hdif_V_lm * _dLh_lm * _or2_r * (ddw - _dLh_lm * _or2_r * f.w_LMloc)
+            d.dwdt.impl[:, :, 0] = -dp + Dif_w + BuoFac * _rgrav_r * f.s_LMloc
+            if l_chemical_conv:
+                d.dwdt.impl[:, :, 0] += ChemFac * _rgrav_r * f.xi_LMloc
+
+            d.dpdt.impl[:, :, 0] = (_dLh_lm * _or2_r * f.p_LMloc
+                                    + _hdif_V_lm * _dLh_lm * _or2_r * (
+                                        -dddw + _dLh_lm * _or2_r * dw
+                                        - two * _dLh_lm * _or3_r * f.w_LMloc
+                                    ))
+
+        # l=0 and boundary zeroing
+        from .update_wp import _lm_l0
+        d.dwdt.impl[_lm_l0, :, 0] = 0
+        d.dpdt.impl[_lm_l0, :, 0] = 0
+        d.dwdt.impl[:, 0, 0] = 0
+        d.dwdt.impl[:, -1, 0] = 0
+        d.dpdt.impl[:, 0, 0] = 0
+        d.dpdt.impl[:, -1, 0] = 0
 
     # --- Composition: compute dxi, d2xi ---
     if l_chemical_conv:
@@ -481,13 +525,15 @@ def setup_initial_state():
         d.djdt.old[:, :, 0] = _dLh_lm * _or2_r * f.aj_LMloc
 
         # dbdt.impl = opm * hdif_B * dLh * or2 * (ddb - dLh * or2 * b)
-        d.dbdt.impl[:, :, 0] = opm * _hdif_B_lm * _dLh_lm * _or2_r * (
-            ddb - _dLh_lm * _or2_r * f.b_LMloc
+        # Fortran only computes interior (n_r_cmb+1 to n_r_icb-1); boundaries stay zero.
+        or2_int = _or2_r[:, 1:-1]
+        d.dbdt.impl[:, 1:-1, 0] = opm * _hdif_B_lm * _dLh_lm * or2_int * (
+            ddb[:, 1:-1] - _dLh_lm * or2_int * f.b_LMloc[:, 1:-1]
         )
 
         # djdt.impl = opm * hdif_B * dLh * or2 * (ddj - dLh * or2 * aj)
-        d.djdt.impl[:, :, 0] = opm * _hdif_B_lm * _dLh_lm * _or2_r * (
-            ddj - _dLh_lm * _or2_r * f.aj_LMloc
+        d.djdt.impl[:, 1:-1, 0] = opm * _hdif_B_lm * _dLh_lm * or2_int * (
+            ddj[:, 1:-1] - _dLh_lm * or2_int * f.aj_LMloc[:, 1:-1]
         )
 
         # --- IC magnetic field (if conducting inner core) ---
@@ -499,20 +545,25 @@ def setup_initial_state():
             )
 
     # --- IC rotation initial state ---
-    if l_z10mat and l_mag:
+    if l_z10mat:
         from .pre_calculations import c_dt_z10_ic, c_z10_omega_ic
         from .blocking import st_lm2 as _st_lm2
         _l1m0 = _st_lm2[1, 0].item()
-        # old = c_dt_z10_ic * z10(ICB)
         z10_icb = f.z_LMloc[_l1m0, n_r_max - 1].real.item()
-        d.domega_ic_dt.old[0] = c_dt_z10_ic * z10_icb
-        # impl = -visc*(2*or1*z10 - dz10) at ICB (Boussinesq: visc=1, beta=0)
-        from .radial_functions import visc as _visc
-        v_icb = _visc[n_r_max - 1].item()
-        dz10_icb = f.dz_LMloc[_l1m0, n_r_max - 1].real.item()
-        d.domega_ic_dt.impl[0] = -v_icb * (two * or1[n_r_max - 1].item() * z10_icb - dz10_icb)
-        # omega_ic = c_z10_omega_ic * z10(ICB) — should be 0 at init
-        f.omega_ic = c_z10_omega_ic * z10_icb
+
+        if l_SRIC:
+            # Prescribed IC rotation: omega_ic is fixed, no domega_ic_dt evolution
+            f.omega_ic = f.omega_ic  # already set by init_fields
+        else:
+            # old = c_dt_z10_ic * z10(ICB)
+            d.domega_ic_dt.old[0] = c_dt_z10_ic * z10_icb
+            # impl = -visc*(2*or1*z10 - dz10) at ICB (Boussinesq: visc=1, beta=0)
+            from .radial_functions import visc as _visc
+            v_icb = _visc[n_r_max - 1].item()
+            dz10_icb = f.dz_LMloc[_l1m0, n_r_max - 1].real.item()
+            d.domega_ic_dt.impl[0] = -v_icb * (two * or1[n_r_max - 1].item() * z10_icb - dz10_icb)
+            # omega_ic = c_z10_omega_ic * z10(ICB) — should be 0 at init
+            f.omega_ic = c_z10_omega_ic * z10_icb
 
 
 def radial_loop():
@@ -537,14 +588,25 @@ def radial_loop():
 
     # === 1. Inverse SHT (batched) ===
     # Scalars: entropy (all N levels), plus composition if active
-    scal_inv_list = [f.s_LMloc]
-    if l_chemical_conv:
-        scal_inv_list.append(f.xi_LMloc)
-    scal_inv_all = scal_to_spat(torch.cat(scal_inv_list, dim=1))
-    sc = scal_inv_all[:N]
-    if l_chemical_conv:
-        xic = scal_inv_all[N:2 * N]
+    if l_heat or l_chemical_conv:
+        scal_inv_list = []
+        if l_heat:
+            scal_inv_list.append(f.s_LMloc)
+        if l_chemical_conv:
+            scal_inv_list.append(f.xi_LMloc)
+        scal_inv_all = scal_to_spat(torch.cat(scal_inv_list, dim=1))
+        offset_sc = 0
+        if l_heat:
+            sc = scal_inv_all[:N]
+            offset_sc = N
+        else:
+            sc = torch.zeros(N, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
+        if l_chemical_conv:
+            xic = scal_inv_all[offset_sc:offset_sc + N]
+        else:
+            xic = torch.zeros(N, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
     else:
+        sc = torch.zeros(N, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
         xic = torch.zeros(N, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
 
     # Build torpol_to_spat inputs dynamically
@@ -566,17 +628,17 @@ def radial_loop():
         T_parts.append(_or2_2d * _dLh_2d * f.b_LMloc - f.ddb_LMloc)
         part_sizes.append(N)
 
-    # Velocity (bulk only)
-    Q_parts.append(_dLh_2d * f.w_LMloc[:, bulk])
-    S_parts.append(f.dw_LMloc[:, bulk])
-    T_parts.append(f.z_LMloc[:, bulk])
-    part_sizes.append(Nb)
+    # Velocity (all N levels — need boundaries for CFL check, e.g. ICB with l_SRIC)
+    Q_parts.append(_dLh_2d * f.w_LMloc)
+    S_parts.append(f.dw_LMloc)
+    T_parts.append(f.z_LMloc)
+    part_sizes.append(N)
 
-    # Curl of velocity (bulk only)
-    Q_parts.append(_dLh_2d * f.z_LMloc[:, bulk])
-    S_parts.append(f.dz_LMloc[:, bulk])
-    T_parts.append(_or2_bulk_2d * _dLh_2d * f.w_LMloc[:, bulk] - f.ddw_LMloc[:, bulk])
-    part_sizes.append(Nb)
+    # Curl of velocity (all N levels)
+    Q_parts.append(_dLh_2d * f.z_LMloc)
+    S_parts.append(f.dz_LMloc)
+    T_parts.append(_or2_2d * _dLh_2d * f.w_LMloc - f.ddw_LMloc)
+    part_sizes.append(N)
 
     Q_all = torch.cat(Q_parts, dim=1)
     S_all = torch.cat(S_parts, dim=1)
@@ -602,14 +664,14 @@ def radial_loop():
         brc = btc = bpc = _zeros_grid
         cbrc = cbtc = cbpc = _zeros_grid
 
-    # Fill pre-allocated velocity buffers (boundaries stay zero from init)
-    _vrc[bulk] = all_r[offset:offset + Nb]
-    _vtc[bulk] = all_t[offset:offset + Nb]
-    _vpc[bulk] = all_p[offset:offset + Nb]
-    offset += Nb
-    _cvrc[bulk] = all_r[offset:offset + Nb]
-    _cvtc[bulk] = all_t[offset:offset + Nb]
-    _cvpc[bulk] = all_p[offset:offset + Nb]
+    # Fill velocity buffers (all levels including boundaries for CFL check)
+    _vrc[:] = all_r[offset:offset + N]
+    _vtc[:] = all_t[offset:offset + N]
+    _vpc[:] = all_p[offset:offset + N]
+    offset += N
+    _cvrc[:] = all_r[offset:offset + N]
+    _cvtc[:] = all_t[offset:offset + N]
+    _cvpc[:] = all_p[offset:offset + N]
 
     # === 2. Nonlinear products (all radial levels at once) ===
     nl_result = get_nl(
@@ -617,8 +679,9 @@ def radial_loop():
         sc, brc, btc, bpc, cbrc, cbtc, cbpc, xic)
     Advr, Advt, Advp, VSr, VSt, VSp, VxBr, VxBt, VxBp, VXir, VXit, VXip = nl_result
 
-    # === 3. Forward SHT (batched, bulk only) ===
-    # Build scalar (Q-component) batch
+    # === 3. Forward SHT (batched) ===
+    # For FD: all N levels (Fortran nBc=0 at boundaries, needed for p0 RHS)
+    # For Chebyshev: interior only (bulk), boundaries stay zero (nBc != 0)
     scal_fwd_list = [Advr[bulk], VSr[bulk]]
     if l_mag:
         scal_fwd_list.append(VxBr[bulk])
@@ -640,7 +703,7 @@ def radial_loop():
     vp_in = torch.cat(vp_fwd_list, dim=0)
     S_out, T_out = spat_to_sphertor(vt_in, vp_in)
 
-    # Spectral work arrays: (lm_max, n_r_max) — boundaries stay zero
+    # Spectral work arrays: (lm_max, n_r_max) — boundaries zero for Chebyshev
     AdvrLM = torch.zeros(lm_max, N, dtype=CDTYPE, device=DEVICE)
     AdvtLM = torch.zeros_like(AdvrLM)
     AdvpLM = torch.zeros_like(AdvrLM)
@@ -695,21 +758,29 @@ def radial_loop():
 
     # === 4. Time derivative assembly ===
     # Poloidal velocity
-    dwdt_expl = get_dwdt(AdvrLM, f.dw_LMloc, f.z_LMloc)
+    if l_double_curl:
+        dwdt_expl, dVxVhLM = get_dwdt_double_curl(
+            AdvrLM, AdvtLM, f.w_LMloc, f.dw_LMloc, f.ddw_LMloc,
+            f.z_LMloc, f.dz_LMloc)
+        dwdt_expl = finish_exp_pol(dwdt_expl, dVxVhLM)
+    else:
+        dwdt_expl = get_dwdt(AdvrLM, f.dw_LMloc, f.z_LMloc)
     dt_fields.dwdt.expl[:, :, expl_idx] = dwdt_expl
 
     # Toroidal velocity
     dzdt_expl = get_dzdt(AdvpLM, f.w_LMloc, f.dw_LMloc, f.z_LMloc)
     dt_fields.dzdt.expl[:, :, expl_idx] = dzdt_expl
 
-    # Pressure
-    dpdt_expl = get_dpdt(AdvtLM, f.w_LMloc, f.dw_LMloc, f.z_LMloc)
-    dt_fields.dpdt.expl[:, :, expl_idx] = dpdt_expl
+    # Pressure (not computed in double-curl — recovered post-hoc)
+    if not l_double_curl:
+        dpdt_expl = get_dpdt(AdvtLM, f.w_LMloc, f.dw_LMloc, f.z_LMloc)
+        dt_fields.dpdt.expl[:, :, expl_idx] = dpdt_expl
 
     # Entropy (partial + finish)
-    dsdt_partial, dVSrLM_out = get_dsdt(VStLM, dVSrLM)
-    dsdt_expl = finish_exp_entropy(dsdt_partial, dVSrLM_out)
-    dt_fields.dsdt.expl[:, :, expl_idx] = dsdt_expl
+    if l_heat:
+        dsdt_partial, dVSrLM_out = get_dsdt(VStLM, dVSrLM)
+        dsdt_expl = finish_exp_entropy(dsdt_partial, dVSrLM_out)
+        dt_fields.dsdt.expl[:, :, expl_idx] = dsdt_expl
 
     # Composition (partial + finish)
     if l_chemical_conv:
@@ -725,6 +796,7 @@ def radial_loop():
         dt_fields.djdt.expl[:, :, expl_idx] = djdt_expl
 
     # === 5. IC rotation: Lorentz torque + explicit torque ===
+    global lorentz_torque_ic_last
     if l_mag and l_rot_ic and l_cond_ic:
         from .horizontal_data import gauss_grid
         icb_idx = N - 1
@@ -732,6 +804,7 @@ def radial_loop():
         bpc_icb = bpc[icb_idx]
         fac_lt = LFfac * two * math.pi / float(n_phi_max)
         lorentz_torque_ic = fac_lt * (gauss_grid.unsqueeze(1) * brc_icb * bpc_icb).sum().item()
+        lorentz_torque_ic_last = lorentz_torque_ic
 
         domega_ic_exp = finish_exp_tor(f.omega_ic, lorentz_torque_ic)
         dt_fields.domega_ic_dt.expl[expl_idx] = domega_ic_exp
@@ -757,10 +830,11 @@ def radial_loop():
 
 
 def radial_loop_anel():
-    """Inverse SHT → non-curl advection + viscous heating → forward SHT → time derivative assembly.
+    """Inverse SHT → non-curl advection + Lorentz + viscous heating → forward SHT → time derivative assembly.
 
-    Anelastic path (l_anel=True, l_adv_curl=False, mode=1 → no magnetic field).
+    Anelastic path (l_anel=True, l_adv_curl=False).
     Uses u·∇u advection formulation with 11 grid-space velocity fields.
+    Includes magnetic field (Lorentz force + induction) when l_mag=True.
     """
     from .get_nl_anel import get_nl_anel
     from .radial_functions import temp0 as _temp0_rf
@@ -783,8 +857,27 @@ def radial_loop_anel():
     else:
         xic = torch.zeros(N, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
 
+    # === 1b. Inverse SHT for magnetic field (all N levels) ===
+    if l_mag:
+        Q_mag_parts = [_dLh_2d * f.b_LMloc, _dLh_2d * f.aj_LMloc]
+        S_mag_parts = [f.db_LMloc, f.dj_LMloc]
+        T_mag_parts = [f.aj_LMloc, _or2_2d * _dLh_2d * f.b_LMloc - f.ddb_LMloc]
+        Q_mag = torch.cat(Q_mag_parts, dim=1)
+        S_mag = torch.cat(S_mag_parts, dim=1)
+        T_mag = torch.cat(T_mag_parts, dim=1)
+        mag_r, mag_t, mag_p = torpol_to_spat(Q_mag, S_mag, T_mag)
+        brc = mag_r[:N]
+        btc = mag_t[:N]
+        bpc = mag_p[:N]
+        cbrc = mag_r[N:2 * N]
+        cbtc = mag_t[N:2 * N]
+        cbpc = mag_p[N:2 * N]
+    else:
+        _zeros_grid = torch.zeros(N, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
+        brc = btc = bpc = _zeros_grid
+        cbrc = cbtc = cbpc = _zeros_grid
+
     # === 2. Inverse SHT for velocity (bulk only) ===
-    # Standard: torpol_to_spat(w, dw, z) → vrc, vtc, vpc
     Q_vel = _dLh_2d * f.w_LMloc[:, bulk]
     S_vel = f.dw_LMloc[:, bulk]
     T_vel = f.z_LMloc[:, bulk]
@@ -846,22 +939,28 @@ def radial_loop_anel():
         dvrdtc, dvrdpc,
         dvtdpc, dvpdpc,
         cvrc_full,
-        sc, xic)
-    Advr, Advt, Advp, VSr, VSt, VSp, VXir, VXit, VXip, heatTerms = nl_result
+        sc, xic,
+        brc, btc, bpc, cbrc, cbtc, cbpc)
+    (Advr, Advt, Advp, VSr, VSt, VSp,
+     VxBr, VxBt, VxBp, VXir, VXit, VXip, heatTerms) = nl_result
 
     # === 5. Forward SHT (bulk only) ===
-    # Scalars: Advr, VSr
+    # Scalars: Advr, VSr, [VxBr], [VXir], heatTerms
     scal_fwd_list = [Advr[bulk], VSr[bulk]]
+    if l_mag:
+        scal_fwd_list.append(VxBr[bulk])
     if l_chemical_conv:
         scal_fwd_list.append(VXir[bulk])
-    # heatTerms forward SHT (separate for clarity)
     scal_fwd_list.append(heatTerms[bulk])
     scal_in = torch.cat(scal_fwd_list, dim=0)
     scal_out = scal_to_SH(scal_in)
 
-    # Vectors: Advt/Advp, VSt/VSp
+    # Vectors: Advt/Advp, VSt/VSp, [VxBt/VxBp], [VXit/VXip]
     vt_fwd_list = [Advt[bulk], VSt[bulk]]
     vp_fwd_list = [Advp[bulk], VSp[bulk]]
+    if l_mag:
+        vt_fwd_list.append(VxBt[bulk])
+        vp_fwd_list.append(VxBp[bulk])
     if l_chemical_conv:
         vt_fwd_list.append(VXit[bulk])
         vp_fwd_list.append(VXip[bulk])
@@ -881,6 +980,9 @@ def radial_loop_anel():
     s_offset = 0
     AdvrLM[:, bulk] = scal_out[:, s_offset:s_offset + Nb]; s_offset += Nb
     dVSrLM[:, bulk] = scal_out[:, s_offset:s_offset + Nb]; s_offset += Nb
+    if l_mag:
+        VxBrLM = torch.zeros_like(AdvrLM)
+        VxBrLM[:, bulk] = scal_out[:, s_offset:s_offset + Nb]; s_offset += Nb
     if l_chemical_conv:
         dVXirLM = torch.zeros_like(AdvrLM)
         dVXirLM[:, bulk] = scal_out[:, s_offset:s_offset + Nb]; s_offset += Nb
@@ -895,20 +997,47 @@ def radial_loop_anel():
     VStLM[:, bulk] = S_out[:, v_offset:v_offset + Nb]
     v_offset += Nb
 
+    if l_mag:
+        VxBtLM = torch.zeros_like(AdvrLM)
+        VxBpLM = torch.zeros_like(AdvrLM)
+        VxBtLM[:, bulk] = S_out[:, v_offset:v_offset + Nb]
+        VxBpLM[:, bulk] = T_out[:, v_offset:v_offset + Nb]
+        v_offset += Nb
+
     if l_chemical_conv:
         VXitLM = torch.zeros_like(AdvrLM)
         VXitLM[:, bulk] = S_out[:, v_offset:v_offset + Nb]
         v_offset += Nb
 
+    # === 5b. Boundary VxBt from rigid rotation (conducting IC/mantle) ===
+    if l_mag and l_cond_ic and f.omega_ic != 0.0:
+        from .horizontal_data import sinTheta_grid
+        icb_nr = N - 1
+        vpc_icb = _r_icb_py ** 2 * _orho1_icb_py * sinTheta_grid ** 2 * f.omega_ic
+        VxBt_grid_icb = (_or4_icb_py * _orho1_icb_py
+                         * vpc_icb.unsqueeze(1) * brc[icb_nr])
+        VxBtLM_icb_S, _ = spat_to_sphertor(
+            VxBt_grid_icb.unsqueeze(0),
+            torch.zeros_like(VxBt_grid_icb).unsqueeze(0)
+        )
+        VxBtLM[:, icb_nr] = VxBtLM_icb_S[:, 0]
+
     # === 6. Time derivative assembly ===
-    dwdt_expl = get_dwdt(AdvrLM, f.dw_LMloc, f.z_LMloc)
+    if l_double_curl:
+        dwdt_expl, dVxVhLM = get_dwdt_double_curl(
+            AdvrLM, AdvtLM, f.w_LMloc, f.dw_LMloc, f.ddw_LMloc,
+            f.z_LMloc, f.dz_LMloc)
+        dwdt_expl = finish_exp_pol(dwdt_expl, dVxVhLM)
+    else:
+        dwdt_expl = get_dwdt(AdvrLM, f.dw_LMloc, f.z_LMloc)
     dt_fields.dwdt.expl[:, :, expl_idx] = dwdt_expl
 
     dzdt_expl = get_dzdt(AdvpLM, f.w_LMloc, f.dw_LMloc, f.z_LMloc)
     dt_fields.dzdt.expl[:, :, expl_idx] = dzdt_expl
 
-    dpdt_expl = get_dpdt(AdvtLM, f.w_LMloc, f.dw_LMloc, f.z_LMloc)
-    dt_fields.dpdt.expl[:, :, expl_idx] = dpdt_expl
+    if not l_double_curl:
+        dpdt_expl = get_dpdt(AdvtLM, f.w_LMloc, f.dw_LMloc, f.z_LMloc)
+        dt_fields.dpdt.expl[:, :, expl_idx] = dpdt_expl
 
     # Entropy: dsdt + heatTermsLM (get_td.f90:485,499)
     dsdt_partial, dVSrLM_out = get_dsdt(VStLM, dVSrLM)
@@ -922,10 +1051,44 @@ def radial_loop_anel():
         dxidt_expl = finish_exp_comp(dxidt_partial, dVXirLM_out)
         dt_fields.dxidt.expl[:, :, expl_idx] = dxidt_expl
 
-    # === 7. CFL Courant condition (no magnetic field for anelastic) ===
-    dtrkc, dthkc = courant_check(_vrc, _vtc, _vpc,
-                                  courfac=tscheme.courfac,
-                                  alffac=tscheme.alffac)
+    # Magnetic field
+    if l_mag:
+        dbdt_expl, djdt_partial, dVxBhLM = get_dbdt(VxBrLM, VxBtLM, VxBpLM)
+        djdt_expl = finish_exp_mag(djdt_partial, dVxBhLM)
+        dt_fields.dbdt.expl[:, :, expl_idx] = dbdt_expl
+        dt_fields.djdt.expl[:, :, expl_idx] = djdt_expl
+
+    # === 6b. IC rotation: Lorentz torque + explicit torque ===
+    global lorentz_torque_ic_last
+    if l_mag and l_rot_ic and l_cond_ic:
+        from .horizontal_data import gauss_grid
+        icb_idx = N - 1
+        brc_icb = brc[icb_idx]
+        bpc_icb = bpc[icb_idx]
+        fac_lt = LFfac * two * math.pi / float(n_phi_max)
+        lorentz_torque_ic = fac_lt * (gauss_grid.unsqueeze(1) * brc_icb * bpc_icb).sum().item()
+        lorentz_torque_ic_last = lorentz_torque_ic
+
+        domega_ic_exp = finish_exp_tor(f.omega_ic, lorentz_torque_ic)
+        dt_fields.domega_ic_dt.expl[expl_idx] = domega_ic_exp
+
+    # === 6c. IC magnetic advection by solid-body rotation ===
+    if l_mag and l_cond_ic:
+        finish_exp_mag_ic(
+            f.b_ic, f.aj_ic, f.omega_ic,
+            dt_fields.dbdt_ic.expl[:, :, expl_idx],
+            dt_fields.djdt_ic.expl[:, :, expl_idx]
+        )
+
+    # === 7. CFL Courant condition ===
+    dtrkc, dthkc = courant_check(
+        _vrc, _vtc, _vpc,
+        brc if l_mag else None,
+        btc if l_mag else None,
+        bpc if l_mag else None,
+        courfac=tscheme.courfac,
+        alffac=tscheme.alffac,
+    )
     return dtrkc, dthkc
 
 
@@ -939,22 +1102,29 @@ def lm_loop():
     f = fields
     d = dt_fields
 
-    if not l_z10mat and not l_anel and not l_correct_AMz and not l_correct_AMe:
+    if (l_heat and not l_z10mat and not l_anel
+            and not l_correct_AMz and not l_correct_AMe and not l_double_curl):
         # Fused path: S + [Xi] + Z + WP all in one optimized pipeline
-        # Not used for anelastic (complex implicit terms) or AM corrections
+        # Not used for anelastic, AM corrections, or double-curl
         _fused_lm_loop_fast()
     else:
-        # Sequential path (z10Mat IC rotation coupling, or anelastic implicit terms)
-        updateS(f.s_LMloc, f.ds_LMloc, d.dsdt, tscheme)
+        # Sequential path
+        if l_heat:
+            updateS(f.s_LMloc, f.ds_LMloc, d.dsdt, tscheme)
         if l_chemical_conv:
             updateXi(f.xi_LMloc, f.dxi_LMloc, d.dxidt, tscheme)
         omega_ic_ref = [f.omega_ic]
         updateZ(f.z_LMloc, f.dz_LMloc, d.dzdt, tscheme,
                 domega_ic_dt=d.domega_ic_dt, omega_ic_ref=omega_ic_ref)
         f.omega_ic = omega_ic_ref[0]
-        updateWP(f.s_LMloc, f.w_LMloc, f.dw_LMloc, f.ddw_LMloc,
-                 d.dwdt, f.p_LMloc, f.dp_LMloc, d.dpdt, tscheme,
-                 xi_LMloc=f.xi_LMloc if l_chemical_conv else None)
+        if l_double_curl:
+            updateW(f.s_LMloc, f.w_LMloc, f.dw_LMloc, f.ddw_LMloc,
+                    d.dwdt, f.p_LMloc, f.dp_LMloc, tscheme,
+                    xi_LMloc=f.xi_LMloc if l_chemical_conv else None)
+        else:
+            updateWP(f.s_LMloc, f.w_LMloc, f.dw_LMloc, f.ddw_LMloc,
+                     d.dwdt, f.p_LMloc, f.dp_LMloc, d.dpdt, tscheme,
+                     xi_LMloc=f.xi_LMloc if l_chemical_conv else None)
 
     if l_mag:
         if l_cond_ic:
@@ -973,16 +1143,22 @@ def lm_loop():
 def build_all_matrices():
     """Build and factorize all implicit matrices for current dt."""
     wimp_lin0 = tscheme.wimp_lin[0].item()
-    build_s_matrices(wimp_lin0)
+    if l_heat:
+        build_s_matrices(wimp_lin0)
     if l_chemical_conv:
         build_xi_matrices(wimp_lin0)
     build_z_matrices(wimp_lin0)
     build_p0_matrix()
-    build_wp_matrices(wimp_lin0)
+    if l_double_curl:
+        build_w_matrices(wimp_lin0)
+    else:
+        build_wp_matrices(wimp_lin0)
     if l_mag:
         build_b_matrices(wimp_lin0)
-    # Build stacked inverses for batched scalar solver
-    _init_batched_scalar()
+    # Build stacked inverses for batched scalar solver (only when heat is active)
+    # Skip for FD (uses banded solve, not batched inverse)
+    if l_heat and not l_finite_diff:
+        _init_batched_scalar()
 
 
 _dtMax = 0.0  # set by initialize_dt; used as CFL upper bound

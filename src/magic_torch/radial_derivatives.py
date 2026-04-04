@@ -10,63 +10,65 @@ Both give identical results to machine precision.
 import torch
 
 from .precision import DTYPE, CDTYPE, DEVICE
-from .chebyshev import drMat, d2rMat, d3rMat, drx, ddrx, dddrx, rnorm, boundary_fac
+from .radial_scheme import drMat, d2rMat, d3rMat, drx, ddrx, dddrx, rnorm, boundary_fac
 from .params import n_r_max, n_cheb_max, l_cond_ic
 from .cosine_transform import costf
 
 
 def get_dr(f: torch.Tensor) -> torch.Tensor:
-    """First radial derivative via matrix multiply.
+    """First radial derivative.
 
-    Args:
-        f: shape (..., n_r_max), real or complex
-
-    Returns:
-        df: shape (..., n_r_max), first derivative df/dr
+    Uses banded matvec for FD, dense matmul for Chebyshev.
     """
-    # drMat[i, n] contains dT_n/dr evaluated at r[i]
-    # f[..., i] is the physical-space value at r[i]
-    # In Chebyshev space: f(r_i) = sum_n a_n * T_n(r_i) = rMat[i,:] . a
-    # df/dr(r_i) = sum_n a_n * dT_n/dr(r_i) = drMat[i,:] . a
-    # But since rMat is invertible: a = rMat^{-1} . f, so df = drMat . rMat^{-1} . f
-    # However, for Chebyshev collocation: drMat . rMat^{-1} is the differentiation matrix D
-    # We compute D = drMat @ rMat_inv once
+    if _D1_bands is not None:
+        return _banded_matvec(_D1_bands, f)
     return f @ _D1.T
 
 
 def get_ddr(f: torch.Tensor):
-    """First and second radial derivatives via matrix multiply.
+    """First and second radial derivatives.
 
     Returns:
         (df, ddf): both shape (..., n_r_max)
     """
-    df = f @ _D1.T
-    ddf = f @ _D2.T
-    return df, ddf
+    if _D1_bands is not None:
+        return _banded_matvec(_D1_bands, f), _banded_matvec(_D2_bands, f)
+    return f @ _D1.T, f @ _D2.T
+
+
+def get_d4(f: torch.Tensor) -> torch.Tensor:
+    """Fourth radial derivative (FD only)."""
+    if _D4_bands is not None:
+        return _banded_matvec(_D4_bands, f)
+    if _D4 is None:
+        raise RuntimeError("D4 not available (Chebyshev has no d4rMat)")
+    return f @ _D4.T
 
 
 def get_dddr(f: torch.Tensor):
-    """First, second, and third radial derivatives via matrix multiply.
+    """First, second, and third radial derivatives.
 
     Returns:
         (df, ddf, dddf): all shape (..., n_r_max)
     """
-    df = f @ _D1.T
-    ddf = f @ _D2.T
-    dddf = f @ _D3.T
-    return df, ddf, dddf
+    if _D1_bands is not None:
+        return (_banded_matvec(_D1_bands, f),
+                _banded_matvec(_D2_bands, f),
+                _banded_matvec(_D3_bands, f))
+    return f @ _D1.T, f @ _D2.T, f @ _D3.T
 
 
 def _build_diff_matrices():
-    """Build Chebyshev differentiation matrices D1, D2, D3.
+    """Build differentiation matrices D1, D2, D3 (and D4 for FD).
 
     D_k = d^k_rMat @ rMat^{-1} gives the k-th derivative operator
-    in physical space.
+    in physical space. For Chebyshev, rMat is the polynomial matrix.
+    For FD, rMat = I, so D_k = d^k_rMat directly.
 
     When n_cheb_max < n_r_max, high Chebyshev modes are zeroed out
     (spectral truncation), matching the Fortran get_dcheb behavior.
     """
-    from .chebyshev import rMat
+    from .radial_scheme import rMat, d4rMat
 
     rMat_inv = torch.linalg.inv(rMat)
 
@@ -78,14 +80,85 @@ def _build_diff_matrices():
     D1 = drMat @ rMat_inv
     D2 = d2rMat @ rMat_inv
     D3 = d3rMat @ rMat_inv
-    return D1, D2, D3
+    D4 = d4rMat @ rMat_inv if d4rMat is not None else None
+    return D1, D2, D3, D4
 
 
-_D1_real, _D2_real, _D3_real = _build_diff_matrices()
+_D1_real, _D2_real, _D3_real, _D4_real = _build_diff_matrices()
 # Complex versions for use with complex fields
 _D1 = _D1_real.to(CDTYPE)
 _D2 = _D2_real.to(CDTYPE)
 _D3 = _D3_real.to(CDTYPE)
+_D4 = _D4_real.to(CDTYPE) if _D4_real is not None else None
+
+
+# --- Banded derivative matvec for FD ---
+
+def _extract_bands(D):
+    """Extract nonzero diagonals from a matrix as (offset, values) pairs.
+
+    Args:
+        D: (N, N) dense matrix
+
+    Returns:
+        list of (offset, diag_values) tuples where offset is the diagonal
+        index (0=main, +k=k-th superdiag, -k=k-th subdiag) and diag_values
+        is a 1-D tensor of the diagonal entries.
+    """
+    N = D.shape[0]
+    bands = []
+    for off in range(-(N - 1), N):
+        diag = torch.diagonal(D, offset=off)
+        if diag.abs().max() > 0:
+            bands.append((off, diag.clone()))
+    return bands
+
+
+def _banded_matvec(bands, f):
+    """Apply banded matrix D to batched vectors: result = f @ D.T.
+
+    Equivalent to result[b, j] = sum_k D[j, k] * f[b, k], but computed
+    as a sum of shifted elementwise multiplies over the nonzero diagonals.
+
+    Args:
+        bands: list of (offset, diag) from _extract_bands(D)
+        f: (..., N) input tensor
+
+    Returns:
+        (..., N) result
+    """
+    N = f.shape[-1]
+    result = torch.zeros_like(f)
+    for off, diag in bands:
+        # D[j, j+off] = diag[j]  (for valid j)
+        # result[..., j] += diag[j] * f[..., j+off]
+        if off >= 0:
+            # j ranges from 0 to N-1-off; k = j+off ranges from off to N-1
+            result[..., :N - off] += diag[:N - off] * f[..., off:]
+        else:
+            # j ranges from -off to N-1; k = j+off ranges from 0 to N-1+off
+            result[..., -off:] += diag * f[..., :N + off]
+    return result
+
+
+# Build banded representations for FD (None for Chebyshev)
+from .params import l_finite_diff as _l_fd
+
+_D1_bands = None
+_D2_bands = None
+_D3_bands = None
+_D4_bands = None
+
+if _l_fd:
+    _D1_bands = [(off, d.to(CDTYPE).to(DEVICE))
+                 for off, d in _extract_bands(_D1_real)]
+    _D2_bands = [(off, d.to(CDTYPE).to(DEVICE))
+                 for off, d in _extract_bands(_D2_real)]
+    _D3_bands = [(off, d.to(CDTYPE).to(DEVICE))
+                 for off, d in _extract_bands(_D3_real)]
+    if _D4_real is not None:
+        _D4_bands = [(off, d.to(CDTYPE).to(DEVICE))
+                     for off, d in _extract_bands(_D4_real)]
 
 
 # --- DCT-based derivatives (alternative, matches Fortran get_dr exactly) ---

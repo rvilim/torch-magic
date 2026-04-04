@@ -14,6 +14,7 @@ os.environ["MAGIC_INIT_S1"] = "1010"
 os.environ["MAGIC_AMP_S1"] = "0.01"
 os.environ["MAGIC_KTOPV"] = "1"
 os.environ["MAGIC_KBOTV"] = "1"
+os.environ["MAGIC_NCHEBMAX"] = "31"
 
 import sys
 import numpy as np

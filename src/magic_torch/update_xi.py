@@ -15,13 +15,14 @@ import torch
 from .precision import DTYPE, CDTYPE, DEVICE
 from .params import n_r_max, lm_max, l_max, n_cheb_max
 from .constants import two
-from .chebyshev import rMat, drMat, d2rMat, rnorm, boundary_fac
-from .radial_functions import or1, or2
+from .radial_scheme import rMat, drMat, d2rMat, rnorm, boundary_fac
+from .radial_functions import or1, or2, beta, orho1
 from .horizontal_data import dLh, hdif_Xi
+from .params import l_anel
 from .pre_calculations import osc
 from .blocking import st_lm2, st_lm2l, st_lm2m
 from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
-from .cosine_transform import costf
+from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_ddr
 
 
@@ -42,10 +43,18 @@ _hdif_lm = hdif_Xi[st_lm2l].to(CDTYPE).unsqueeze(1)  # (lm_max, 1)
 _dLh_lm = dLh.to(CDTYPE).unsqueeze(1)                # (lm_max, 1)
 _or1_r = or1.unsqueeze(0)                             # (1, n_r_max)
 _or2_r = or2.unsqueeze(0)                             # (1, n_r_max)
+_beta_r = beta.unsqueeze(0)                           # (1, n_r_max)
+_orho1_r = orho1.unsqueeze(0)                         # (1, n_r_max)
 
 
-# Unique inverse per l degree: (l_max+1, N, N) float64
+# Unique inverse per l degree: (l_max+1, N, N) float64 (Chebyshev)
 _xi_inv_by_l = None
+# FD: banded LU storage per l for pivoted solve
+_xi_bands_by_l = None
+_xi_piv_by_l = None
+_xi_fac_by_l = None
+_xi_kl = 1
+_xi_ku = 1
 
 
 def build_xi_matrices(wimp_lin0: float):
@@ -56,7 +65,8 @@ def build_xi_matrices(wimp_lin0: float):
 
     Must be called whenever dt changes.
     """
-    global _xi_inv_by_l
+    global _xi_inv_by_l, _xi_bands_by_l, _xi_piv_by_l, _xi_fac_by_l, _xi_kl, _xi_ku
+    from .params import l_finite_diff
     N = n_r_max
 
     cpu = torch.device("cpu")
@@ -69,16 +79,30 @@ def build_xi_matrices(wimp_lin0: float):
     _bfac = boundary_fac.to(cpu) if isinstance(boundary_fac, torch.Tensor) else boundary_fac
     or1_col = _or1.unsqueeze(1)
     or2_col = _or2.unsqueeze(1)
+    _beta = beta.to(cpu)
+    beta_col = _beta.unsqueeze(1)
 
     eye = torch.eye(N, dtype=DTYPE, device=cpu)
     inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
+    # FD bandwidth (same as sMat: Dirichlet BCs → tridiag for fd_order<=2)
+    if l_finite_diff:
+        from .params import fd_order, fd_order_bound
+        if fd_order <= 2 and fd_order_bound <= 2:
+            _xi_kl, _xi_ku = 1, 1
+        else:
+            hw = max(fd_order // 2, fd_order_bound)
+            _xi_kl, _xi_ku = hw, hw
+    n_abd = 2 * _xi_kl + _xi_ku + 1 if l_finite_diff else 1
+    abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
+    piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
+    fac_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
 
     for l in range(l_max + 1):
         dL = float(l * (l + 1))
         hdif_l = hdif_Xi[l].item()
 
         dat = _rnorm * (_rMat - wimp_lin0 * osc * hdif_l * (
-            _d2rMat + two * or1_col * _drMat - dL * or2_col * _rMat
+            _d2rMat + (beta_col + two * or1_col) * _drMat - dL * or2_col * _rMat
         ))
 
         dat[0, :] = _rnorm * _rMat[0, :]
@@ -92,21 +116,36 @@ def build_xi_matrices(wimp_lin0: float):
         dat[:, N - 1] = dat[:, N - 1] * _bfac
 
         fac = 1.0 / dat.abs().max(dim=1).values
-        dat = fac.unsqueeze(1) * dat
+        dat_precond = fac.unsqueeze(1) * dat
 
-        lu, ip, info = prepare_mat(dat)
-        assert info == 0, f"Singular xiMat for l={l}, info={info}"
+        if l_finite_diff:
+            from .algebra import dense_to_band_storage, prepare_band
+            abd = dense_to_band_storage(dat_precond, _xi_kl, _xi_ku)
+            abd_f, piv, info = prepare_band(abd, N, _xi_kl, _xi_ku)
+            assert info == 0, f"Singular xiMat (band) for l={l}, info={info}"
+            abd_all[l] = abd_f
+            piv_all[l] = piv
+            fac_all[l] = fac
+        else:
+            lu, ip, info = prepare_mat(dat_precond)
+            assert info == 0, f"Singular xiMat for l={l}, info={info}"
+            inv_precond = solve_mat_real(lu, ip, eye)
+            inv_by_l[l] = inv_precond * fac.unsqueeze(0)
 
-        inv_precond = solve_mat_real(lu, ip, eye)
-        inv_by_l[l] = inv_precond * fac.unsqueeze(0)
-
-    _xi_inv_by_l = inv_by_l.to(DEVICE)
+    if l_finite_diff:
+        _xi_bands_by_l = abd_all.to(DEVICE)
+        _xi_piv_by_l = piv_all.to(DEVICE)
+        _xi_fac_by_l = fac_all.to(DEVICE)
+        _xi_inv_by_l = None
+    else:
+        _xi_inv_by_l = inv_by_l.to(DEVICE)
+        _xi_bands_by_l = None
 
 
 def finish_exp_comp(dxi_exp, dVXirLM):
     """Complete explicit composition term by adding radial derivative of dVXirLM.
 
-    dxi_exp = dxi_exp - or2 * d(dVXirLM)/dr
+    dxi_exp = orho1 * (dxi_exp - or2 * d(dVXirLM)/dr)
 
     Structurally identical to finish_exp_entropy.
 
@@ -118,7 +157,10 @@ def finish_exp_comp(dxi_exp, dVXirLM):
         dxi_exp: (lm_max, n_r_max) complex — completed explicit term
     """
     d_dVXirLM = get_dr(dVXirLM)
-    return dxi_exp - _or2_r * d_dVXirLM
+    result = dxi_exp - _or2_r * d_dVXirLM
+    if l_anel:
+        result = _orho1_r * result
+    return result
 
 
 def updateXi(xi_LMloc, dxi_LMloc, dxidt, tscheme):
@@ -133,18 +175,23 @@ def updateXi(xi_LMloc, dxi_LMloc, dxidt, tscheme):
     # 1. Assemble IMEX RHS
     rhs = tscheme.set_imex_rhs(dxidt)  # (lm_max, n_r_max)
 
-    # 2. Batched solve: set BCs, then chunked matmul with per-l inverses
+    # 2. Batched solve: set BCs, then solve
     rhs[:, 0] = _topxi
     rhs[:, N - 1] = _botxi
-    xi_cheb = chunked_solve_complex(_xi_inv_by_l, st_lm2l, rhs)
-    xi_cheb[_m0_mask] = xi_cheb[_m0_mask].real.to(CDTYPE)
 
-    # 3. Truncate high Chebyshev modes
-    if n_cheb_max < N:
-        xi_cheb[:, n_cheb_max:] = 0.0
-
-    # 4. Convert Chebyshev coefficients to physical space
-    xi_LMloc[:] = costf(xi_cheb)
+    if _xi_bands_by_l is not None:
+        from .algebra import banded_solve_by_l
+        xi_phys = banded_solve_by_l(
+            _xi_bands_by_l, _xi_piv_by_l, st_lm2l, rhs,
+            n=N, kl=_xi_kl, ku=_xi_ku, fac_row_by_l=_xi_fac_by_l)
+        xi_phys[_m0_mask] = xi_phys[_m0_mask].real.to(CDTYPE)
+        xi_LMloc[:] = xi_phys
+    else:
+        xi_cheb = chunked_solve_complex(_xi_inv_by_l, st_lm2l, rhs)
+        xi_cheb[_m0_mask] = xi_cheb[_m0_mask].real.to(CDTYPE)
+        if n_cheb_max < N:
+            xi_cheb[:, n_cheb_max:] = 0.0
+        xi_LMloc[:] = costf(xi_cheb)
 
     # 5. Compute radial derivatives in physical space
     dxi_new, d2xi = get_ddr(xi_LMloc)
@@ -158,8 +205,8 @@ def updateXi(xi_LMloc, dxi_LMloc, dxidt, tscheme):
         dxidt.old[:, :, 0] = xi_LMloc.clone()
 
     # 8. Compute implicit diffusion term for next IMEX stage
-    # impl = osc * hdif_Xi(l) * (d2xi + 2*or1*dxi - l(l+1)*or2*xi)
+    # impl = osc * hdif_Xi(l) * (d2xi + (beta+2*or1)*dxi - l(l+1)*or2*xi)
     idx = tscheme.next_impl_idx
     dxidt.impl[:, :, idx] = osc * _hdif_lm * (
-        d2xi + two * _or1_r * dxi_LMloc - _dLh_lm * _or2_r * xi_LMloc
+        d2xi + (_beta_r + two * _or1_r) * dxi_LMloc - _dLh_lm * _or2_r * xi_LMloc
     )

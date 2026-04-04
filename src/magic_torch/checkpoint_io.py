@@ -78,6 +78,13 @@ class CheckpointData:
     b_ic: Optional[np.ndarray] = None
     aj_ic: Optional[np.ndarray] = None
 
+    # Derivative arrays: {field_name: {"expl": [...], "impl": [...], "old": [...]}}
+    derivatives: dict = field(default_factory=dict)
+
+    # Scalar derivatives (domega_ic_dt, domega_ma_dt)
+    domega_ic_dt: Optional[dict] = None
+    domega_ma_dt: Optional[dict] = None
+
     # Detected endianness
     endian: str = "<"
 
@@ -174,18 +181,25 @@ def read_checkpoint(path: str) -> CheckpointData:
 
         # --- Scalar time derivatives (MULTISTEP only) ---
         if ck.family == "MULTISTEP":
-            # domega_ic_dt: expl(2..nexp), impl(2..nimp), old(2..nold)
-            _skip_scalars = (max(0, ck.nexp - 1) + max(0, ck.nimp - 1)
-                             + max(0, ck.nold - 1))
-            # domega_ma_dt: same
-            _skip_scalars *= 2
+            def _read_scalar_derivs():
+                """Read expl/impl/old scalar derivatives."""
+                expl = [struct.unpack(f"{endian}d", f.read(8))[0]
+                        for _ in range(max(0, ck.nexp - 1))]
+                impl = [struct.unpack(f"{endian}d", f.read(8))[0]
+                        for _ in range(max(0, ck.nimp - 1))]
+                old = [struct.unpack(f"{endian}d", f.read(8))[0]
+                       for _ in range(max(0, ck.nold - 1))]
+                return {"expl": expl, "impl": impl, "old": old}
+
+            ck.domega_ic_dt = _read_scalar_derivs()
+            ck.domega_ma_dt = _read_scalar_derivs()
 
             if ck.version < 5:
-                # lorentz_torque_ic_dt + lorentz_torque_ma_dt
-                _skip_scalars += 2 * (max(0, ck.nexp - 1) + max(0, ck.nimp - 1)
-                                      + max(0, ck.nold - 1))
-
-            f.read(_skip_scalars * 8)
+                # lorentz_torque_ic_dt + lorentz_torque_ma_dt (skip)
+                _skip_lorentz = 2 * (max(0, ck.nexp - 1)
+                                     + max(0, ck.nimp - 1)
+                                     + max(0, ck.nold - 1))
+                f.read(_skip_lorentz * 8)
         # DIRK: no scalar time derivatives written
 
         # --- Omega parameters (always, 12 doubles) ---
@@ -230,47 +244,53 @@ def read_checkpoint(path: str) -> CheckpointData:
             # Fortran column-major: lm varies fastest → reshape as (lm, nr)
             return arr.reshape((lm_max, n_r), order="F")
 
-        def _skip_multistep_arrays(n_r: int):
-            """Skip expl/impl/old arrays for MULTISTEP fields."""
-            if ck.family == "MULTISTEP":
-                n_skip = (max(0, ck.nexp - 1) + max(0, ck.nimp - 1)
-                          + max(0, ck.nold - 1))
-                f.read(n_skip * lm_max * n_r * 16)
+        def _read_multistep_arrays(n_r: int):
+            """Read expl/impl/old arrays for MULTISTEP fields."""
+            if ck.family != "MULTISTEP":
+                return None
+            expl = [_read_field(n_r) for _ in range(max(0, ck.nexp - 1))]
+            impl = [_read_field(n_r) for _ in range(max(0, ck.nimp - 1))]
+            old = [_read_field(n_r) for _ in range(max(0, ck.nold - 1))]
+            return {"expl": expl, "impl": impl, "old": old}
 
-        def _read_oc_field() -> np.ndarray:
+        def _read_oc_field(name: str) -> np.ndarray:
             arr = _read_field(ck.n_r_max)
-            _skip_multistep_arrays(ck.n_r_max)
+            derivs = _read_multistep_arrays(ck.n_r_max)
+            if derivs is not None:
+                ck.derivatives[name] = derivs
             return arr
 
         # w and z always present
-        ck.w = _read_oc_field()
-        ck.z = _read_oc_field()
+        ck.w = _read_oc_field("w")
+        ck.z = _read_oc_field("z")
 
         if ck.l_press_store:
-            ck.p = _read_oc_field()
+            ck.p = _read_oc_field("p")
 
         if ck.l_heat:
-            ck.s = _read_oc_field()
+            ck.s = _read_oc_field("s")
 
         if ck.l_chemical_conv:
-            ck.xi = _read_oc_field()
+            ck.xi = _read_oc_field("xi")
 
         if ck.l_phase_field:
-            ck.phi = _read_oc_field()
+            ck.phi = _read_oc_field("phi")
 
         if ck.l_mag:
-            ck.b = _read_oc_field()
-            ck.aj = _read_oc_field()
+            ck.b = _read_oc_field("b")
+            ck.aj = _read_oc_field("aj")
 
         # --- Read IC fields ---
         if ck.l_mag and ck.l_cond_ic:
-            def _read_ic_field() -> np.ndarray:
+            def _read_ic_field(name: str) -> np.ndarray:
                 arr = _read_field(ck.n_r_ic_max)
-                _skip_multistep_arrays(ck.n_r_ic_max)
+                derivs = _read_multistep_arrays(ck.n_r_ic_max)
+                if derivs is not None:
+                    ck.derivatives[name] = derivs
                 return arr
 
-            ck.b_ic = _read_ic_field()
-            ck.aj_ic = _read_ic_field()
+            ck.b_ic = _read_ic_field("b_ic")
+            ck.aj_ic = _read_ic_field("aj_ic")
 
         # Verify we consumed exactly the right amount
         remaining = f.read(1)
@@ -333,7 +353,7 @@ def write_checkpoint_fortran(path: str, sim_time: float, n_time_step: int,
     """
     from . import fields, dt_fields, params
     from .time_scheme import tscheme
-    from .chebyshev import r as cheb_r
+    from .radial_scheme import r as cheb_r
     from .pre_calculations import tScale
 
     with open(path, "wb") as f:

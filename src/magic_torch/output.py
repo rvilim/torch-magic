@@ -12,13 +12,17 @@ from collections import namedtuple
 import torch
 
 from .precision import CDTYPE, DEVICE
-from .params import n_r_max, lm_max, l_max, l_mag, l_cond_ic, minc, kbotb, ktopb, m_max, prmag
-from .chebyshev import r, r_cmb, r_icb
-from .radial_functions import or2, orho1, sigma, vol_oc, surf_cmb
+from .params import (n_r_max, lm_max, l_max, l_mag, l_cond_ic, l_heat, l_chemical_conv,
+                     minc, kbotb, ktopb, m_max, prmag, ek, n_theta_max, n_phi_max)
+from .radial_scheme import r, r_cmb, r_icb
+from .radial_functions import (or1, or2, or4, orho1, orho2, beta as r_beta,
+                               sigma, lambda_ as r_lambda, visc as r_visc,
+                               rgrav, vol_oc, surf_cmb)
 from .horizontal_data import dLh
 from .blocking import st_lm2l, st_lm2m
 from .integration import rInt_R
-from .pre_calculations import LFfac, ekScaled, mass
+from .pre_calculations import (LFfac, ekScaled, mass, eScale, vScale, opm,
+                               BuoFac, ChemFac)
 from .constants import pi
 
 # --- Precomputed masks (1D, lm_max) ---
@@ -83,6 +87,15 @@ def _cc2real(c, m):
     For m>0: 2*(real^2 + imag^2) (accounts for conjugate mode)
     """
     return torch.where(m == 0, c.real ** 2, 2.0 * (c.real ** 2 + c.imag ** 2))
+
+
+def _cc22real(a, b, m):
+    """Cross-spectrum: Re(a*conj(b)) for m=0, 2*Re(a*conj(b)) for m>0.
+
+    Fortran cc22real convention: Re(a)*Re(b) for m=0, 2*(Re(a)*Re(b)+Im(a)*Im(b)) for m>0.
+    """
+    cross = a.real * b.real + a.imag * b.imag  # Re(a*conj(b))
+    return torch.where(m == 0, cross, 2.0 * cross)
 
 
 def get_e_kin(w, dw, ddw, z, dz):
@@ -180,12 +193,98 @@ def get_e_mag_oc_full(b, db, aj):
                   e_p_es, e_t_es, e_p_eas, e_t_eas, e_p_e, e_p_as_e)
 
 
-def get_e_mag_ic(b):
-    """Compute inner-core magnetic energy for insulating IC.
+def _cc22real(c1, c2, m):
+    """Cross-term: real(c1)*real(c2) for m=0, 2*(re*re+im*im) for m>0."""
+    return torch.where(m == 0, c1.real * c2.real,
+                       2.0 * (c1.real * c2.real + c1.imag * c2.imag))
+
+
+def _rIntIC(f_r):
+    """Chebyshev integration on IC even grid (integration.f90 rIntIC).
+
+    f_r: shape (n_r_ic_max,) — radial profile on IC Chebyshev grid.
+    Returns: scalar integral value.
+    """
+    from .radial_functions import dr_fac_ic
+    from .params import n_r_ic_max
+    from .radial_scheme import costf
+
+    # Apply costf (same DCT-I as OC)
+    a = costf(f_r.unsqueeze(0)).squeeze(0)
+    # Half endpoints
+    a = a.clone()
+    a[0] = 0.5 * a[0]
+    a[-1] = 0.5 * a[-1]
+    # Vectorized IC Chebyshev weights: nChebInt = 2*(k+1)-1 for k=1..N-1
+    k = torch.arange(1, n_r_ic_max, dtype=torch.float64, device=a.device)
+    nChebInt = 2.0 * (k + 1.0) - 1.0
+    weights = -1.0 / (nChebInt * (nChebInt - 2.0))
+    result = (a[0] + (weights * a[1:]).sum()).item()
+    # Normalize
+    result *= math.sqrt(2.0 / (n_r_ic_max - 1)) / dr_fac_ic
+    return result
+
+
+def get_e_mag_ic(b, b_ic=None, db_ic=None, aj_ic=None):
+    """Compute inner-core magnetic energy.
 
     For insulating IC (l_cond_ic=False): uses b at ICB with l*(l+1)^2 weighting.
+    For conducting IC (l_cond_ic=True): integrates over IC grid using b_ic/db_ic/aj_ic.
     Returns EMagIC namedtuple with 4 components matching Fortran e_mag_ic.TAG.
     """
+    if l_cond_ic and b_ic is not None and db_ic is not None and aj_ic is not None:
+        # Conducting IC: magnetic_energy.f90 lines 485-541
+        from .radial_functions import r_ic
+        from .params import n_r_ic_max
+
+        O_r_icb_E_2 = 1.0 / (r_icb * r_icb)
+        ll = _l_f  # (lm_max,)
+        llp1 = ll * (ll + 1.0)
+        m_ic = st_lm2m.unsqueeze(1)  # (lm_max, 1) for broadcasting
+
+        # r_ratio = r_ic[nR] / r_ic[0], shape (n_r_ic_max,)
+        r_ratio = (r_ic / r_ic[0]).unsqueeze(0)  # (1, n_r_ic_max)
+
+        # r_dr_b = r_ic * db_ic, shape (lm_max, n_r_ic_max)
+        r_dr_b = r_ic.unsqueeze(0) * db_ic
+
+        # Poloidal: l(l+1) * O_r_icb^2 * r_ratio^(2l) * [...]
+        # Need per-lm r_ratio^(2l): (lm_max, n_r_ic_max)
+        rr_2l = r_ratio ** (2.0 * ll.unsqueeze(1))
+
+        cc_b = _cc2real(b_ic, m_ic)       # (lm_max, n_r_ic_max)
+        cc_rdrb = _cc2real(r_dr_b, m_ic)  # (lm_max, n_r_ic_max)
+        cc_cross = _cc22real(b_ic, r_dr_b, m_ic)  # (lm_max, n_r_ic_max)
+
+        e_p_r_lm = llp1.unsqueeze(1) * O_r_icb_E_2 * rr_2l * (
+            ((ll + 1.0) * (2.0 * ll + 1.0)).unsqueeze(1) * cc_b +
+            (2.0 * (ll + 1.0)).unsqueeze(1) * cc_cross +
+            cc_rdrb
+        )
+        # Toroidal: l(l+1) * r_ratio^(2l+2) * cc2real(aj_ic)
+        rr_2lp2 = r_ratio ** (2.0 * ll.unsqueeze(1) + 2.0)
+        cc_aj = _cc2real(aj_ic, m_ic)
+        e_t_r_lm = llp1.unsqueeze(1) * rr_2lp2 * cc_aj
+
+        # Skip l=0 (lm=0) — Fortran starts from lm=2 (1-based), i.e. lm>=1 (0-based)
+        e_p_r_lm[0, :] = 0.0
+        e_t_r_lm[0, :] = 0.0
+
+        # Total and axisymmetric radial profiles
+        e_p_r = e_p_r_lm.sum(dim=0)  # (n_r_ic_max,)
+        e_t_r = e_t_r_lm.sum(dim=0)
+        e_p_as_r = (e_p_r_lm * _m0_f.unsqueeze(1)).sum(dim=0)
+        e_t_as_r = (e_t_r_lm * _m0_f.unsqueeze(1)).sum(dim=0)
+
+        # Integrate over IC grid
+        fac = 0.5 * LFfac  # eScale=1.0
+        e_p = fac * _rIntIC(e_p_r)
+        e_t = fac * _rIntIC(e_t_r)
+        e_p_as = fac * _rIntIC(e_p_as_r)
+        e_t_as = fac * _rIntIC(e_t_as_r)
+
+        return EMagIC(e_p, e_t, e_p_as, e_t_as)
+
     # Insulating IC: energy from potential field extrapolation at ICB
     fac_ic = 0.5 * LFfac / r_icb  # eScale=1.0
     b_icb = b[:, -1]  # (lm_max,) — ICB is last radial point
@@ -497,7 +596,7 @@ def get_heat_data(s00, ds00, p00):
     Implements outMisc.f90:543-656, Boussinesq entropy diffusion path.
     """
     from .radial_functions import temp0, rho0, alpha0, orho1, kappa, ViscHeatFac, ThExpNb, ogrun
-    from .chebyshev import r_cmb, r_icb
+    from .radial_scheme import r_cmb, r_icb
     from .init_fields import topcond, botcond, deltacond
     from .pre_calculations import lScale
     from .params import l_chemical_conv
@@ -762,6 +861,550 @@ def get_dlm(w, dw, z, switch='V'):
     return (dl, dlR, dm, dlc, dlPolPeak, dlRc, dlPolPeakR)
 
 
+USquare = namedtuple('USquare', 'e_p e_t e_p_as e_t_as Ro Rm Rol dl RolC dlc')
+
+
+def get_u_square(w, dw, z):
+    """Compute squared velocity u² diagnostics (kinetic_energy.f90 get_u_square).
+
+    Like get_e_kin_full but weighted by orho2 (1/rho²) instead of orho1 (1/rho),
+    plus length scale and Rossby/Reynolds number diagnostics.
+    Only meaningful for anelastic (l_anel=True).
+
+    Returns USquare namedtuple with 10 components matching u_square.TAG cols 2-11.
+    """
+    dLh_lm = dLh.unsqueeze(1)   # (lm_max, 1)
+    or2_r = or2.unsqueeze(0)     # (1, n_r_max)
+    orho2_r = orho2.unsqueeze(0) # (1, n_r_max)
+
+    # Per-mode radial profiles (lm_max, n_r_max) — no 0.5 factor yet
+    e_p_lm = orho2_r * dLh_lm * (dLh_lm * or2_r * _cc2real(w, _m_arr) + _cc2real(dw, _m_arr))
+    e_t_lm = orho2_r * dLh_lm * _cc2real(z, _m_arr)
+    e_total = e_p_lm + e_t_lm  # (lm_max, n_r_max)
+
+    # Total and axisymmetric sums
+    ones = torch.ones(lm_max, dtype=torch.float64, device=e_p_lm.device)
+    fac = 0.5 * eScale
+
+    e_p = fac * rInt_R(ones @ e_p_lm).item()
+    e_t = fac * rInt_R(ones @ e_t_lm).item()
+    e_p_as = fac * rInt_R(_m0_f @ e_p_lm).item()
+    e_t_as = fac * rInt_R(_m0_f @ e_t_lm).item()
+    e_kin = e_p + e_t
+
+    # Per-l energy decomposition via scatter_add
+    e_lr = torch.zeros(l_max + 1, n_r_max, dtype=torch.float64, device=e_total.device)
+    e_lr.scatter_add_(0, _l_expanded, e_total)
+
+    # Convective (m != 0) per-l
+    m_ne0 = (st_lm2m != 0).unsqueeze(1)  # (lm_max, 1)
+    e_conv = e_total * m_ne0
+    e_lr_c = torch.zeros(l_max + 1, n_r_max, dtype=torch.float64, device=e_total.device)
+    e_lr_c.scatter_add_(0, _l_expanded, e_conv)
+
+    # Rossby / Reynolds numbers
+    vol = float(vol_oc)
+    Re = math.sqrt(2.0 * e_kin / vol) if e_kin > 0.0 else 0.0
+    e_kin_conv = e_kin - e_p_as - e_t_as
+    ReConv = math.sqrt(2.0 * e_kin_conv / vol) if e_kin_conv > 0.0 else 0.0
+
+    # l_non_rot = ek < 0 (step_time.py)
+    l_non_rot = ek < 0.0
+    if l_non_rot:
+        Ro = 0.0
+        RoConv = 0.0
+    else:
+        Ro = Re * ek
+        RoConv = ReConv * ek
+
+    # Magnetic Reynolds number (nVarCond=0 path)
+    Rm = Re * prmag if prmag != 0 else Re
+
+    # Length scales: dl = pi*E/EL — batched rInt_R over all l
+    e_l_all = fac * rInt_R(e_lr[1:, :])  # (l_max,) — radial integral per l
+    l_range = torch.arange(1, l_max + 1, dtype=torch.float64, device=e_total.device)
+    E = e_l_all.sum().item()
+    EL = (l_range * e_l_all).sum().item()
+
+    e_l_c_all = fac * rInt_R(e_lr_c[1:, :])  # (l_max,)
+    Ec = e_l_c_all.sum().item()
+    ELc = (l_range * e_l_c_all).sum().item()
+
+    dl = math.pi * E / EL if EL != 0.0 else 0.0
+    dlc = math.pi * Ec / ELc if ELc != 0.0 else 0.0
+
+    # Local Rossby
+    Rol = Ro / dl if dl != 0.0 else Ro
+    RolC = RoConv / dlc if dlc != 0.0 else RoConv
+
+    return USquare(e_p, e_t, e_p_as, e_t_as, Ro, Rm, Rol, dl, RolC, dlc)
+
+
+def write_u_square_line(f, time, usq):
+    """Write one line to u_square.TAG matching Fortran '(1P,ES20.12,10ES16.8)'."""
+    f.write(f"{time:20.12E}{usq.e_p:16.8E}{usq.e_t:16.8E}"
+            f"{usq.e_p_as:16.8E}{usq.e_t_as:16.8E}"
+            f"{usq.Ro:16.8E}{usq.Rm:16.8E}{usq.Rol:16.8E}"
+            f"{usq.dl:16.8E}{usq.RolC:16.8E}{usq.dlc:16.8E}\n")
+
+
+# --- Hemisphere diagnostic (outMisc.f90 get_hemi / outHemi) ---
+
+# Hemisphere mask: True = Northern hemisphere (sorted theta index < n_theta_max/2)
+from .horizontal_data import n_theta_cal2ord, gauss_grid, O_sin_theta_E2_grid, _grid_idx
+# Hemisphere mask: True = Northern hemisphere in interleaved grid-space order.
+# _grid_idx[i] gives the sorted (geographic) theta index for interleaved position i.
+# Sorted indices 0..n_theta_max/2-1 are Northern hemisphere.
+_north_mask = (_grid_idx < n_theta_max // 2)  # (n_theta_max,) — even indices = North
+
+Hemi = namedtuple('Hemi', 'hemi_vr hemi_ekin hemi_br hemi_emag hemi_cmb ekin_total emag_total')
+
+
+def get_hemi(vr, vt, vp, br, bt, bp):
+    """Compute hemisphere diagnostics (outMisc.f90 get_hemi + outHemi).
+
+    Args:
+        vr, vt, vp: velocity fields (n_r_max, n_theta_max, n_phi_max) from batched SHT
+        br, bt, bp: magnetic fields (n_r_max, n_theta_max, n_phi_max) or None if not l_mag
+
+    Returns:
+        Hemi namedtuple with 7 components matching hemi.TAG cols 2-8.
+    """
+    phiNorm = 2.0 * math.pi / float(n_phi_max)
+
+    # Gauss weights: (n_theta_max,) -> (1, n_theta_max, 1) for broadcasting
+    gw = (phiNorm * gauss_grid).unsqueeze(0).unsqueeze(2)  # (1, n_theta_max, 1)
+    # O_sin_theta_E2 in grid order: (n_theta_max,) -> (1, n_theta_max, 1)
+    oste2 = O_sin_theta_E2_grid.unsqueeze(0).unsqueeze(2)
+    # or2: (n_r_max,) -> (n_r_max, 1, 1)
+    or2_3d = or2.unsqueeze(1).unsqueeze(2)
+    # orho1: (n_r_max,) -> (n_r_max, 1, 1)
+    orho1_3d = orho1.unsqueeze(1).unsqueeze(2)
+
+    # Hemisphere mask: (1, n_theta_max, 1)
+    north = _north_mask.unsqueeze(0).unsqueeze(2)
+
+    # --- Velocity hemisphere ---
+    # en = 0.5 * orho1 * (or2*vr^2 + O_sin_theta_E2*(vt^2 + vp^2))
+    en_v = 0.5 * orho1_3d * (or2_3d * vr * vr + oste2 * (vt * vt + vp * vp))
+    # vrabs = orho1 * |vr|
+    vrabs_v = orho1_3d * vr.abs()
+
+    # Weighted per-radial-level, summed over phi: (n_r_max, n_theta_max, n_phi_max)
+    en_v_weighted = gw * en_v    # (n_r_max, n_theta_max, n_phi_max)
+    vrabs_v_weighted = gw * vrabs_v
+
+    # Sum over phi, then split hemisphere, then sum over theta -> (n_r_max,)
+    # North
+    ekin_r_N = en_v_weighted[:, _north_mask, :].sum(dim=(1, 2))
+    ekin_r_S = en_v_weighted[:, ~_north_mask, :].sum(dim=(1, 2))
+    vrabs_r_N = vrabs_v_weighted[:, _north_mask, :].sum(dim=(1, 2))
+    vrabs_r_S = vrabs_v_weighted[:, ~_north_mask, :].sum(dim=(1, 2))
+
+    # Radial integration
+    ekinN = eScale * rInt_R(ekin_r_N).item()
+    ekinS = eScale * rInt_R(ekin_r_S).item()
+    vrabsN = vScale * rInt_R(vrabs_r_N).item()
+    vrabsS = vScale * rInt_R(vrabs_r_S).item()
+
+    ekin_total = ekinN + ekinS
+    if ekin_total > 0.0:
+        hemi_ekin = abs(ekinN - ekinS) / ekin_total
+        hemi_vr = abs(vrabsN - vrabsS) / (vrabsN + vrabsS)
+    else:
+        hemi_ekin = 0.0
+        hemi_vr = 0.0
+
+    # --- Magnetic hemisphere ---
+    if br is not None:
+        en_b = 0.5 * (or2_3d * br * br + oste2 * (bt * bt + bp * bp))
+        brabs_b = br.abs()
+
+        en_b_weighted = gw * en_b
+        brabs_b_weighted = gw * brabs_b
+
+        emag_r_N = en_b_weighted[:, _north_mask, :].sum(dim=(1, 2))
+        emag_r_S = en_b_weighted[:, ~_north_mask, :].sum(dim=(1, 2))
+        brabs_r_N = brabs_b_weighted[:, _north_mask, :].sum(dim=(1, 2))
+        brabs_r_S = brabs_b_weighted[:, ~_north_mask, :].sum(dim=(1, 2))
+
+        emagN = LFfac * eScale * rInt_R(emag_r_N).item()
+        emagS = LFfac * eScale * rInt_R(emag_r_S).item()
+        brabsN = rInt_R(brabs_r_N).item()
+        brabsS = rInt_R(brabs_r_S).item()
+
+        emag_total = emagN + emagS
+        if emag_total > 0.0:
+            hemi_emag = abs(emagN - emagS) / emag_total
+            hemi_br = abs(brabsN - brabsS) / (brabsN + brabsS)
+            # CMB is nR=0 (first radial level)
+            brN_cmb = brabs_b_weighted[0, _north_mask, :].sum().item()
+            brS_cmb = brabs_b_weighted[0, ~_north_mask, :].sum().item()
+            if brN_cmb + brS_cmb > 0.0:
+                hemi_cmb = abs(brN_cmb - brS_cmb) / (brN_cmb + brS_cmb)
+            else:
+                hemi_cmb = 0.0
+        else:
+            hemi_emag = 0.0
+            hemi_br = 0.0
+            hemi_cmb = 0.0
+    else:
+        emag_total = 0.0
+        hemi_emag = 0.0
+        hemi_br = 0.0
+        hemi_cmb = 0.0
+
+    return Hemi(hemi_vr, hemi_ekin, hemi_br, hemi_emag, hemi_cmb,
+                ekin_total, emag_total)
+
+
+def write_hemi_line(f, time, hemi):
+    """Write one line to hemi.TAG matching Fortran '(1P,ES20.12,7ES16.8)'."""
+    f.write(f"{time:20.12E}{_round_off(hemi.hemi_vr, 1.0):16.8E}"
+            f"{_round_off(hemi.hemi_ekin, 1.0):16.8E}"
+            f"{_round_off(hemi.hemi_br, 1.0):16.8E}"
+            f"{_round_off(hemi.hemi_emag, 1.0):16.8E}"
+            f"{_round_off(hemi.hemi_cmb, 1.0):16.8E}"
+            f"{hemi.ekin_total:16.8E}{hemi.emag_total:16.8E}\n")
+
+
+# --- Helicity diagnostics (outMisc.f90 get_helicity / outHelicity) ---
+
+Helicity = namedtuple('Helicity',
+                       'HelN HelS HelRMSN HelRMSS HelnaN HelnaS HelnaRMSN HelnaRMSS')
+
+
+def get_helicity(vr, vt, vp, cvr, dvrdt, dvrdp, dvtdr, dvpdr):
+    """Compute helicity diagnostics (outMisc.f90 get_helicity + outHelicity).
+
+    All inputs shape (n_r_max, n_theta_max, n_phi_max) from batched SHTs.
+    cvr = curl_r(z), dvrdt/dvrdp from pol_to_grad_spat(w),
+    dvtdr/dvpdr from torpol_to_spat(dw, ddw, dz).
+
+    Returns Helicity namedtuple with 8 components matching helicity.TAG cols 2-9.
+    """
+    # Reshape radial quantities: (n_r_max,) -> (n_r_max, 1, 1)
+    or4_3d = or4.unsqueeze(1).unsqueeze(2)
+    or2_3d = or2.unsqueeze(1).unsqueeze(2)
+    orho2_3d = orho2.unsqueeze(1).unsqueeze(2)
+    beta_3d = r_beta.unsqueeze(1).unsqueeze(2)
+
+    # O_sin_theta_E2 in grid order: (1, n_theta_max, 1)
+    oste2 = O_sin_theta_E2_grid.unsqueeze(0).unsqueeze(2)
+
+    phiNorm = 1.0 / float(n_phi_max)
+
+    # --- Phi-averaged fields (axisymmetric) ---
+    # Mean over phi: (n_r_max, n_theta_max, n_phi_max) -> (n_r_max, n_theta_max, 1)
+    vras = vr.mean(dim=2, keepdim=True)
+    vtas = vt.mean(dim=2, keepdim=True)
+    vpas = vp.mean(dim=2, keepdim=True)
+    cvras = cvr.mean(dim=2, keepdim=True)
+    dvrdtas = dvrdt.mean(dim=2, keepdim=True)
+    dvrdpas = dvrdp.mean(dim=2, keepdim=True)
+    dvtdras = dvtdr.mean(dim=2, keepdim=True)
+    dvpdras = dvpdr.mean(dim=2, keepdim=True)
+
+    # NOTE: Fortran uses sum/n_phi_max which is the same as mean. But the phiNorm
+    # normalization is 1/n_phi_max applied to the sums. Since Fortran does
+    # sum_over_phi / n_phi_max, that equals mean. ✓
+
+    # --- Non-axisymmetric fields with beta corrections ---
+    vrna = vr - vras
+    cvrna = cvr - cvras
+    vtna = vt - vtas
+    vpna = vp - vpas
+    dvrdpna = dvrdp - dvrdpas
+    # dvpdrna = dvpdr - beta*vp - (dvpdras - beta*vpas)
+    dvpdrna = dvpdr - beta_3d * vp - dvpdras + beta_3d * vpas
+    # dvtdrna = dvtdr - beta*vt - (dvtdras - beta*vtas)
+    dvtdrna = dvtdr - beta_3d * vt - dvtdras + beta_3d * vtas
+    dvrdtna = dvrdt - dvrdtas
+
+    # --- Full helicity at each point ---
+    # Hel = or4*orho2*vr*cvr + or2*orho2*O_sin_theta_E2 * (
+    #   vt*(or2*dvrdp - dvpdr + beta*vp) + vp*(dvtdr - beta*vt - or2*dvrdt))
+    Hel = (or4_3d * orho2_3d * vr * cvr +
+           or2_3d * orho2_3d * oste2 * (
+               vt * (or2_3d * dvrdp - dvpdr + beta_3d * vp) +
+               vp * (dvtdr - beta_3d * vt - or2_3d * dvrdt)))
+
+    # --- Non-axisymmetric helicity ---
+    Helna = (or4_3d * orho2_3d * vrna * cvrna +
+             or2_3d * orho2_3d * oste2 * (
+                 vtna * (or2_3d * dvrdpna - dvpdrna) +
+                 vpna * (dvtdrna - or2_3d * dvrdtna)))
+
+    # --- Weighted sums per hemisphere ---
+    # Weight: phiNorm * gauss_grid(nTheta)
+    gw = (phiNorm * gauss_grid).unsqueeze(0).unsqueeze(2)  # (1, n_theta_max, 1)
+
+    Hel_w = gw * Hel         # (n_r_max, n_theta_max, n_phi_max)
+    Hel2_w = gw * Hel * Hel
+    Helna_w = gw * Helna
+    Helna2_w = gw * Helna * Helna
+
+    # Sum over phi and theta, split by hemisphere -> (n_r_max,)
+    HelN_r = Hel_w[:, _north_mask, :].sum(dim=(1, 2))
+    HelS_r = Hel_w[:, ~_north_mask, :].sum(dim=(1, 2))
+    Hel2N_r = Hel2_w[:, _north_mask, :].sum(dim=(1, 2))
+    Hel2S_r = Hel2_w[:, ~_north_mask, :].sum(dim=(1, 2))
+    HelnaN_r = Helna_w[:, _north_mask, :].sum(dim=(1, 2))
+    HelnaS_r = Helna_w[:, ~_north_mask, :].sum(dim=(1, 2))
+    Helna2N_r = Helna2_w[:, _north_mask, :].sum(dim=(1, 2))
+    Helna2S_r = Helna2_w[:, ~_north_mask, :].sum(dim=(1, 2))
+    # HelEAAS: North gets +Hel, South gets -Hel
+    HelEA_r = HelN_r - HelS_r  # (n_r_max,)
+
+    # --- Radial integration (outHelicity) ---
+    # Integration weight: r^2, factor 2*pi, volume norm = vol_oc/2 per hemisphere
+    r2 = r * r
+    half_vol = float(vol_oc) / 2.0
+    fac = 2.0 * math.pi / half_vol
+
+    HelN = fac * rInt_R(HelN_r * r2).item()
+    HelS = fac * rInt_R(HelS_r * r2).item()
+    HelnaN = fac * rInt_R(HelnaN_r * r2).item()
+    HelnaS = fac * rInt_R(HelnaS_r * r2).item()
+    HelEA = 2.0 * math.pi / float(vol_oc) * rInt_R(HelEA_r * r2).item()
+    HelRMSN = math.sqrt(abs(fac * rInt_R(Hel2N_r * r2).item()))
+    HelRMSS = math.sqrt(abs(fac * rInt_R(Hel2S_r * r2).item()))
+    HelnaRMSN = math.sqrt(abs(fac * rInt_R(Helna2N_r * r2).item()))
+    HelnaRMSS = math.sqrt(abs(fac * rInt_R(Helna2S_r * r2).item()))
+
+    # Relative helicity: Hel / HelRMS per hemisphere
+    HelRMS = HelRMSN + HelRMSS
+    HelnaRMS = HelnaRMSN + HelnaRMSS
+
+    if HelnaRMS != 0.0:
+        HelnaN = HelnaN / HelnaRMSN if HelnaRMSN != 0.0 else 0.0
+        HelnaS = HelnaS / HelnaRMSS if HelnaRMSS != 0.0 else 0.0
+    else:
+        HelnaN = 0.0
+        HelnaS = 0.0
+
+    if HelRMS != 0.0:
+        HelN = HelN / HelRMSN if HelRMSN != 0.0 else 0.0
+        HelS = HelS / HelRMSS if HelRMSS != 0.0 else 0.0
+    else:
+        HelN = 0.0
+        HelS = 0.0
+
+    return Helicity(HelN, HelS, HelRMSN, HelRMSS, HelnaN, HelnaS, HelnaRMSN, HelnaRMSS)
+
+
+def write_helicity_line(f, time, hel):
+    """Write one line to helicity.TAG matching Fortran '(1P,ES20.12,8ES16.8)'."""
+    f.write(f"{time:20.12E}{hel.HelN:16.8E}{hel.HelS:16.8E}"
+            f"{hel.HelRMSN:16.8E}{hel.HelRMSS:16.8E}"
+            f"{hel.HelnaN:16.8E}{hel.HelnaS:16.8E}"
+            f"{hel.HelnaRMSN:16.8E}{hel.HelnaRMSS:16.8E}\n")
+
+
+# --- Power diagnostics (power.f90 get_power / get_visc_heat) ---
+
+from .horizontal_data import cosn_theta_E2_grid
+
+Power = namedtuple('Power',
+                    'buoy buoy_chem z10ICB_term z10CMB_term viscDiss ohmDiss '
+                    'powerMA powerIC powerDiff eDiffInt_norm')
+
+
+def get_visc_heat(vr, vt, vp, cvr, dvrdr, dvrdt, dvrdp, dvtdr, dvtdp, dvpdr, dvpdp):
+    """Compute viscous heating at all radial levels (power.f90 get_visc_heat).
+
+    All inputs shape (n_r_max, n_theta_max, n_phi_max) from batched SHTs.
+    Returns viscASr (n_r_max,): viscous heating per radial level (before eScale*rInt_R).
+    """
+    phiNorm = 2.0 * math.pi / float(n_phi_max)
+
+    # Reshape radial quantities: (n_r_max,) -> (n_r_max, 1, 1)
+    or2_3d = or2.unsqueeze(1).unsqueeze(2)
+    or1_3d = or1.unsqueeze(1).unsqueeze(2)
+    orho1_3d = orho1.unsqueeze(1).unsqueeze(2)
+    visc_3d = r_visc.unsqueeze(1).unsqueeze(2)
+    beta_3d = r_beta.unsqueeze(1).unsqueeze(2)
+    r_3d = r.unsqueeze(1).unsqueeze(2)
+
+    # Theta quantities: (1, n_theta_max, 1)
+    csn2 = cosn_theta_E2_grid.unsqueeze(0).unsqueeze(2)
+    oste2 = O_sin_theta_E2_grid.unsqueeze(0).unsqueeze(2)
+
+    # Gauss weights: (1, n_theta_max, 1)
+    gw = gauss_grid.unsqueeze(0).unsqueeze(2)
+
+    # Strain rate terms (matching Fortran get_visc_heat exactly)
+    # Term 1: 2*(dvrdr - (2*or1 + beta)*vr)^2
+    t1 = 2.0 * (dvrdr - (2.0 * or1_3d + beta_3d) * vr) ** 2
+
+    # Term 2: 2*(csn2*vt + dvpdp + dvrdr - or1*vr)^2
+    t2 = 2.0 * (csn2 * vt + dvpdp + dvrdr - or1_3d * vr) ** 2
+
+    # Term 3: 2*(dvpdp + csn2*vt + or1*vr)^2
+    # Wait — re-reading Fortran: this is a separate term. Let me re-check.
+    # Fortran line: two*(dvpdp + csn2*vt + or1*vr)**2
+    t3 = 2.0 * (dvpdp + csn2 * vt + or1_3d * vr) ** 2
+
+    # Term 6 (numbering from Fortran comments): (2*dvtdp + cvr - 2*csn2*vp)^2
+    t6 = (2.0 * dvtdp + cvr - 2.0 * csn2 * vp) ** 2
+
+    # Term 4: O_sin_theta_E2 * (r*dvtdr - (2+beta*r)*vt + or1*dvrdt)^2
+    t4 = oste2 * (r_3d * dvtdr - (2.0 + beta_3d * r_3d) * vt + or1_3d * dvrdt) ** 2
+
+    # Term 5: O_sin_theta_E2 * (r*dvpdr - (2+beta*r)*vp + or1*dvrdp)^2
+    t5 = oste2 * (r_3d * dvpdr - (2.0 + beta_3d * r_3d) * vp + or1_3d * dvrdp) ** 2
+
+    # Correction: -2/3*(beta*vr)^2
+    t_corr = -2.0 / 3.0 * (beta_3d * vr) ** 2
+
+    # Total viscous heating
+    vh = or2_3d * orho1_3d * visc_3d * (t1 + t2 + t3 + t6 + t4 + t5 + t_corr)
+
+    # Sum over phi and theta with gauss weights
+    viscASr = (phiNorm * gw * vh).sum(dim=(1, 2))  # (n_r_max,)
+
+    return viscASr
+
+
+def get_power_spectral(w, s, xi, b, ddb, aj, dj):
+    """Compute spectral contributions to power budget (buoyancy, ohmic dissipation).
+
+    Args:
+        w: poloidal velocity (lm_max, n_r_max)
+        s: entropy (lm_max, n_r_max)
+        xi: composition (lm_max, n_r_max) or None
+        b, ddb, aj, dj: magnetic field (lm_max, n_r_max) or None
+
+    Returns:
+        (buoy, buoy_chem, curlB2): scalars (radially integrated)
+    """
+    dLh_lm = dLh.unsqueeze(1)  # (lm_max, 1)
+    or2_r = or2.unsqueeze(0)   # (1, n_r_max)
+    rgrav_r = rgrav.unsqueeze(0)  # (1, n_r_max)
+
+    # --- Buoyancy power ---
+    buoy = 0.0
+    if l_heat:
+        # buoy_r(nR) = Σ_lm eScale * dLh * BuoFac * rgrav(nR) * cc22real(w, s, m)
+        buoy_lm = eScale * dLh_lm * BuoFac * rgrav_r * _cc22real(w, s, _m_arr)
+        ones = torch.ones(lm_max, dtype=torch.float64, device=w.device)
+        buoy = rInt_R(ones @ buoy_lm).item()
+
+    # --- Chemical buoyancy ---
+    buoy_chem = 0.0
+    if l_chemical_conv and xi is not None:
+        buoy_chem_lm = eScale * dLh_lm * ChemFac * rgrav_r * _cc22real(w, xi, _m_arr)
+        ones = torch.ones(lm_max, dtype=torch.float64, device=w.device)
+        buoy_chem = rInt_R(ones @ buoy_chem_lm).item()
+
+    # --- Ohmic dissipation ---
+    curlB2 = 0.0
+    if l_mag and b is not None:
+        lambda_r = r_lambda.unsqueeze(0)  # (1, n_r_max)
+        # laplace = dLh*or2*b - ddb
+        laplace = dLh_lm * or2_r * b - ddb
+        # curlB2_r = Σ_lm LFfac*opm*eScale * dLh * lambda * (dLh*or2*cc2real(aj) + cc2real(dj) + cc2real(laplace))
+        curlB2_lm = (LFfac * opm * eScale * dLh_lm * lambda_r *
+                     (dLh_lm * or2_r * _cc2real(aj, _m_arr) +
+                      _cc2real(dj, _m_arr) +
+                      _cc2real(laplace, _m_arr)))
+        ones = torch.ones(lm_max, dtype=torch.float64, device=b.device)
+        curlB2 = rInt_R(ones @ curlB2_lm).item()
+
+    return buoy, buoy_chem, curlB2
+
+
+def write_power_line(f, time, pw):
+    """Write one line to power.TAG matching Fortran '(1P,ES20.12,10ES16.8)'."""
+    f.write(f"{time:20.12E}{pw.buoy:16.8E}{pw.buoy_chem:16.8E}"
+            f"{pw.z10ICB_term:16.8E}{pw.z10CMB_term:16.8E}"
+            f"{pw.viscDiss:16.8E}{pw.ohmDiss:16.8E}"
+            f"{pw.powerMA:16.8E}{pw.powerIC:16.8E}"
+            f"{pw.powerDiff:16.8E}{pw.eDiffInt_norm:16.8E}\n")
+
+
+# --- Output diagnostic sweep: batched SHTs for grid-space diagnostics ---
+
+from .sht import (torpol_to_spat, pol_to_curlr_spat, pol_to_grad_spat,
+                  scal_to_spat)
+from .horizontal_data import dPhi
+from .radial_functions import or3 as _or3
+from .precision import DTYPE
+
+# Precomputed dLh for Q input in torpol_to_spat
+_dLh_2d = dLh.to(CDTYPE).unsqueeze(1)  # (lm_max, 1)
+_dPhi_2d = dPhi.to(CDTYPE).unsqueeze(1)  # (lm_max, 1)
+# Precomputed radial factors for dvrdr (n_r_max,) -> (1, n_r_max)
+_or2_2d = or2.unsqueeze(0)
+_or3_2d = _or3.unsqueeze(0)
+
+
+def output_diag_sweep(w, dw, ddw, z, dz,
+                      b=None, db=None, aj=None,
+                      need_hemi=True, need_helicity=True, need_visc_heat=True):
+    """Batched SHTs at all radial levels for output diagnostics.
+
+    Returns dict with computed diagnostics (Hemi, Helicity, viscASr).
+    Skips SHTs/computations not needed.
+    """
+    result = {}
+
+    # --- Velocity SHTs (all radial levels) ---
+    # torpol_to_spat(dLh*w, dw, z) -> vr, vt, vp
+    Q_vel = _dLh_2d * w
+    vr_all, vt_all, vp_all = torpol_to_spat(Q_vel, dw, z)
+
+    # --- Hemi: only needs vr, vt, vp (and optionally br, bt, bp) ---
+    if need_hemi:
+        br_all = bt_all = bp_all = None
+        if l_mag and b is not None:
+            Q_mag = _dLh_2d * b
+            br_all, bt_all, bp_all = torpol_to_spat(Q_mag, db, aj)
+        result['hemi'] = get_hemi(vr_all, vt_all, vp_all,
+                                  br_all, bt_all, bp_all)
+
+    # --- Additional SHTs for helicity and visc_heat ---
+    if need_helicity or need_visc_heat:
+        # cvr from pol_to_curlr_spat(z)
+        cvr_all = pol_to_curlr_spat(z)
+
+        # dvrdt, dvrdp from pol_to_grad_spat(w)
+        dvrdt_all, dvrdp_all = pol_to_grad_spat(w)
+
+        # dvtdr, dvpdr from torpol_to_spat(dLh*dw, ddw, dz)
+        Q_dv = _dLh_2d * dw
+        _, dvtdr_all, dvpdr_all = torpol_to_spat(Q_dv, ddw, dz)
+
+    if need_helicity:
+        result['helicity'] = get_helicity(
+            vr_all, vt_all, vp_all, cvr_all,
+            dvrdt_all, dvrdp_all, dvtdr_all, dvpdr_all)
+
+    if need_visc_heat:
+        # dvtdp, dvpdp from torpol_to_dphspat(dw, z) — inline via batched torpol_to_spat
+        Slm_dph = _dPhi_2d * dw
+        Tlm_dph = _dPhi_2d * z
+        Qlm_dph = torch.zeros_like(Slm_dph)
+        _, dvtdp_raw, dvpdp_raw = torpol_to_spat(Qlm_dph, Slm_dph, Tlm_dph)
+        # Multiply by 1/sin²θ
+        Ost2_grid = O_sin_theta_E2_grid.unsqueeze(0).unsqueeze(2)
+        dvtdp_all = dvtdp_raw * Ost2_grid
+        dvpdp_all = dvpdp_raw * Ost2_grid
+
+        # dvrdr = dvrdrc from torpol_to_spat(dw, ddw, dz) = scal_to_spat(dLh*dw)
+        # This is the RAW SHT output, NOT the physical dvr/dr.
+        # The get_visc_heat formula applies its own or1/beta corrections.
+        # (Fortran rIter.f90 line 551-553: torpol_to_spat(dw, ddw, dz, dvrdrc, ...))
+        dvrdr_all = scal_to_spat(_dLh_2d * dw)
+
+        result['viscASr'] = get_visc_heat(
+            vr_all, vt_all, vp_all, cvr_all,
+            dvrdr_all, dvrdt_all, dvrdp_all,
+            dvtdr_all, dvtdp_all, dvpdr_all, dvpdp_all)
+
+    return result
+
+
 def get_elsAnel(b, db, aj):
     """Radially-integrated Elsasser number (unfactored, matching magnetic_energy.f90:342,455).
 
@@ -884,6 +1527,57 @@ def update_par_means(rm_ms, rol_ms, urol_ms, dlv_ms, dlvc_ms, dlpp_ms,
     RmR = RmR * torch.sqrt(_mass * orho1) * _or2
     rm_ms.compute(RmR, dt, total_time)         # line 278
     dlpp_ms.compute(dlPolPeakR, dt, total_time)  # line 279
+
+
+def get_lorentz_torque_ic(b, db, aj):
+    """Compute Lorentz torque on IC from spectral magnetic fields.
+
+    Does a single-level inverse SHT at ICB to get brc, bpc, then
+    integrates gauss * brc * bpc. Matches get_lorentz_torque in outRot.f90.
+    """
+    from .sht import torpol_to_spat
+    from .horizontal_data import gauss_grid, dLh as _dLh_hd
+    from .params import n_phi_max, n_r_max
+    _dLh_cd = _dLh_hd.to(CDTYPE).unsqueeze(1)
+
+    icb = n_r_max - 1
+    # Single-level inverse SHT at ICB
+    Q = _dLh_cd * b[:, icb:icb + 1]
+    S = db[:, icb:icb + 1]
+    T = aj[:, icb:icb + 1]
+    brc, _, bpc = torpol_to_spat(Q, S, T)
+    brc = brc[0]  # (n_theta, n_phi)
+    bpc = bpc[0]
+
+    fac = LFfac * 2.0 * math.pi / float(n_phi_max)
+    return fac * (gauss_grid.unsqueeze(1) * brc * bpc).sum().item()
+
+
+def get_viscous_torque(z10, dz10, r_bnd, beta_bnd, visc_bnd):
+    """Compute viscous torque at a boundary (outRot.f90 get_viscous_torque).
+
+    Args:
+        z10: real value of z(l=1,m=0) at boundary
+        dz10: real value of dz/dr(l=1,m=0) at boundary
+        r_bnd: radius of boundary
+        beta_bnd: d(ln rho0)/dr at boundary (0 for Boussinesq)
+        visc_bnd: kinematic viscosity at boundary
+
+    Returns:
+        viscous torque (scalar float)
+    """
+    return -4.0 * math.sqrt(pi / 3.0) * visc_bnd * r_bnd * (
+        (2.0 + beta_bnd * r_bnd) * z10 - r_bnd * dz10)
+
+
+def write_rot_line(f, time, omega_ic, lorentz_torque_ic, viscous_torque_ic,
+                   omega_ma, lorentz_torque_ma, viscous_torque_ma,
+                   gravi_torque_ic):
+    """Write one line to rot.TAG matching Fortran '(1P,2X,ES20.12,7ES16.8)'."""
+    f.write(f"  {time:20.12E}{omega_ic:16.8E}{lorentz_torque_ic:16.8E}"
+            f"{viscous_torque_ic:16.8E}{omega_ma:16.8E}"
+            f"{lorentz_torque_ma:16.8E}{viscous_torque_ma:16.8E}"
+            f"{gravi_torque_ic:16.8E}\n")
 
 
 def write_par_line(f, time, cols):

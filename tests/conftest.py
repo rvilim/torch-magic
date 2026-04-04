@@ -164,6 +164,7 @@ _LM_FIELD_NAMES_DD = _LM_FIELD_NAMES | {
     'ddw_init', 'ddb_init', 'ds_init',
     'dxidt_old', 'dxidt_impl', 'dxidt_expl', 'xi_imex_rhs',
     'dVXirLM_nR17', 'VXitLM_nR17', 'VXipLM_nR17',
+    'dpdt_old', 'dpdt_impl', 'dpdt_expl',
 }
 
 
@@ -187,6 +188,79 @@ def load_ref_dd(name: str, reorder_lm: bool = None) -> torch.Tensor:
         if t.ndim >= 1:
             result = torch.zeros_like(t)
             result[_SNAKE2ST_BOUSS] = t
+            return result
+
+    return t
+
+
+# Path to condIC Fortran reference data
+FORTRAN_REF_CONDIC = Path(__file__).parent.parent.parent / "samples" / "dynamo_benchmark_condIC" / "fortran_ref"
+
+# LM field names for condIC (conducting IC, CNAB2, l_max=16, minc=1)
+_LM_FIELD_NAMES_CONDIC = _LM_FIELD_NAMES | {
+    *[f'{f}_init' for f in ('b_ic', 'db_ic', 'ddb_ic', 'aj_ic', 'dj_ic', 'ddj_ic')],
+    *[f'{f}_step{n}' for n in range(1, 102)
+      for f in ('b_ic', 'db_ic', 'ddb_ic', 'aj_ic', 'dj_ic', 'ddj_ic')],
+    'ddw_init', 'dj_init', 'ddb_init', 'ds_init',
+    'dbdt_old', 'dbdt_impl', 'dbdt_expl', 'dbdt_imex_rhs',
+    'djdt_old', 'djdt_impl', 'djdt_expl', 'djdt_imex_rhs',
+    'dbdt_ic_imex_rhs', 'djdt_ic_imex_rhs',
+    'dpdt_old', 'dpdt_impl', 'dpdt_expl',
+}
+
+
+def load_ref_condic(name: str, reorder_lm: bool = None) -> torch.Tensor:
+    """Load a condIC Fortran reference array.
+
+    Uses l_max=16, minc=1 snake-to-standard permutation.
+    """
+    arr = np.load(FORTRAN_REF_CONDIC / f"{name}.npy")
+    if arr.ndim == 0:
+        return torch.tensor(arr.item(), device=DEVICE, dtype=DTYPE)
+    if np.issubdtype(arr.dtype, np.integer):
+        t = torch.from_numpy(arr.copy()).long().to(DEVICE)
+    elif np.issubdtype(arr.dtype, np.complexfloating):
+        t = torch.from_numpy(arr.copy()).to(CDTYPE).to(DEVICE)
+    else:
+        t = torch.from_numpy(arr.copy()).to(DTYPE).to(DEVICE)
+
+    should_reorder = reorder_lm if reorder_lm is not None else (name in _LM_FIELD_NAMES_CONDIC)
+    if should_reorder and t.shape[0] == len(_SNAKE2ST):
+        if t.ndim >= 1:
+            result = torch.zeros_like(t)
+            result[_SNAKE2ST] = t
+            return result
+
+    return t
+
+
+# Path to condICrotIC Fortran reference data
+FORTRAN_REF_CONDICROTIC = Path(__file__).parent.parent.parent / "samples" / "dynamo_benchmark_condICrotIC" / "fortran_ref"
+
+# Same LM field names as condIC, plus omega_ic (scalar, no reorder)
+_LM_FIELD_NAMES_CONDICROTIC = _LM_FIELD_NAMES_CONDIC
+
+
+def load_ref_condicrotic(name: str, reorder_lm: bool = None) -> torch.Tensor:
+    """Load a condICrotIC Fortran reference array.
+
+    Uses l_max=16, minc=1 snake-to-standard permutation (same as condIC).
+    """
+    arr = np.load(FORTRAN_REF_CONDICROTIC / f"{name}.npy")
+    if arr.ndim == 0:
+        return torch.tensor(arr.item(), device=DEVICE, dtype=DTYPE)
+    if np.issubdtype(arr.dtype, np.integer):
+        t = torch.from_numpy(arr.copy()).long().to(DEVICE)
+    elif np.issubdtype(arr.dtype, np.complexfloating):
+        t = torch.from_numpy(arr.copy()).to(CDTYPE).to(DEVICE)
+    else:
+        t = torch.from_numpy(arr.copy()).to(DTYPE).to(DEVICE)
+
+    should_reorder = reorder_lm if reorder_lm is not None else (name in _LM_FIELD_NAMES_CONDICROTIC)
+    if should_reorder and t.shape[0] == len(_SNAKE2ST):
+        if t.ndim >= 1:
+            result = torch.zeros_like(t)
+            result[_SNAKE2ST] = t
             return result
 
     return t

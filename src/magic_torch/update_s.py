@@ -13,13 +13,13 @@ import torch
 from .precision import DTYPE, CDTYPE, DEVICE
 from .params import n_r_max, lm_max, l_max, n_cheb_max, l_anel
 from .constants import sq4pi, two
-from .chebyshev import rMat, drMat, d2rMat, rnorm, boundary_fac
+from .radial_scheme import rMat, drMat, d2rMat, rnorm, boundary_fac
 from .radial_functions import or1, or2, beta, dLtemp0, dLkappa, kappa, orho1
 from .horizontal_data import dLh, hdif_S
 from .pre_calculations import opr
 from .blocking import st_lm2, st_lm2l, st_lm2m
 from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
-from .cosine_transform import costf
+from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_ddr
 
 
@@ -57,8 +57,14 @@ _sMat_lu = [None] * (l_max + 1)
 _sMat_ip = [None] * (l_max + 1)
 _sMat_fac = [None] * (l_max + 1)
 
-# Unique inverse per l degree: (l_max+1, N, N) float64
+# Unique inverse per l degree: (l_max+1, N, N) float64 (Chebyshev)
 _s_inv_by_l = None
+# FD: banded LU storage per l for pivoted solve
+_s_bands_by_l = None   # (l_max+1, n_abd_rows, N) band LU factors
+_s_piv_by_l = None     # (l_max+1, N) pivot indices
+_s_fac_by_l = None     # (l_max+1, N) row preconditioning
+_s_kl = 1              # bandwidth (set in build_s_matrices for FD)
+_s_ku = 1
 
 
 def build_s_matrices(wimp_lin0: float):
@@ -71,11 +77,10 @@ def build_s_matrices(wimp_lin0: float):
 
     Must be called whenever dt changes.
     """
-    global _s_inv_by_l
+    global _s_inv_by_l, _s_bands_by_l, _s_piv_by_l, _s_fac_by_l, _s_kl, _s_ku
+    from .params import l_finite_diff
     N = n_r_max
 
-    # Build on CPU (prepare_mat/solve_mat_real use Python scalar loops that
-    # are catastrophically slow on GPU due to per-element sync).
     cpu = torch.device("cpu")
     _rMat = rMat.to(cpu)
     _drMat = drMat.to(cpu)
@@ -89,6 +94,18 @@ def build_s_matrices(wimp_lin0: float):
 
     eye = torch.eye(N, dtype=DTYPE, device=cpu)
     inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
+    # FD bandwidth
+    if l_finite_diff:
+        from .params import fd_order, fd_order_bound
+        if fd_order <= 2 and fd_order_bound <= 2:
+            _s_kl, _s_ku = 1, 1
+        else:
+            hw = max(fd_order // 2, fd_order_bound)
+            _s_kl, _s_ku = hw, hw
+    n_abd = 2 * _s_kl + _s_ku + 1 if l_finite_diff else 1
+    abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
+    piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
+    fac_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
 
     # Anelastic: first-derivative coefficient includes beta + dLtemp0 + dLkappa
     # Boussinesq: beta=0, dLtemp0=0, dLkappa=0 → just 2/r
@@ -118,15 +135,30 @@ def build_s_matrices(wimp_lin0: float):
         dat[:, N - 1] = dat[:, N - 1] * _bfac
 
         fac = 1.0 / dat.abs().max(dim=1).values
-        dat = fac.unsqueeze(1) * dat
+        dat_precond = fac.unsqueeze(1) * dat
 
-        lu, ip, info = prepare_mat(dat)
-        assert info == 0, f"Singular sMat for l={l}, info={info}"
+        if l_finite_diff:
+            from .algebra import dense_to_band_storage, prepare_band
+            abd = dense_to_band_storage(dat_precond, _s_kl, _s_ku)
+            abd_f, piv, info = prepare_band(abd, N, _s_kl, _s_ku)
+            assert info == 0, f"Singular sMat (band) for l={l}, info={info}"
+            abd_all[l] = abd_f
+            piv_all[l] = piv
+            fac_all[l] = fac
+        else:
+            lu, ip, info = prepare_mat(dat_precond)
+            assert info == 0, f"Singular sMat for l={l}, info={info}"
+            inv_precond = solve_mat_real(lu, ip, eye)
+            inv_by_l[l] = inv_precond * fac.unsqueeze(0)
 
-        inv_precond = solve_mat_real(lu, ip, eye)
-        inv_by_l[l] = inv_precond * fac.unsqueeze(0)
-
-    _s_inv_by_l = inv_by_l.to(DEVICE)
+    if l_finite_diff:
+        _s_bands_by_l = abd_all.to(DEVICE)
+        _s_piv_by_l = piv_all.to(DEVICE)
+        _s_fac_by_l = fac_all.to(DEVICE)
+        _s_inv_by_l = None
+    else:
+        _s_inv_by_l = inv_by_l.to(DEVICE)
+        _s_bands_by_l = None
 
 
 def finish_exp_entropy(ds_exp, dVSrLM):
@@ -166,18 +198,24 @@ def updateS(s_LMloc, ds_LMloc, dsdt, tscheme):
     # 1. Assemble IMEX RHS (physical-space values at grid points)
     rhs = tscheme.set_imex_rhs(dsdt)  # (lm_max, n_r_max)
 
-    # 2. Batched solve: set BCs, then chunked matmul with per-l inverses
+    # 2. Batched solve: set BCs, then solve
     rhs[:, 0] = _tops
     rhs[:, N - 1] = _bots
-    s_cheb = chunked_solve_complex(_s_inv_by_l, st_lm2l, rhs)
-    s_cheb[_m0_mask] = s_cheb[_m0_mask].real.to(CDTYPE)
 
-    # 3. Truncate high Chebyshev modes (Fortran only stores n_cheb_max modes)
-    if n_cheb_max < N:
-        s_cheb[:, n_cheb_max:] = 0.0
-
-    # 4. Convert Chebyshev coefficients to physical space
-    s_LMloc[:] = costf(s_cheb)
+    if _s_bands_by_l is not None:
+        # FD: pivoted banded LU solve
+        from .algebra import banded_solve_by_l
+        s_phys = banded_solve_by_l(
+            _s_bands_by_l, _s_piv_by_l, st_lm2l, rhs,
+            n=N, kl=_s_kl, ku=_s_ku, fac_row_by_l=_s_fac_by_l)
+        s_phys[_m0_mask] = s_phys[_m0_mask].real.to(CDTYPE)
+        s_LMloc[:] = s_phys  # already physical space for FD
+    else:
+        s_cheb = chunked_solve_complex(_s_inv_by_l, st_lm2l, rhs)
+        s_cheb[_m0_mask] = s_cheb[_m0_mask].real.to(CDTYPE)
+        if n_cheb_max < N:
+            s_cheb[:, n_cheb_max:] = 0.0
+        s_LMloc[:] = costf(s_cheb)
 
     # 4. Compute radial derivatives in physical space
     ds_new, d2s = get_ddr(s_LMloc)

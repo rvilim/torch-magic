@@ -13,7 +13,7 @@ from .params import (n_r_max, n_r_ic_max, n_theta_max, n_phi_max, n_phi_tot,
                      l_max, l_mag, l_heat, l_chemical_conv, l_cond_ic,
                      minc, lm_max, ra, ek, pr, prmag, radratio, raxi, sc,
                      sigma_ratio)
-from .chebyshev import r, r_icb
+from .radial_scheme import r, r_icb
 from .radial_functions import or1, or2, orho1, r_ic, O_r_ic, O_r_ic2
 from .horizontal_data import (theta_ord, O_sin_theta_grid, n_theta_cal2ord,
                               dLh)

@@ -14,13 +14,13 @@ import torch
 from .precision import DTYPE, CDTYPE, DEVICE
 from .params import (n_r_max, n_r_ic_max, n_r_tot, n_cheb_max, n_cheb_ic_max,
                      lm_max, l_max, l_cond_ic, sigma_ratio)
-from .chebyshev import rMat, drMat, d2rMat, rnorm, boundary_fac
+from .radial_scheme import rMat, drMat, d2rMat, rnorm, boundary_fac
 from .radial_functions import or1, or2
 from .horizontal_data import dLh, hdif_B
 from .pre_calculations import opm
 from .blocking import st_lm2, st_lm2l, st_lm2m
 from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
-from .cosine_transform import costf
+from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_ddr
 
 
@@ -57,6 +57,20 @@ _jMat_fac = [None] * (l_max + 1)
 # Unique inverses per l degree — l=0 is zero
 _b_inv_by_l = None
 _j_inv_by_l = None
+# FD insulating: banded LU per l
+_b_bands_by_l = None
+_b_piv_by_l = None
+_b_fac_by_l = None
+_j_bands_by_l = None
+_j_piv_by_l = None
+_j_fac_by_l = None
+_bj_kl = 0
+_bj_ku = 0
+# FD coupled IC: bordered-band per l
+_b_bordered_by_l = None
+_j_bordered_by_l = None
+_b_fac_coupled_by_l = None
+_j_fac_coupled_by_l = None
 
 # IC-specific broadcast arrays (only when l_cond_ic)
 if l_cond_ic:
@@ -80,6 +94,9 @@ def build_b_matrices(wimp_lin0: float):
 def _build_b_matrices_insulating(wimp_lin0: float):
     """Build insulating-IC matrices (original code path)."""
     global _b_inv_by_l, _j_inv_by_l
+    global _b_bands_by_l, _b_piv_by_l, _b_fac_by_l
+    global _j_bands_by_l, _j_piv_by_l, _j_fac_by_l, _bj_kl, _bj_ku
+    from .params import l_finite_diff, fd_order, fd_order_bound
     N = n_r_max
 
     cpu = torch.device("cpu")
@@ -95,6 +112,24 @@ def _build_b_matrices_insulating(wimp_lin0: float):
     eye = torch.eye(N, dtype=DTYPE, device=cpu)
     b_inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
     j_inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
+
+    # FD: pentadiag for bMat (vacuum BCs use drMat boundary stencil)
+    if l_finite_diff:
+        _bj_kl = max(fd_order // 2, fd_order_bound)
+        _bj_ku = _bj_kl
+    n_abd = 2 * _bj_kl + _bj_ku + 1 if l_finite_diff else 1
+    b_abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
+    b_piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
+    b_fac_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+    j_abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
+    j_piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
+    j_fac_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+    if l_finite_diff:
+        # l=0 identity bands
+        b_abd_all[0, _bj_kl + _bj_ku, :] = 1.0
+        b_piv_all[0] = torch.arange(1, N + 1, dtype=torch.long)
+        j_abd_all[0, _bj_kl + _bj_ku, :] = 1.0
+        j_piv_all[0] = torch.arange(1, N + 1, dtype=torch.long)
 
     for l in range(1, l_max + 1):
         dL = float(l * (l + 1))
@@ -119,12 +154,21 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         dat_b[:, 0] = dat_b[:, 0] * _bfac
         dat_b[:, N-1] = dat_b[:, N-1] * _bfac
         fac_b = 1.0 / dat_b.abs().max(dim=1).values
-        dat_b = fac_b.unsqueeze(1) * dat_b
+        dat_b_precond = fac_b.unsqueeze(1) * dat_b
 
-        lu_b, ip_b, info_b = prepare_mat(dat_b)
-        assert info_b == 0, f"Singular bMat for l={l}, info={info_b}"
-        b_inv_precond = solve_mat_real(lu_b, ip_b, eye)
-        b_inv_by_l[l] = b_inv_precond * fac_b.unsqueeze(0)
+        if l_finite_diff:
+            from .algebra import dense_to_band_storage, prepare_band
+            abd = dense_to_band_storage(dat_b_precond, _bj_kl, _bj_ku)
+            abd_f, piv, info_b = prepare_band(abd, N, _bj_kl, _bj_ku)
+            assert info_b == 0, f"Singular bMat (band) for l={l}, info={info_b}"
+            b_abd_all[l] = abd_f
+            b_piv_all[l] = piv
+            b_fac_all[l] = fac_b
+        else:
+            lu_b, ip_b, info_b = prepare_mat(dat_b_precond)
+            assert info_b == 0, f"Singular bMat for l={l}, info={info_b}"
+            b_inv_precond = solve_mat_real(lu_b, ip_b, eye)
+            b_inv_by_l[l] = b_inv_precond * fac_b.unsqueeze(0)
 
         # === jMat (toroidal magnetic field) ===
         dat_j = torch.zeros(N, N, dtype=DTYPE, device=cpu)
@@ -141,15 +185,35 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         dat_j[:, 0] = dat_j[:, 0] * _bfac
         dat_j[:, N-1] = dat_j[:, N-1] * _bfac
         fac_j = 1.0 / dat_j.abs().max(dim=1).values
-        dat_j = fac_j.unsqueeze(1) * dat_j
+        dat_j_precond = fac_j.unsqueeze(1) * dat_j
 
-        lu_j, ip_j, info_j = prepare_mat(dat_j)
-        assert info_j == 0, f"Singular jMat for l={l}, info={info_j}"
-        j_inv_precond = solve_mat_real(lu_j, ip_j, eye)
-        j_inv_by_l[l] = j_inv_precond * fac_j.unsqueeze(0)
+        if l_finite_diff:
+            abd = dense_to_band_storage(dat_j_precond, _bj_kl, _bj_ku)
+            abd_f, piv, info_j = prepare_band(abd, N, _bj_kl, _bj_ku)
+            assert info_j == 0, f"Singular jMat (band) for l={l}, info={info_j}"
+            j_abd_all[l] = abd_f
+            j_piv_all[l] = piv
+            j_fac_all[l] = fac_j
+        else:
+            lu_j, ip_j, info_j = prepare_mat(dat_j_precond)
+            assert info_j == 0, f"Singular jMat for l={l}, info={info_j}"
+            j_inv_precond = solve_mat_real(lu_j, ip_j, eye)
+            j_inv_by_l[l] = j_inv_precond * fac_j.unsqueeze(0)
 
-    _b_inv_by_l = b_inv_by_l.to(DEVICE)
-    _j_inv_by_l = j_inv_by_l.to(DEVICE)
+    if l_finite_diff:
+        _b_bands_by_l = b_abd_all.to(DEVICE)
+        _b_piv_by_l = b_piv_all.to(DEVICE)
+        _b_fac_by_l = b_fac_all.to(DEVICE)
+        _j_bands_by_l = j_abd_all.to(DEVICE)
+        _j_piv_by_l = j_piv_all.to(DEVICE)
+        _j_fac_by_l = j_fac_all.to(DEVICE)
+        _b_inv_by_l = None
+        _j_inv_by_l = None
+    else:
+        _b_inv_by_l = b_inv_by_l.to(DEVICE)
+        _j_inv_by_l = j_inv_by_l.to(DEVICE)
+        _b_bands_by_l = None
+        _j_bands_by_l = None
 
 
 def _build_b_matrices_coupled(wimp_lin0: float):
@@ -165,9 +229,11 @@ def _build_b_matrices_coupled(wimp_lin0: float):
 
     where N = n_r_max, NT = n_r_tot = n_r_max + n_r_ic_max.
     """
-    global _b_inv_by_l, _j_inv_by_l
+    global _b_inv_by_l, _j_inv_by_l, _b_bordered_by_l, _j_bordered_by_l, _b_fac_coupled_by_l, _j_fac_coupled_by_l
+    global _bj_kl, _bj_ku
     from .radial_functions import cheb_ic, dcheb_ic, d2cheb_ic, O_r_ic, cheb_norm_ic
     from .pre_calculations import O_sr
+    from .params import l_finite_diff, fd_order, fd_order_bound
 
     N = n_r_max
     N_ic = n_r_ic_max
@@ -190,9 +256,19 @@ def _build_b_matrices_coupled(wimp_lin0: float):
     or2_col = _or2.unsqueeze(1)
     or2_icb = _or2[N - 1].item()  # 1/r_icb^2
 
-    eye = torch.eye(NT, dtype=DTYPE, device=cpu)
-    b_inv_by_l = torch.zeros(l_max + 1, NT, NT, dtype=DTYPE, device=cpu)
-    j_inv_by_l = torch.zeros(l_max + 1, NT, NT, dtype=DTYPE, device=cpu)
+    if l_finite_diff:
+        _bj_kl = max(fd_order // 2, fd_order_bound)
+        _bj_ku = _bj_kl
+        _b_bordered_by_l = [None] * (l_max + 1)
+        _j_bordered_by_l = [None] * (l_max + 1)
+        _b_fac_coupled_by_l = torch.ones(l_max + 1, NT, dtype=DTYPE, device=cpu)
+        _j_fac_coupled_by_l = torch.ones(l_max + 1, NT, dtype=DTYPE, device=cpu)
+        _b_inv_by_l = None
+        _j_inv_by_l = None
+    else:
+        eye = torch.eye(NT, dtype=DTYPE, device=cpu)
+        b_inv_by_l = torch.zeros(l_max + 1, NT, NT, dtype=DTYPE, device=cpu)
+        j_inv_by_l = torch.zeros(l_max + 1, NT, NT, dtype=DTYPE, device=cpu)
 
     for l in range(1, l_max + 1):
         dL = float(l * (l + 1))
@@ -267,10 +343,15 @@ def _build_b_matrices_coupled(wimp_lin0: float):
         fac_b = 1.0 / dat_b.abs().max(dim=1).values
         dat_b = fac_b.unsqueeze(1) * dat_b
 
-        lu_b, ip_b, info_b = prepare_mat(dat_b)
-        assert info_b == 0, f"Singular coupled bMat for l={l}, info={info_b}"
-        b_inv_precond = solve_mat_real(lu_b, ip_b, eye)
-        b_inv_by_l[l] = b_inv_precond * fac_b.unsqueeze(0)
+        if l_finite_diff:
+            from .algebra import prepare_bordered
+            _b_bordered_by_l[l] = prepare_bordered(dat_b, N, N_ic, _bj_kl, _bj_ku)
+            _b_fac_coupled_by_l[l] = fac_b
+        else:
+            lu_b, ip_b, info_b = prepare_mat(dat_b)
+            assert info_b == 0, f"Singular coupled bMat for l={l}, info={info_b}"
+            b_inv_precond = solve_mat_real(lu_b, ip_b, eye)
+            b_inv_by_l[l] = b_inv_precond * fac_b.unsqueeze(0)
 
         # ===== jMat =====
         dat_j = torch.zeros(NT, NT, dtype=DTYPE, device=cpu)
@@ -327,13 +408,22 @@ def _build_b_matrices_coupled(wimp_lin0: float):
         fac_j = 1.0 / dat_j.abs().max(dim=1).values
         dat_j = fac_j.unsqueeze(1) * dat_j
 
-        lu_j, ip_j, info_j = prepare_mat(dat_j)
-        assert info_j == 0, f"Singular coupled jMat for l={l}, info={info_j}"
-        j_inv_precond = solve_mat_real(lu_j, ip_j, eye)
-        j_inv_by_l[l] = j_inv_precond * fac_j.unsqueeze(0)
+        if l_finite_diff:
+            from .algebra import prepare_bordered
+            _j_bordered_by_l[l] = prepare_bordered(dat_j, N, N_ic, _bj_kl, _bj_ku)
+            _j_fac_coupled_by_l[l] = fac_j
+        else:
+            lu_j, ip_j, info_j = prepare_mat(dat_j)
+            assert info_j == 0, f"Singular coupled jMat for l={l}, info={info_j}"
+            j_inv_precond = solve_mat_real(lu_j, ip_j, eye)
+            j_inv_by_l[l] = j_inv_precond * fac_j.unsqueeze(0)
 
-    _b_inv_by_l = b_inv_by_l.to(DEVICE)
-    _j_inv_by_l = j_inv_by_l.to(DEVICE)
+    if not l_finite_diff:
+        _b_inv_by_l = b_inv_by_l.to(DEVICE)
+        _j_inv_by_l = j_inv_by_l.to(DEVICE)
+    else:
+        _b_fac_coupled_by_l = _b_fac_coupled_by_l.to(DEVICE)
+        _j_fac_coupled_by_l = _j_fac_coupled_by_l.to(DEVICE)
 
 
 def finish_exp_mag(dj_exp, dVxBhLM):
@@ -389,15 +479,25 @@ def _updateB_insulating(b_LMloc, db_LMloc, ddb_LMloc,
     rhs_b = tscheme.set_imex_rhs(dbdt)  # (lm_max, n_r_max)
     rhs_j = tscheme.set_imex_rhs(djdt)  # (lm_max, n_r_max)
 
-    # 2. Batched solve: BCs=0, then chunked matmul with per-l inverses
+    # 2. Batched solve: BCs=0, then solve
     rhs_b[:, 0] = 0.0
     rhs_b[:, N - 1] = 0.0
-    b_cheb = chunked_solve_complex(_b_inv_by_l, st_lm2l, rhs_b)
-    b_cheb[_m0_mask] = b_cheb[_m0_mask].real.to(CDTYPE)
-
     rhs_j[:, 0] = 0.0
     rhs_j[:, N - 1] = 0.0
-    j_cheb = chunked_solve_complex(_j_inv_by_l, st_lm2l, rhs_j)
+
+    if _b_bands_by_l is not None:
+        from .algebra import banded_solve_by_l
+        b_cheb = banded_solve_by_l(
+            _b_bands_by_l, _b_piv_by_l, st_lm2l, rhs_b,
+            n=N, kl=_bj_kl, ku=_bj_ku, fac_row_by_l=_b_fac_by_l)
+        j_cheb = banded_solve_by_l(
+            _j_bands_by_l, _j_piv_by_l, st_lm2l, rhs_j,
+            n=N, kl=_bj_kl, ku=_bj_ku, fac_row_by_l=_j_fac_by_l)
+    else:
+        b_cheb = chunked_solve_complex(_b_inv_by_l, st_lm2l, rhs_b)
+        j_cheb = chunked_solve_complex(_j_inv_by_l, st_lm2l, rhs_j)
+
+    b_cheb[_m0_mask] = b_cheb[_m0_mask].real.to(CDTYPE)
     j_cheb[_m0_mask] = j_cheb[_m0_mask].real.to(CDTYPE)
 
     # 3. Truncate high Chebyshev modes (Fortran only stores n_cheb_max modes)
@@ -475,12 +575,39 @@ def _updateB_coupled(b_LMloc, db_LMloc, ddb_LMloc,
     rhs_j[:, 1:N-1] = oc_rhs_j[:, 1:N-1]     # OC bulk
     rhs_j[:, N+1:NT] = ic_rhs_j[:, 1:N_ic]    # IC bulk + center
 
-    # 4. Batched solve with coupled per-l inverses
-    b_sol = chunked_solve_complex(_b_inv_by_l, st_lm2l, rhs_b)
-    b_sol[_m0_mask] = b_sol[_m0_mask].real.to(CDTYPE)
+    # 4. Solve: bordered-band per-l for FD, dense batched for Chebyshev
+    from .params import l_finite_diff
+    if l_finite_diff and _b_bordered_by_l is not None:
+        from .algebra import solve_bordered
+        cpu = torch.device("cpu")
+        rhs_b_cpu = rhs_b.to(cpu)
+        rhs_j_cpu = rhs_j.to(cpu)
+        b_sol_cpu = torch.zeros_like(rhs_b_cpu)
+        j_sol_cpu = torch.zeros_like(rhs_j_cpu)
+        fac_b_cpu = _b_fac_coupled_by_l.to(cpu)
+        fac_j_cpu = _j_fac_coupled_by_l.to(cpu)
+        for l in range(1, l_max + 1):
+            lm_idx = _l_lm_idx[l]
+            if lm_idx.numel() == 0:
+                continue
+            fac_b = fac_b_cpu[l]
+            fac_j = fac_j_cpu[l]
+            for i in range(lm_idx.numel()):
+                lm = lm_idx[i].item()
+                b_sol_cpu[lm] = solve_bordered(
+                    _b_bordered_by_l[l], fac_b * rhs_b_cpu[lm])
+                j_sol_cpu[lm] = solve_bordered(
+                    _j_bordered_by_l[l], fac_j * rhs_j_cpu[lm])
+        b_sol_cpu[_m0_mask] = b_sol_cpu[_m0_mask].real.to(CDTYPE)
+        j_sol_cpu[_m0_mask] = j_sol_cpu[_m0_mask].real.to(CDTYPE)
+        b_sol = b_sol_cpu.to(DEVICE)
+        j_sol = j_sol_cpu.to(DEVICE)
+    else:
+        b_sol = chunked_solve_complex(_b_inv_by_l, st_lm2l, rhs_b)
+        b_sol[_m0_mask] = b_sol[_m0_mask].real.to(CDTYPE)
 
-    j_sol = chunked_solve_complex(_j_inv_by_l, st_lm2l, rhs_j)
-    j_sol[_m0_mask] = j_sol[_m0_mask].real.to(CDTYPE)
+        j_sol = chunked_solve_complex(_j_inv_by_l, st_lm2l, rhs_j)
+        j_sol[_m0_mask] = j_sol[_m0_mask].real.to(CDTYPE)
 
     # 5. Extract and transform OC part (Chebyshev → physical via costf)
     b_oc_cheb = b_sol[:, :N]
@@ -500,8 +627,10 @@ def _updateB_coupled(b_LMloc, db_LMloc, ddb_LMloc,
     if n_cheb_ic_max < N_ic:
         b_ic_cheb[:, n_cheb_ic_max:] = 0.0
         aj_ic_cheb[:, n_cheb_ic_max:] = 0.0
-    b_ic[:] = costf(b_ic_cheb)
-    aj_ic[:] = costf(aj_ic_cheb)
+    # IC always uses Chebyshev DCT regardless of OC scheme (FD or Chebyshev).
+    from .radial_scheme import ic_costf
+    b_ic[:] = ic_costf(b_ic_cheb)
+    aj_ic[:] = ic_costf(aj_ic_cheb)
 
     # 7. Compute OC derivatives
     db_new, ddb_new = get_ddr(b_LMloc)

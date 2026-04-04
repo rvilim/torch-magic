@@ -1,10 +1,12 @@
 """Parameters for MagIC benchmarks, matching Fortran input.nml + truncation.
 
-All physics/grid parameters are configurable via environment variables,
-set by run.py from YAML config before this module is imported.
+Configuration is read from the config dict (set via ``config.configure()``)
+with fallback to environment variables for backward compatibility.
 """
 
 import os
+
+from .config import _config
 
 
 def _prime_decomposition(n):
@@ -22,34 +24,46 @@ def _prime_decomposition(n):
     return best
 
 
-def _env_int(key, default):
-    return int(os.environ.get(key, str(default)))
+def _cfg(key, env_key, default):
+    """Read config value: config dict first, then env var fallback."""
+    if key in _config:
+        return _config[key]
+    val = os.environ.get(env_key)
+    if val is not None:
+        return val
+    return default
 
 
-def _env_float(key, default):
-    return float(os.environ.get(key, str(default)))
+def _cfg_int(key, env_key, default):
+    return int(_cfg(key, env_key, default))
 
 
-def _env_bool(key, default):
-    val = os.environ.get(key, str(default)).lower()
-    return val in ("true", "1", "yes")
+def _cfg_float(key, env_key, default):
+    return float(_cfg(key, env_key, default))
 
 
-def _env_str(key, default):
-    return os.environ.get(key, default)
+def _cfg_bool(key, env_key, default):
+    val = _cfg(key, env_key, default)
+    if isinstance(val, bool):
+        return val
+    return str(val).lower() in ("true", "1", "yes")
 
 
-# --- Grid parameters (from input.nml &grid, overridable via env vars) ---
-l_max = _env_int("MAGIC_LMAX", 16)
+def _cfg_str(key, env_key, default):
+    return str(_cfg(key, env_key, default))
+
+
+# --- Grid parameters ---
+l_max = _cfg_int("l_max", "MAGIC_LMAX", 16)
 m_max = l_max
 m_min = 0
-minc = _env_int("MAGIC_MINC", 1)
+minc = _cfg_int("minc", "MAGIC_MINC", 1)
 nalias = 20
 
-n_r_max = _env_int("MAGIC_NR", 2 * l_max + 1)
-n_cheb_max = _env_int("MAGIC_NCHEBMAX", n_r_max)
+n_r_max = _cfg_int("n_r_max", "MAGIC_NR", 2 * l_max + 1)
+n_cheb_max = _cfg_int("n_cheb_max", "MAGIC_NCHEBMAX", n_r_max)
 n_r_ic_max = (n_r_max + 1) // 2
-n_cheb_ic_max = _env_int("MAGIC_NCHEBICMAX", n_r_ic_max)
+n_cheb_ic_max = _cfg_int("n_cheb_ic_max", "MAGIC_NCHEBICMAX", n_r_ic_max)
 
 # --- Derived grid parameters (from truncation.f90 initialize_truncation) ---
 n_phi_tot = _prime_decomposition(2 * ((30 * l_max) // nalias))
@@ -61,71 +75,78 @@ n_m_max = m_max // minc + 1
 # For minc=1: reduces to (l_max+1)*(l_max+2)//2
 lm_max = sum(l_max - m + 1 for m in range(0, m_max + 1, minc))
 
-# --- Physical parameters (from input.nml &phys_param) ---
-ra = _env_float("MAGIC_RA", 1.0e5)
-ek = _env_float("MAGIC_EK", 1.0e-3)
-pr = _env_float("MAGIC_PR", 1.0)
-prmag = _env_float("MAGIC_PRMAG", 5.0)
-radratio = _env_float("MAGIC_RADRATIO", 0.35)
-raxi = _env_float("MAGIC_RAXI", 0.0)
-sc = _env_float("MAGIC_SC", 10.0)  # Fortran default: Namelists.f90:1376
+# --- Physical parameters ---
+ra = _cfg_float("ra", "MAGIC_RA", 1.0e5)
+ek = _cfg_float("ek", "MAGIC_EK", 1.0e-3)
+pr = _cfg_float("pr", "MAGIC_PR", 1.0)
+prmag = _cfg_float("prmag", "MAGIC_PRMAG", 5.0)
+radratio = _cfg_float("radratio", "MAGIC_RADRATIO", 0.35)
+raxi = _cfg_float("raxi", "MAGIC_RAXI", 0.0)
+sc = _cfg_float("sc", "MAGIC_SC", 10.0)
 
-# Mode: 0=full MHD, 1=convection only (no magnetic field)
-mode = _env_int("MAGIC_MODE", 0)
+# Mode: 0=full MHD, 1=convection only, 7=Couette flow (no heat, no mag)
+mode = _cfg_int("mode", "MAGIC_MODE", 0)
 
 # Anelastic parameters
-strat = _env_float("MAGIC_STRAT", 0.0)
-polind = _env_float("MAGIC_POLIND", 2.0)
-g0 = _env_float("MAGIC_G0", 0.0)
-g1 = _env_float("MAGIC_G1", 0.0)
-g2 = _env_float("MAGIC_G2", 0.0)
+strat = _cfg_float("strat", "MAGIC_STRAT", 0.0)
+polind = _cfg_float("polind", "MAGIC_POLIND", 2.0)
+g0 = _cfg_float("g0", "MAGIC_G0", 0.0)
+g1 = _cfg_float("g1", "MAGIC_G1", 0.0)
+g2 = _cfg_float("g2", "MAGIC_G2", 0.0)
 
 # Boundary conditions
 ktops = 1  # fixed entropy at top
 kbots = 1  # fixed entropy at bottom
 ktopxi = 1  # fixed composition at top
 kbotxi = 1  # fixed composition at bottom
-ktopv = _env_int("MAGIC_KTOPV", 2)  # 1=stress-free, 2=no-slip
-kbotv = _env_int("MAGIC_KBOTV", 2)  # 1=stress-free, 2=no-slip
-kbotb = _env_int("MAGIC_KBOTB", 1)  # 1=insulating, 3=conducting IC
+ktopv = _cfg_int("ktopv", "MAGIC_KTOPV", 2)  # 1=stress-free, 2=no-slip
+kbotv = _cfg_int("kbotv", "MAGIC_KBOTV", 2)  # 1=stress-free, 2=no-slip
+kbotb = _cfg_int("kbotb", "MAGIC_KBOTB", 1)  # 1=insulating, 3=conducting IC
 
-# --- Control parameters (from input.nml &control) ---
+# --- Control parameters ---
 n_time_steps = 1000
-dtmax = _env_float("MAGIC_DTMAX", 1.0e-4)
-alpha = _env_float("MAGIC_ALPHA", 0.6)
-courfac = _env_float("MAGIC_COURFAC", 1e3)   # Fortran default 1e3; scheme overrides when >= 1e3
-alffac = _env_float("MAGIC_ALFFAC", 1e3)    # Fortran default 1e3; scheme overrides when >= 1e3
-intfac = _env_float("MAGIC_INTFAC", 1e3)    # Fortran default 1e3; scheme overrides when >= 1e3
+dtmax = _cfg_float("dtmax", "MAGIC_DTMAX", 1.0e-4)
+alpha = _cfg_float("alpha", "MAGIC_ALPHA", 0.6)
+courfac = _cfg_float("courfac", "MAGIC_COURFAC", 1e3)
+alffac = _cfg_float("alffac", "MAGIC_ALFFAC", 1e3)
+intfac = _cfg_float("intfac", "MAGIC_INTFAC", 1e3)
 
 # --- Time scheme ---
-time_scheme = _env_str("MAGIC_TIME_SCHEME", "CNAB2")
+time_scheme = _cfg_str("time_scheme", "MAGIC_TIME_SCHEME", "CNAB2")
 
-# --- Start field (from input.nml &start_field) ---
+# --- Start field ---
 init_b1 = 3
 amp_b1 = 5.0
-init_s1 = _env_int("MAGIC_INIT_S1", 404)
-amp_s1 = _env_float("MAGIC_AMP_S1", 0.1)
-l_start_file = _env_str("MAGIC_START_FILE", "") != ""
-start_file = _env_str("MAGIC_START_FILE", "")
+init_v1 = _cfg_int("init_v1", "MAGIC_INIT_V1", 0)
+init_s1 = _cfg_int("init_s1", "MAGIC_INIT_S1", 404)
+amp_s1 = _cfg_float("amp_s1", "MAGIC_AMP_S1", 0.1)
+_start_file_val = _cfg_str("start_file", "MAGIC_START_FILE", "")
+l_start_file = _start_file_val != ""
+start_file = _start_file_val
 
 # --- Logic flags for this benchmark ---
-l_mag = (mode != 1)
-l_heat = True
+l_mag = (mode not in (1, 7))
+l_heat = (mode not in (7,))
 l_conv = True
-l_finite_diff = False
+radial_scheme = _cfg_str("radial_scheme", "MAGIC_RADIAL_SCHEME", "chebyshev").upper()
+l_finite_diff = (radial_scheme == "FD")
+fd_order = _cfg_int("fd_order", "MAGIC_FD_ORDER", 2)
+fd_order_bound = _cfg_int("fd_order_bound", "MAGIC_FD_ORDER_BOUND", 2)
+fd_stretch = _cfg_float("fd_stretch", "MAGIC_FD_STRETCH", 0.3)
+fd_ratio = _cfg_float("fd_ratio", "MAGIC_FD_RATIO", 0.1)
 l_axi = False
 l_chemical_conv = (raxi != 0.0)
-l_double_curl = False
+l_double_curl = l_finite_diff  # FD forces double-curl (Fortran Namelists.f90:300)
 l_anel = strat > 0.0
 l_adv_curl = not l_anel  # anelastic uses non-curl advection
-l_correct_AMz = _env_str("MAGIC_L_CORRECT_AMZ", "false").lower() in ("true", "1", "yes")
-l_correct_AMe = _env_str("MAGIC_L_CORRECT_AME", "false").lower() in ("true", "1", "yes")
+l_correct_AMz = _cfg_bool("l_correct_AMz", "MAGIC_L_CORRECT_AMZ", False)
+l_correct_AMe = _cfg_bool("l_correct_AMe", "MAGIC_L_CORRECT_AME", False)
 l_isothermal = False
 l_single_matrix = False
 l_RMS = False
 l_mag_LF = l_mag       # Lorentz force active when magnetic field is active
 l_mag_kin = False       # kinematic dynamo: False for all benchmarks
-l_cour_alf_damp = _env_bool("MAGIC_L_COUR_ALF_DAMP", True)  # Fortran default: .true.
+l_cour_alf_damp = _cfg_bool("l_cour_alf_damp", "MAGIC_L_COUR_ALF_DAMP", True)
 
 # --- Magnetic field memory ---
 lMagMem = 1 if l_mag else 0
@@ -134,30 +155,35 @@ lm_maxMag = lm_max if l_mag else 0
 l_maxMag = l_max if l_mag else 0
 
 # --- Inner core ---
-sigma_ratio = _env_float("MAGIC_SIGMA_RATIO", 0.0)
-nRotIC = _env_int("MAGIC_NROTIC", 0)
+sigma_ratio = _cfg_float("sigma_ratio", "MAGIC_SIGMA_RATIO", 0.0)
+nRotIC = _cfg_int("nRotIC", "MAGIC_NROTIC", 0)
 nRotMa = 0
 
 # --- Derived IC flags ---
 l_cond_ic = sigma_ratio > 0.0
-l_rot_ic = nRotIC > 0
+l_rot_ic = nRotIC != 0
+l_rot_ma = nRotMa != 0
+l_SRIC = nRotIC == -1
 
 # --- Total radial points (OC + IC when conducting) ---
 n_r_tot = n_r_max + n_r_ic_max if l_cond_ic else n_r_max
 
 # --- Output ---
-n_log_step = 1
+n_log_step = _cfg_int("n_log_step", "MAGIC_N_LOG_STEP", 1)
+l_power = _cfg_bool("l_power", "MAGIC_L_POWER", False)
+l_hel = _cfg_bool("l_hel", "MAGIC_L_HEL", False)
+l_hemi = _cfg_bool("l_hemi", "MAGIC_L_HEMI", False)
 ktopb = 1  # insulating magnetic top BC (vacuum at CMB)
 
 # --- Chebyshev mapping parameters (num_param.f90) ---
-alph1 = _env_float("MAGIC_ALPH1", 0.8)
-alph2 = _env_float("MAGIC_ALPH2", 0.0)
+alph1 = _cfg_float("alph1", "MAGIC_ALPH1", 0.8)
+alph2 = _cfg_float("alph2", "MAGIC_ALPH2", 0.0)
 
 # --- Stefan number (unused in benchmark) ---
-stef = _env_float("MAGIC_STEF", 0.0)
+stef = _cfg_float("stef", "MAGIC_STEF", 0.0)
 
-# --- Omega parameters (init_fields.f90 namelist, 12 doubles) ---
-omega_ic1 = _env_float("MAGIC_OMEGA_IC1", 0.0)
+# --- Omega parameters ---
+omega_ic1 = _cfg_float("omega_ic1", "MAGIC_OMEGA_IC1", 0.0)
 omegaOsz_ic1 = 0.0
 tOmega_ic1 = 0.0
 omega_ic2 = 0.0

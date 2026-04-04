@@ -17,6 +17,7 @@ os.environ["MAGIC_KBOTV"] = "1"
 os.environ["MAGIC_ALPHA"] = "0.6"
 os.environ["MAGIC_L_CORRECT_AMZ"] = "true"
 os.environ["MAGIC_L_CORRECT_AME"] = "true"
+os.environ["MAGIC_NCHEBMAX"] = "31"
 
 import sys
 import numpy as np

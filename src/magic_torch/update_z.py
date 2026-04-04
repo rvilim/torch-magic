@@ -16,12 +16,12 @@ from .precision import DTYPE, CDTYPE, DEVICE
 from .params import (n_r_max, lm_max, l_max, l_rot_ic, n_cheb_max, ktopv, kbotv,
                      l_anel, l_correct_AMz, l_correct_AMe)
 from .constants import two, third, four
-from .chebyshev import rMat, drMat, d2rMat, rnorm, boundary_fac, r
+from .radial_scheme import rMat, drMat, d2rMat, rnorm, boundary_fac, r
 from .radial_functions import or1, or2, visc, beta, dbeta, dLvisc, rho0
 from .horizontal_data import dLh, hdif_V
 from .blocking import st_lm2, st_lm2l, st_lm2m
 from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
-from .cosine_transform import costf
+from .radial_scheme import costf
 from .radial_derivatives import get_ddr
 from .integration import rInt_R
 from .pre_calculations import (l_z10mat, c_z10_omega_ic, c_dt_z10_ic,
@@ -80,6 +80,12 @@ _zMat_fac = [None] * (l_max + 1)
 
 # Unique inverse per l degree: (l_max+1, N, N) float64 — l=0 is zero
 _z_inv_by_l = None
+# FD: banded LU storage per l
+_z_bands_by_l = None
+_z_piv_by_l = None
+_z_fac_by_l = None
+_z_kl = 0
+_z_ku = 0
 
 # Separate z10Mat inverse for l=1,m=0 when l_z10mat
 _z10_inv = None
@@ -97,10 +103,10 @@ def build_z_matrices(wimp_lin0: float):
 
     Must be called whenever dt changes.
     """
-    global _z_inv_by_l, _z10_inv
+    global _z_inv_by_l, _z10_inv, _z_bands_by_l, _z_piv_by_l, _z_fac_by_l, _z_kl, _z_ku
+    from .params import l_finite_diff
     N = n_r_max
 
-    # Build on CPU (scalar loops in prepare_mat/solve_mat_real)
     cpu = torch.device("cpu")
     _rMat = rMat.to(cpu)
     _drMat = drMat.to(cpu)
@@ -113,6 +119,22 @@ def build_z_matrices(wimp_lin0: float):
 
     eye = torch.eye(N, dtype=DTYPE, device=cpu)
     inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
+    # FD bandwidth: depends on BCs (no-slip → narrower, stress-free → wider)
+    if l_finite_diff:
+        from .params import fd_order, fd_order_bound
+        if ktopv != 1 and kbotv != 1 and fd_order <= 2 and fd_order_bound <= 2:
+            _z_kl, _z_ku = fd_order // 2, fd_order // 2
+        else:
+            hw = max(fd_order // 2, fd_order_bound)
+            _z_kl, _z_ku = hw, hw
+    n_abd = 2 * _z_kl + _z_ku + 1 if l_finite_diff else 1
+    abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
+    piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
+    fac_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+    if l_finite_diff:
+        # l=0: identity bands
+        abd_all[0, _z_kl + _z_ku, :] = 1.0
+        piv_all[0] = torch.arange(1, N + 1, dtype=torch.long)
 
     # Anelastic profiles for bulk equation
     _beta = beta.to(cpu)
@@ -159,15 +181,30 @@ def build_z_matrices(wimp_lin0: float):
         dat[:, N - 1] = dat[:, N - 1] * _bfac
 
         fac = 1.0 / dat.abs().max(dim=1).values
-        dat = fac.unsqueeze(1) * dat
+        dat_precond = fac.unsqueeze(1) * dat
 
-        lu, ip, info = prepare_mat(dat)
-        assert info == 0, f"Singular zMat for l={l}, info={info}"
+        if l_finite_diff:
+            from .algebra import dense_to_band_storage, prepare_band
+            abd = dense_to_band_storage(dat_precond, _z_kl, _z_ku)
+            abd_f, piv, info = prepare_band(abd, N, _z_kl, _z_ku)
+            assert info == 0, f"Singular zMat (band) for l={l}, info={info}"
+            abd_all[l] = abd_f
+            piv_all[l] = piv
+            fac_all[l] = fac
+        else:
+            lu, ip, info = prepare_mat(dat_precond)
+            assert info == 0, f"Singular zMat for l={l}, info={info}"
+            inv_precond = solve_mat_real(lu, ip, eye)
+            inv_by_l[l] = inv_precond * fac.unsqueeze(0)
 
-        inv_precond = solve_mat_real(lu, ip, eye)
-        inv_by_l[l] = inv_precond * fac.unsqueeze(0)
-
-    _z_inv_by_l = inv_by_l.to(DEVICE)
+    if l_finite_diff:
+        _z_bands_by_l = abd_all.to(DEVICE)
+        _z_piv_by_l = piv_all.to(DEVICE)
+        _z_fac_by_l = fac_all.to(DEVICE)
+        _z_inv_by_l = None
+    else:
+        _z_inv_by_l = inv_by_l.to(DEVICE)
+        _z_bands_by_l = None
 
     # --- Build z10Mat for l=1,m=0 (angular momentum coupling at ICB) ---
     if l_z10mat:
@@ -177,29 +214,34 @@ def build_z_matrices(wimp_lin0: float):
         # visc is 1.0 for Boussinesq, beta=0
         v_icb = visc[N - 1].item()
 
-        # Bulk rows: same as zMat for l=1
+        # Bulk rows: same as zMat for l=1 (Fortran get_z10Mat lines 1781-1793)
         dat = _rnorm * dL * or2_col * (
-            _rMat - wimp_lin0 * hdif_l * (
-                _d2rMat - dL * or2_col * _rMat
+            _rMat - wimp_lin0 * hdif_l * visc_col * (
+                _d2rMat
+                + (dLvisc_col - beta_col) * _drMat
+                - (dLvisc_col * beta_col + two * dLvisc_col * or1_col
+                   + dL * or2_col + dbeta_col + two * beta_col * or1_col) * _rMat
             )
         )
 
         # CMB row (row 0): no-slip, no mantle rotation → just z=0
         dat[0, :] = _rnorm * _rMat[0, :]
 
-        # ICB row (row N-1): angular momentum equation for IC rotation
-        # dat(N-1,:) = rnorm * (c_dt_z10_ic * rMat(N-1,:)
-        #   + wimp * (visc*(2*or1+beta)*rMat - visc*drMat
-        #   + gammatau*c_lorentz_ic*c_z10_omega_ic*rMat))
-        # Boussinesq: visc=1, beta=0
-        dat[N - 1, :] = _rnorm * (
-            c_dt_z10_ic * _rMat[N - 1, :]
-            + wimp_lin0 * (
-                v_icb * (two * _or1_cpu[N - 1] * _rMat[N - 1, :]
-                         - _drMat[N - 1, :])
-                + gammatau_gravi * c_lorentz_ic * c_z10_omega_ic * _rMat[N - 1, :]
+        # ICB row (row N-1): depends on IC rotation mode
+        from .params import l_SRIC
+        if l_SRIC:
+            # Prescribed IC rotation: simple Dirichlet z10(ICB) = omega_ic / c_z10_omega_ic
+            dat[N - 1, :] = _rnorm * c_z10_omega_ic * _rMat[N - 1, :]
+        else:
+            # Time-integrated IC rotation: angular momentum equation
+            dat[N - 1, :] = _rnorm * (
+                c_dt_z10_ic * _rMat[N - 1, :]
+                + wimp_lin0 * (
+                    v_icb * ((two * _or1_cpu[N - 1] + _beta[N - 1]) * _rMat[N - 1, :]
+                             - _drMat[N - 1, :])
+                    + gammatau_gravi * c_lorentz_ic * c_z10_omega_ic * _rMat[N - 1, :]
+                )
             )
-        )
 
         # Zero high-order Chebyshev modes in boundary rows
         if n_cheb_max < N:
@@ -276,12 +318,17 @@ def updateZ(z_LMloc, dz_LMloc, dzdt, tscheme,
     rhs = tscheme.set_imex_rhs(dzdt)  # (lm_max, n_r_max)
 
     # 1b. For z10 with IC rotation: set boundary RHS to dom_ic (IMEX-assembled scalar)
-    if l_z10mat and domega_ic_dt is not None:
-        dom_ic = tscheme.set_imex_rhs_scalar(domega_ic_dt)
-        # Replace ICB boundary with dom_ic for l=1,m=0
-        rhs[_l1m0, N - 1] = complex(dom_ic, 0.0)
-        # CMB boundary: no mantle rotation → rhs=0
-        rhs[_l1m0, 0] = 0.0
+    from .params import l_SRIC
+    if l_z10mat:
+        if l_SRIC:
+            # Prescribed IC rotation: use omega_ic directly as Dirichlet BC
+            from . import fields as _fields_z
+            rhs[_l1m0, N - 1] = complex(_fields_z.omega_ic, 0.0)
+            rhs[_l1m0, 0] = 0.0
+        elif domega_ic_dt is not None:
+            dom_ic = tscheme.set_imex_rhs_scalar(domega_ic_dt)
+            rhs[_l1m0, N - 1] = complex(dom_ic, 0.0)
+            rhs[_l1m0, 0] = 0.0
 
     # 2. Zero boundary conditions for all other modes
     if l_z10mat:
@@ -295,7 +342,13 @@ def updateZ(z_LMloc, dz_LMloc, dzdt, tscheme,
         rhs[:, N - 1] = 0.0
 
     # 3. Solve: batched for all modes, then override l=1,m=0 with z10Mat
-    z_cheb = chunked_solve_complex(_z_inv_by_l, st_lm2l, rhs)
+    if _z_bands_by_l is not None:
+        from .algebra import banded_solve_by_l
+        z_cheb = banded_solve_by_l(
+            _z_bands_by_l, _z_piv_by_l, st_lm2l, rhs,
+            n=N, kl=_z_kl, ku=_z_ku, fac_row_by_l=_z_fac_by_l)
+    else:
+        z_cheb = chunked_solve_complex(_z_inv_by_l, st_lm2l, rhs)
 
     if l_z10mat:
         # Override l=1,m=0 with z10Mat solve
@@ -313,8 +366,9 @@ def updateZ(z_LMloc, dz_LMloc, dzdt, tscheme,
     z_LMloc[:] = costf(z_cheb)
 
     # 5. Extract omega_ic from z10 at ICB (after costf)
+    # For l_SRIC: omega_ic is prescribed, NOT extracted from z10
     omega_ic = 0.0
-    if l_z10mat:
+    if l_z10mat and not l_SRIC:
         z10_icb = z_LMloc[_l1m0, N - 1].real.item()
         omega_ic = c_z10_omega_ic * z10_icb
         if omega_ic_ref is not None:
@@ -354,29 +408,26 @@ def updateZ(z_LMloc, dz_LMloc, dzdt, tscheme,
 
     # 7. Rotate IMEX time arrays
     tscheme.rotate_imex(dzdt)
-    if l_z10mat and domega_ic_dt is not None:
+    if l_z10mat and domega_ic_dt is not None and not l_SRIC:
         tscheme.rotate_imex_scalar(domega_ic_dt)
 
     # 8. Store old state: dLh * or2 * z (matches Fortran updateZ line 926)
     if tscheme.store_old:
         dzdt.old[:, :, 0] = _dLh_lm * _or2_r * z_LMloc
 
-    # 8b. IC rotation old state (kbotv=2 no-slip)
-    if l_z10mat and domega_ic_dt is not None and tscheme.store_old:
-        # old = c_dt_z10_ic * z10(ICB) — reuse z10_icb from step 5
+    # 8b. IC rotation old state (kbotv=2 no-slip, NOT for SRIC)
+    if l_z10mat and domega_ic_dt is not None and tscheme.store_old and not l_SRIC:
         domega_ic_dt.old[0] = c_dt_z10_ic * z10_icb
 
     # 9. Compute implicit diffusion term
-    # impl = hdif*dL*or2*visc*(d2z + (dLvisc-beta)*dz - (dLvisc*beta + 2*dLvisc/r + dL*or2 + dbeta + 2*beta/r)*z)
     idx = tscheme.next_impl_idx
     dzdt.impl[:, :, idx] = _hdif_lm * _dLh_lm * _or2_r * _z_impl_visc * (
         d2z + _z_impl_d1 * dz_LMloc
         - (_z_impl_z0_nol + _dLh_lm * _or2_r) * z_LMloc
     )
 
-    # 9b. IC rotation implicit term (kbotv=2 no-slip)
-    if l_z10mat and domega_ic_dt is not None:
-        # impl = -visc*((2*or1+beta)*z10 - dz10) - gammatau*c_lorentz_ic*omega_ic
+    # 9b. IC rotation implicit term (NOT for SRIC — prescribed rotation)
+    if l_z10mat and domega_ic_dt is not None and not l_SRIC:
         dz10_icb_val = dz_LMloc[_l1m0, N - 1].real.item()
         _beta_icb = beta[N - 1].item()
         domega_ic_dt.impl[idx] = (

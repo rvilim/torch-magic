@@ -1,21 +1,18 @@
-"""Chebyshev (Clenshaw-Curtis) integration matching Fortran's integration.f90.
+"""Radial integration matching Fortran's integration.f90.
 
-The integral of a function f(r) over [r_icb, r_cmb] is computed via:
-1. Undo mapping: g = f / drx
-2. Forward DCT: a = costf(g)
-3. Apply Chebyshev integration weights: sum = a[0]*w[0] + sum_{odd n} a[n]*w[n]
-4. Normalize: integral = 2 * rnorm * sum
-
-where the weights are: w[0] = boundary_fac, w[odd n>=2] = -1/(n*(n-2)),
-using our costf convention.
+Two backends:
+- Chebyshev: Clenshaw-Curtis via DCT + spectral weights
+- FD: Simpson's rule on non-uniform grid
 """
 
 import torch
 
 from .precision import DTYPE, DEVICE
-from .params import n_r_max
-from .chebyshev import drx, rnorm, boundary_fac
-from .cosine_transform import costf
+from .params import n_r_max, l_finite_diff
+
+if not l_finite_diff:
+    from .chebyshev import drx, rnorm, boundary_fac
+    from .cosine_transform import costf
 
 
 def _build_cheb_int_weights():
@@ -41,10 +38,11 @@ def _build_cheb_int_weights():
     return w
 
 
-_cheb_int = _build_cheb_int_weights()
+if not l_finite_diff:
+    _cheb_int = _build_cheb_int_weights()
 
 
-def rInt_R(f: torch.Tensor) -> torch.Tensor:
+def _rInt_R_cheb(f: torch.Tensor) -> torch.Tensor:
     """Chebyshev (Clenshaw-Curtis) radial integration.
 
     Integrates f(r) over [r_icb, r_cmb].
@@ -72,3 +70,69 @@ def rInt_R(f: torch.Tensor) -> torch.Tensor:
     result = 2.0 * rnorm * result
 
     return result
+
+
+def simps(f: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+    """Simpson's rule on non-uniform grid. Matches integration.f90 simps.
+
+    Args:
+        f: shape (..., N), function values
+        r: shape (N,), radial grid points (decreasing: r[0]=r_cmb > r[-1]=r_icb)
+
+    Returns:
+        integral: shape (...), the definite integral (negated because r decreases)
+    """
+    N = r.shape[0]
+
+    if N % 2 == 1:
+        # Odd number of points: standard composite Simpson
+        result = torch.zeros(f.shape[:-1], dtype=f.dtype, device=f.device)
+        for n_r in range(1, N - 1, 2):  # 0-based: 1,3,5,...,N-2
+            h2 = r[n_r + 1] - r[n_r]
+            h1 = r[n_r] - r[n_r - 1]
+            result = result + (h1 + h2) / 6.0 * (
+                f[..., n_r - 1] * (2.0 * h1 - h2) / h1
+                + f[..., n_r] * (h1 + h2) * (h1 + h2) / (h1 * h2)
+                + f[..., n_r + 1] * (2.0 * h2 - h1) / h2
+            )
+        return -result
+    else:
+        # Even: trapezoidal on first interval + Simpson on rest,
+        # then Simpson on all even pairs + trapezoidal on last, average both
+        # (Fortran: "twice simpson + trapz on first and last points")
+        result = 0.5 * (r[1] - r[0]) * (f[..., 1] + f[..., 0])
+        for n_r in range(2, N - 1, 2):  # 0-based: 2,4,...
+            h2 = r[n_r + 1] - r[n_r]
+            h1 = r[n_r] - r[n_r - 1]
+            result = result + (h1 + h2) / 6.0 * (
+                f[..., n_r - 1] * (2.0 * h1 - h2) / h1
+                + f[..., n_r] * (h1 + h2) * (h1 + h2) / (h1 * h2)
+                + f[..., n_r + 1] * (2.0 * h2 - h1) / h2
+            )
+        result = result + 0.5 * (r[N - 1] - r[N - 2]) * (f[..., N - 1] + f[..., N - 2])
+        for n_r in range(1, N - 1, 2):  # 0-based: 1,3,...
+            h2 = r[n_r + 1] - r[n_r]
+            h1 = r[n_r] - r[n_r - 1]
+            result = result + (h1 + h2) / 6.0 * (
+                f[..., n_r - 1] * (2.0 * h1 - h2) / h1
+                + f[..., n_r] * (h1 + h2) * (h1 + h2) / (h1 * h2)
+                + f[..., n_r + 1] * (2.0 * h2 - h1) / h2
+            )
+        return -0.5 * result
+
+
+def _rInt_R_fd(f: torch.Tensor) -> torch.Tensor:
+    """FD radial integration via Simpson's rule.
+
+    Args:
+        f: shape (..., n_r_max), function values at radial grid points
+
+    Returns:
+        integral: shape (...), the definite integral
+    """
+    from .radial_scheme import r
+    return simps(f, r)
+
+
+# Dispatch
+rInt_R = _rInt_R_fd if l_finite_diff else _rInt_R_cheb

@@ -40,6 +40,9 @@ osc = one / sc if l_chemical_conv else 1.0  # 1/Schmidt number
 ChemFac = raxi / sc if l_chemical_conv else 0.0  # composition buoyancy factor
 epscXi = 0.0  # internal composition source (zero for benchmark)
 
+# Energy scale factor (always 1.0 for dimensional benchmarks)
+eScale = 1.0
+
 # Mass (preCalculations.f90:302, Boussinesq: mass = 1.0)
 mass = 1.0
 
@@ -87,7 +90,7 @@ y11_norm = 0.5 * math.sqrt(1.5 / math.pi)
 
 # Outer core moment of inertia: c_moi_oc = 8/3 * pi * int(r^4 * rho0 dr)
 # Always compute (preCalculations.f90:334-335), needed for log.TAG output
-from .chebyshev import r as _r_grid
+from .radial_scheme import r as _r_grid
 from .radial_functions import rho0 as _rho0
 from .integration import rInt_R as _rInt_R
 _mom = _r_grid ** 4 * _rho0

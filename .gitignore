@@ -6,14 +6,21 @@ dist/
 build/
 .eggs/
 *.so
+.DS_Store
 
-# Debug/scratch scripts
+# Debug/scratch/profile scripts
 debug_*.py
+profile_*.py
 
-# Data files
+# Output and data files
+output/
 fortran_ref/
 energy_comparison.csv
+dd_energy_comparison.csv
 
 # Environment
 .venv/
 .env
+
+# Claude plans
+.claude/

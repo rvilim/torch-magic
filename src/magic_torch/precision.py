@@ -3,8 +3,10 @@
 import os
 import torch
 
-# Device selection: MAGIC_DEVICE env var overrides auto-detection
-_device_override = os.environ.get("MAGIC_DEVICE", "").lower()
+from .config import _config
+
+# Device selection: config dict or MAGIC_DEVICE env var overrides auto-detection
+_device_override = str(_config.get("device", os.environ.get("MAGIC_DEVICE", ""))).lower()
 if _device_override:
     DEVICE = torch.device(_device_override)
 elif torch.cuda.is_available():

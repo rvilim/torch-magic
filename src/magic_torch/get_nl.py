@@ -11,7 +11,7 @@ import torch
 
 from .precision import DTYPE, DEVICE
 from .params import n_r_max, n_theta_max, n_phi_max
-from .chebyshev import r
+from .radial_scheme import r
 from .radial_functions import or1, or2, or4
 from .horizontal_data import O_sin_theta_E2_grid, cosn_theta_E2_grid
 from .pre_calculations import LFfac
