@@ -60,19 +60,19 @@ _or2_icb = (one - radratio) ** 2 / radratio ** 2  # 1/r_icb^2
 # Y10 normalization: Y_1^0 = y10_norm * cos(theta)
 y10_norm = 0.5 * math.sqrt(3.0 / math.pi)
 
+# rho0 at ICB for IC rotation constants (preCalculations.f90 uses rho0(n_r_max))
+from .radial_functions import rho0 as _rho0_early
+_rho0_icb = _rho0_early[-1].item()  # rho0(n_r_max), =1.0 for Boussinesq
+
 # z10 -> omega_ic conversion (preCalculations.f90 line 319)
-# c_z10_omega_ic = y10_norm * or2(n_r_max) / rho0(n_r_max)
-# Boussinesq: rho0=1
-c_z10_omega_ic = y10_norm * _or2_icb
+c_z10_omega_ic = y10_norm * _or2_icb / _rho0_icb
 
 # IC moment-of-inertia mass term for z10 (preCalculations.f90 line 337)
-# c_dt_z10_ic = 0.2 * r_icb * rho_ratio_ic * rho0(n_r_max)
-# Boussinesq: rho_ratio_ic=1, rho0=1
-c_dt_z10_ic = 0.2 * _r_icb
+# rho_ratio_ic=1 (default, not parameterized)
+c_dt_z10_ic = 0.2 * _r_icb * _rho0_icb
 
 # IC moment of inertia (preCalculations.f90 line 326)
-# c_moi_ic = 8*pi/15 * r_icb^5 * rho_ratio_ic * rho0(n_r_max)
-c_moi_ic = 8.0 * math.pi / 15.0 * _r_icb ** 5
+c_moi_ic = 8.0 * math.pi / 15.0 * _r_icb ** 5 * _rho0_icb
 
 # Lorentz torque coefficient (preCalculations.f90 line 344)
 # c_lorentz_ic = 0.25 * sqrt(3/pi) * or2(n_r_max)
