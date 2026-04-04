@@ -310,6 +310,60 @@ def chunked_solve_complex(inv_by_l, l_index, rhs_complex, chunk_size=512):
     return torch.view_as_complex(out_real)
 
 
+def chunked_lu_solve_complex(lu_by_l, pivots_by_l, fac_row_by_l, fac_col_by_l,
+                             l_index, rhs_complex):
+    """Batched LU solve with preconditioning, using packed layout.
+
+    Same packing as chunked_solve_complex but uses torch.linalg.lu_solve
+    instead of bmm with precomputed inverse. Gives LU-level accuracy
+    (backward error O(eps)) for ill-conditioned systems where the
+    precomputed-inverse approach loses digits.
+
+    The view_as_real trick works because the WP matrix is real: for real A,
+    lu_solve(A, [br, bi]) = [lu_solve(A, br), lu_solve(A, bi)].
+
+    Args:
+        lu_by_l: (l_max+1, N, N) float64 — LU factors from torch.linalg.lu_factor
+        pivots_by_l: (l_max+1, N) int32 — pivot indices
+        fac_row_by_l: (l_max+1, N) float64 — row preconditioning factors
+        fac_col_by_l: (l_max+1, N) float64 — column preconditioning factors
+        l_index: (lm_max,) long — maps each lm mode to its l value
+        rhs_complex: (lm_max, N) complex — right-hand side
+
+    Returns:
+        (lm_max, N) complex — solution
+    """
+    rhs_real = torch.view_as_real(rhs_complex)  # (lm_max, N, 2) — zero-copy
+    N = rhs_real.shape[1]
+
+    ss = _get_solver_state(lu_by_l, l_index, N)
+    L = ss["l_max_plus_1"]
+    max_m = ss["max_modes"]
+    cidx = ss["combined_idx"]
+    rhs_packed_flat = ss["rhs_packed_flat"]  # pre-allocated (L*max_m, N, 2)
+
+    # Apply row preconditioning: rhs_precond[lm, :] = fac_row[l[lm], :] * rhs[lm, :]
+    fac_row_lm = fac_row_by_l[l_index]  # (lm_max, N)
+    rhs_precond = rhs_real * fac_row_lm.unsqueeze(2)  # (lm_max, N, 2)
+
+    # Pack: scatter directly from lm-order to packed layout
+    rhs_packed_flat[cidx] = rhs_precond
+    rhs_packed = rhs_packed_flat.reshape(L, max_m, N, 2).permute(0, 2, 1, 3).reshape(L, N, max_m * 2)
+
+    # Batched LU solve: (L, N, N) LU factors, (L, N, max_m*2) RHS
+    out_packed = torch.linalg.lu_solve(lu_by_l, pivots_by_l, rhs_packed)
+
+    # Unpack: gather directly from packed layout to lm-order
+    out_flat = out_packed.reshape(L, N, max_m, 2).permute(0, 2, 1, 3).reshape(L * max_m, N, 2)
+    out_real = out_flat[cidx]  # (lm_max, N, 2)
+
+    # Apply column preconditioning: x[lm, :] = fac_col[l[lm], :] * x_precond[lm, :]
+    fac_col_lm = fac_col_by_l[l_index]  # (lm_max, N)
+    out_real = out_real * fac_col_lm.unsqueeze(2)
+
+    return torch.view_as_complex(out_real.contiguous())
+
+
 # ===========================================================================
 # Pivoted banded LU (matching Fortran algebra.f90 prepare_band/solve_band)
 # ===========================================================================

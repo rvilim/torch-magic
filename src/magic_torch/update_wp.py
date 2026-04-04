@@ -30,7 +30,7 @@ from .pre_calculations import BuoFac, ChemFac
 from .params import l_finite_diff as _l_fd_p0
 _l_p0_integ_bc = (ViscHeatFac * ThExpNb != 0.0) and not _l_fd_p0
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
+from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex, chunked_lu_solve_complex
 from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_dddr
 
@@ -81,6 +81,11 @@ _wpMat_fac_col = [None] * (l_max + 1)  # column preconditioning
 
 # Unique inverse per l degree: (l_max+1, 2N, 2N) float64 — l=0 is zero
 _wp_inv_by_l = None
+# LU factors for anelastic (accurate solve for ill-conditioned wpMat)
+_wp_lu_by_l = None
+_wp_pivots_by_l = None
+_wp_fac_row_by_l = None
+_wp_fac_col_by_l = None
 
 
 
@@ -221,7 +226,7 @@ def build_wp_matrices(wimp_lin0: float):
 
     Must be called whenever dt changes.
     """
-    global _wp_inv_by_l
+    global _wp_inv_by_l, _wp_lu_by_l, _wp_pivots_by_l, _wp_fac_row_by_l, _wp_fac_col_by_l
     N = n_r_max
 
     # Build on CPU (scalar loops in prepare_mat/solve_mat_real)
@@ -249,6 +254,13 @@ def build_wp_matrices(wimp_lin0: float):
 
     eye = torch.eye(2 * N, dtype=DTYPE, device=cpu)
     inv_by_l = torch.zeros(l_max + 1, 2 * N, 2 * N, dtype=DTYPE, device=cpu)
+    # For anelastic: store LU factors for accurate solve (precomputed inverse loses
+    # digits when cond(wpMat) ~ 1e12 due to variable density/viscosity profiles)
+    if l_anel:
+        lu_factors = torch.eye(2 * N, dtype=DTYPE, device=cpu).unsqueeze(0).expand(l_max + 1, -1, -1).clone()
+        pivots_all = torch.arange(1, 2 * N + 1, dtype=torch.int32, device=cpu).unsqueeze(0).expand(l_max + 1, -1).clone()
+        fac_row_all = torch.ones(l_max + 1, 2 * N, dtype=DTYPE, device=cpu)
+        fac_col_all = torch.ones(l_max + 1, 2 * N, dtype=DTYPE, device=cpu)
 
     for l in range(1, l_max + 1):
         dL = float(l * (l + 1))
@@ -337,18 +349,40 @@ def build_wp_matrices(wimp_lin0: float):
             dat[:, blk_start] = dat[:, blk_start] * _bfac
             dat[:, blk_start + N - 1] = dat[:, blk_start + N - 1] * _bfac
 
-        fac_row = 1.0 / dat.abs().max(dim=1).values
+        row_max = dat.abs().max(dim=1).values
+        row_max[row_max == 0] = 1.0  # protect zero rows from inf
+        fac_row = 1.0 / row_max
         dat = fac_row.unsqueeze(1) * dat
-        fac_col = 1.0 / dat.abs().max(dim=0).values
+        col_max = dat.abs().max(dim=0).values
+        col_max[col_max == 0] = 1.0  # protect zero cols from inf
+        fac_col = 1.0 / col_max
         dat = dat * fac_col.unsqueeze(0)
 
-        lu, ip, info = prepare_mat(dat)
-        assert info == 0, f"Singular wpMat for l={l}, info={info}"
+        if l_anel:
+            # Store LU factors for accurate batched lu_solve
+            lu_f, piv = torch.linalg.lu_factor(dat)
+            lu_factors[l] = lu_f
+            pivots_all[l] = piv
+            fac_row_all[l] = fac_row
+            fac_col_all[l] = fac_col
+        else:
+            lu, ip, info = prepare_mat(dat)
+            assert info == 0, f"Singular wpMat for l={l}, info={info}"
+            inv_precond = solve_mat_real(lu, ip, eye)
+            inv_by_l[l] = fac_col.unsqueeze(1) * inv_precond * fac_row.unsqueeze(0)
 
-        inv_precond = solve_mat_real(lu, ip, eye)
-        inv_by_l[l] = fac_col.unsqueeze(1) * inv_precond * fac_row.unsqueeze(0)
-
-    _wp_inv_by_l = inv_by_l.to(DEVICE)
+    if l_anel:
+        _wp_lu_by_l = lu_factors.to(DEVICE)
+        _wp_pivots_by_l = pivots_all.to(DEVICE)
+        _wp_fac_row_by_l = fac_row_all.to(DEVICE)
+        _wp_fac_col_by_l = fac_col_all.to(DEVICE)
+        _wp_inv_by_l = None
+    else:
+        _wp_inv_by_l = inv_by_l.to(DEVICE)
+        _wp_lu_by_l = None
+        _wp_pivots_by_l = None
+        _wp_fac_row_by_l = None
+        _wp_fac_col_by_l = None
 
 
 def finish_exp_pol(dw_exp, dVxVhLM):
@@ -423,8 +457,17 @@ def updateWP(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
     # BCs: all zero (w=0, dw/dr=0 at both boundaries) — already zero
     # l=0 modes get zero solution (inv is zero for l=0)
 
-    # Chunked batched solve via per-l inverses
-    sol = chunked_solve_complex(_wp_inv_by_l, st_lm2l, rhs_combined)
+    # Chunked batched solve: LU for anelastic (ill-conditioned), inverse for Boussinesq
+    if _wp_lu_by_l is not None:
+        sol = chunked_lu_solve_complex(
+            _wp_lu_by_l, _wp_pivots_by_l,
+            _wp_fac_row_by_l, _wp_fac_col_by_l,
+            st_lm2l, rhs_combined)
+        # l=0 has no WP solve (dLh=0); precomputed-inverse path gives zero via
+        # zero inv_by_l[0], but LU path returns RHS unchanged. Zero explicitly.
+        sol[st_lm2l == 0] = 0.0
+    else:
+        sol = chunked_solve_complex(_wp_inv_by_l, st_lm2l, rhs_combined)
     sol[_m0_mask] = sol[_m0_mask].real.to(CDTYPE)
 
     # Extract w and p Chebyshev coefficients

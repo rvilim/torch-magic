@@ -75,15 +75,18 @@ def run_anel_steps():
 
 
 # Relative tolerance per field.
+# After switching anelastic WP solver from precomputed inverse to
+# torch.linalg.lu_solve (cond(wpMat) ~1e10 was amplifying inverse errors),
+# all fields now match Fortran to near machine precision.
 # Measured worst-case relative errors across 3 steps:
-#   s: 1.3e-9   ds: 2.9e-8   p: 8.5e-8   dp: 8.5e-8
-#   w: 9.0e-6   dw: 3.1e-4   ddw: 3.6e-3
-#   z: 1.0e-4   dz: 1.7e-3
-# Tolerances set to ~3x measured worst-case to allow FP variability.
+#   s: 7e-13   ds: 8e-12   p: 7e-11   dp: 3e-11
+#   w: 2e-11   dw: 2e-10   ddw: 3e-9
+#   z: 5e-12   dz: 4e-10
+# Tolerances set to ~10x measured worst-case.
 _RTOL = {
-    "s": 5e-9, "ds": 1e-7, "p": 3e-7, "dp": 3e-7,
-    "w": 3e-5, "dw": 1e-3, "ddw": 1.5e-2,
-    "z": 5e-4, "dz": 6e-3,
+    "s": 1e-11, "ds": 1e-10, "p": 1e-9, "dp": 1e-9,
+    "w": 1e-9, "dw": 1e-8, "ddw": 1e-7,
+    "z": 1e-10, "dz": 1e-8,
 }
 
 

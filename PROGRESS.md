@@ -2122,3 +2122,43 @@ Assessed by 5 independent audit agents cross-referencing code, tests, plan file,
 - Additional time schemes (ARS222, ARS233, etc.) — CNAB2 + BPR353 cover all exercised paths
 - Movie output, RMS output, coefficient output — diagnostic, not core physics
 - Conducting outer boundary (ktopb=2) — dynamo_benchmark uses insulating
+
+---
+
+## Anelastic WP Solver: Precomputed Inverse → LU Solve (2026-04-03)
+
+### Problem
+The anelastic Chebyshev WP solver had tolerances 7–10 orders of magnitude looser than every other test:
+- ddw: 1.5% rtol after 3 steps (vs 1e-10 for Boussinesq after 100 steps)
+- dz: 0.6% rtol, w: 3e-5 rtol
+
+Root cause: the solver used a precomputed dense matrix inverse (`x = inv(A) @ b` via batched bmm). For anelastic with strat=5.0, the 66×66 wpMat has condition number ~4e10 (vs ~1e6–7 for Boussinesq). The precomputed inverse accumulates errors proportional to cond(A)·eps, compounded by Chebyshev differentiation (ddw) and Coriolis coupling (dz).
+
+Two critique agents confirmed: naive iterative refinement (`dx = inv(A) @ residual`) would NOT help because the correction reuses the same noisy inverse — the fix requires LU-based solving.
+
+### Fix
+Replaced precomputed-inverse bmm with `torch.linalg.lu_solve` for the WP solver when `l_anel=True`. Boussinesq path unchanged (precomputed inverse works fine at cond ~1e6).
+
+**Files changed**:
+- `algebra.py`: Added `chunked_lu_solve_complex()` — batched LU solve using `torch.linalg.lu_solve` with the same packing infrastructure (pack by l, view_as_real trick for float64 TRSM)
+- `update_wp.py`: When `l_anel`, `build_wp_matrices()` stores `torch.linalg.lu_factor` results + preconditioning factors instead of precomputed inverse. `updateWP()` dispatches to `chunked_lu_solve_complex`. l=0 solution explicitly zeroed (LU identity returns RHS unchanged, unlike zero inverse)
+- `test_anel_step.py`: Tightened tolerances from 1e-3–1e-2 to 1e-7–1e-9
+
+**Bugs found during implementation**:
+1. `n_cheb_max` truncation (zeroing boundary-row columns for modes > n_cheb_max) does NOT make the matrix singular — interior rows still have nonzero entries at those columns. Fortran's partial pivoting handles this. `torch.linalg.lu_factor` (not `lu_factor_ex`) works fine.
+2. l=0 WP has no solve (dLh=0). Precomputed inverse is all-zero → zero output. LU with identity factors returns RHS unchanged. Fixed by zeroing l=0 result after solve.
+
+**Verification**: Rebuilt Fortran fresh, regenerated reference data, compared field-by-field:
+
+| Field | Before (precomputed inv) | After (LU solve) |
+|-------|-------------------------|-------------------|
+| w     | 3e-5                    | 2e-11            |
+| dw    | 1e-3                    | 2e-10            |
+| ddw   | 1.5e-2                  | 3e-9             |
+| z     | 5e-4                    | 5e-12            |
+| dz    | 6e-3                    | 4e-10            |
+
+Energy comparison vs fresh Fortran: 9 significant digits match across all 3 steps.
+
+### Fortran reference data regenerated
+`samples/hydro_bench_anel_lowres/fortran_ref/` regenerated from fresh Fortran build (gfortran-15, -O3). `input.nml` changed to `n_time_steps=4` (3 integrating steps + 1 output). 36 arrays (9 fields × 4 steps).
