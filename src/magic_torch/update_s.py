@@ -18,7 +18,7 @@ from .radial_functions import or1, or2, beta, dLtemp0, dLkappa, kappa, orho1
 from .horizontal_data import dLh, hdif_S
 from .pre_calculations import opr
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
+from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex
 from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_ddr
 
@@ -34,11 +34,6 @@ _bots[st_lm2[0, 0].item()] = sq4pi
 _m0_mask = (st_lm2m == 0)
 
 
-# --- Precompute per-l LM index groups ---
-_l_lm_idx = []
-for _l in range(l_max + 1):
-    _l_lm_idx.append(torch.where(st_lm2l == _l)[0])
-
 # Precompute per-lm broadcast arrays for implicit term
 _hdif_lm = hdif_S[st_lm2l].to(CDTYPE).unsqueeze(1)  # (lm_max, 1)
 _dLh_lm = dLh.to(CDTYPE).unsqueeze(1)                # (lm_max, 1)
@@ -52,10 +47,6 @@ _s_impl_d1 = (beta + dLtemp0 + two * or1 + dLkappa).unsqueeze(0)  # (1, n_r_max)
 _kappa_r = kappa.unsqueeze(0)                         # (1, n_r_max)
 
 
-# --- LU-factored matrices storage (one per l degree) ---
-_sMat_lu = [None] * (l_max + 1)
-_sMat_ip = [None] * (l_max + 1)
-_sMat_fac = [None] * (l_max + 1)
 
 # Unique inverse per l degree: (l_max+1, N, N) float64 (Chebyshev)
 _s_inv_by_l = None

@@ -30,15 +30,10 @@ from .pre_calculations import BuoFac, ChemFac
 from .params import l_finite_diff as _l_fd_p0
 _l_p0_integ_bc = (ViscHeatFac * ThExpNb != 0.0) and not _l_fd_p0
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex, chunked_lu_solve_complex
+from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex, chunked_lu_solve_complex
 from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_dddr
 
-
-# --- Precompute per-l LM index groups ---
-_l_lm_idx = []
-for _l in range(l_max + 1):
-    _l_lm_idx.append(torch.where(st_lm2l == _l)[0])
 
 # m=0 mask for forcing real coefficients
 _m0_mask = (st_lm2m == 0)
@@ -68,17 +63,10 @@ _D23_T_wp = torch.cat([_D2_cd_wp.T, _D3_cd_wp.T], dim=1)  # (N, 2N)
 _lm_l0 = st_lm2[0, 0].item()
 
 # --- l=0 pressure matrix ---
-_p0Mat_lu = None
-_p0Mat_ip = None
 _p0Mat_inv = None  # (N, N) float64 on DEVICE — precomputed inverse for GPU solve
 _p0Mat_bands = None  # (dl, d, du) tridiagonal bands for FD — on DEVICE
 
 # --- l>=1 coupled (w,p) matrices ---
-_wpMat_lu = [None] * (l_max + 1)
-_wpMat_ip = [None] * (l_max + 1)
-_wpMat_fac_row = [None] * (l_max + 1)  # row preconditioning
-_wpMat_fac_col = [None] * (l_max + 1)  # column preconditioning
-
 # Unique inverse per l degree: (l_max+1, 2N, 2N) float64 — l=0 is zero
 _wp_inv_by_l = None
 # LU factors for anelastic (accurate solve for ill-conditioned wpMat)
@@ -96,7 +84,7 @@ def build_p0_matrix():
     Row 0: Dirichlet p=0 (Boussinesq) or Chebyshev integral constraint (anelastic
            with ViscHeatFac*ThExpNb != 0).
     """
-    global _p0Mat_lu, _p0Mat_ip, _p0Mat_inv, _p0Mat_bands
+    global _p0Mat_inv, _p0Mat_bands
     N = n_r_max
 
     # Build on CPU (scalar loops in prepare_mat)
@@ -176,14 +164,10 @@ def build_p0_matrix():
             assert info == 0, f"Singular p0Mat (banded), info={info}"
             _p0Mat_bands = ('band', abd_f, piv, N, p0_kl, p0_ku)
         _p0Mat_inv = None
-        _p0Mat_lu = None
-        _p0Mat_ip = None
     else:
         # Chebyshev: dense LU + precomputed inverse
         lu, ip, info = prepare_mat(dat)
         assert info == 0, "Singular p0Mat"
-        _p0Mat_lu = lu
-        _p0Mat_ip = ip
         eye = torch.eye(N, dtype=DTYPE, device=cpu)
         inv_cols = []
         for i in range(N):

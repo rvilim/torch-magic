@@ -20,7 +20,7 @@ from .radial_scheme import rMat, drMat, d2rMat, rnorm, boundary_fac, r
 from .radial_functions import or1, or2, visc, beta, dbeta, dLvisc, rho0
 from .horizontal_data import dLh, hdif_V
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
+from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex
 from .radial_scheme import costf
 from .radial_derivatives import get_ddr
 from .integration import rInt_R
@@ -29,11 +29,6 @@ from .pre_calculations import (l_z10mat, c_z10_omega_ic, c_dt_z10_ic,
                                 y10_norm, y11_norm, c_moi_oc, c_moi_ic,
                                 c_moi_ma, AMstart)
 
-
-# --- Precompute per-l LM index groups ---
-_l_lm_idx = []
-for _l in range(l_max + 1):
-    _l_lm_idx.append(torch.where(st_lm2l == _l)[0])
 
 # m=0 mask for forcing real coefficients
 _m0_mask = (st_lm2m == 0)
@@ -72,11 +67,6 @@ _am_d2z_profile = rho0 * (two + four * beta * r + dbeta * _am_r2
 # Precompute ICB scalar constants as Python floats (avoids GPU→CPU sync per step)
 _visc_icb = visc[n_r_max - 1].item()
 _or1_icb = or1[n_r_max - 1].item()
-
-# --- LU-factored matrices storage (one per l degree, l>=1) ---
-_zMat_lu = [None] * (l_max + 1)
-_zMat_ip = [None] * (l_max + 1)
-_zMat_fac = [None] * (l_max + 1)
 
 # Unique inverse per l degree: (l_max+1, N, N) float64 — l=0 is zero
 _z_inv_by_l = None

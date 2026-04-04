@@ -21,7 +21,7 @@ from .horizontal_data import dLh, hdif_Xi
 from .params import l_anel
 from .pre_calculations import osc
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
+from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex
 from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_ddr
 

@@ -258,8 +258,8 @@ def test_p0Mat_roundtrip():
     x = torch.randn(N, dtype=DTYPE)
     rhs = dat @ x
 
-    # p0Mat LU factors are on CPU
-    x_hat = solve_mat_real(update_wp._p0Mat_lu.cpu(), update_wp._p0Mat_ip.cpu(), rhs)
+    # p0Mat uses precomputed inverse
+    x_hat = (update_wp._p0Mat_inv.cpu() @ rhs)
     err = (x_hat - x).abs().max().item()
     print(f"  roundtrip error = {err:.2e}")
     assert err < 1e-10, f"p0Mat roundtrip failed: {err:.2e}"

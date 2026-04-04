@@ -36,14 +36,6 @@ def get_ddr(f: torch.Tensor):
     return f @ _D1.T, f @ _D2.T
 
 
-def get_d4(f: torch.Tensor) -> torch.Tensor:
-    """Fourth radial derivative (FD only)."""
-    if _D4_bands is not None:
-        return _banded_matvec(_D4_bands, f)
-    if _D4 is None:
-        raise RuntimeError("D4 not available (Chebyshev has no d4rMat)")
-    return f @ _D4.T
-
 
 def get_dddr(f: torch.Tensor):
     """First, second, and third radial derivatives.
@@ -162,52 +154,6 @@ if _l_fd:
 
 
 # --- DCT-based derivatives (alternative, matches Fortran get_dr exactly) ---
-
-def _get_dcheb(f: torch.Tensor) -> torch.Tensor:
-    """Chebyshev derivative recurrence in spectral space.
-
-    Matches get_dcheb from radial_derivatives.f90.
-    Input f is in "costf space" (self-inverse DCT-I coefficients).
-    Output df is the derivative in the same space.
-
-    The recurrence (0-indexed, with s[n] = costf coefficients):
-        df[N] = 0
-        df[N-1] = fac * f[N]    where fac = N (if n_r_max == n_cheb_max) else 2*N
-        df[n] = df[n+2] + 2*(n+1) * f[n+1]   for n = N-2, ..., 0
-    """
-    N = n_r_max - 1
-    fac = float(n_cheb_max - 1) if n_r_max == n_cheb_max else 2.0 * float(n_cheb_max - 1)
-
-    df = torch.zeros_like(f)
-    df[..., n_cheb_max - 1] = 0.0
-    if n_cheb_max >= 2:
-        df[..., n_cheb_max - 2] = fac * f[..., n_cheb_max - 1]
-
-    for n in range(n_cheb_max - 3, -1, -1):
-        df[..., n] = df[..., n + 2] + 2.0 * (n + 1) * f[..., n + 1]
-
-    return df
-
-
-def get_dr_costf(f: torch.Tensor) -> torch.Tensor:
-    """First radial derivative via costf + Chebyshev recurrence.
-
-    This matches the Fortran get_dr code path exactly:
-    1. Forward DCT: physical → spectral
-    2. Chebyshev derivative recurrence
-    3. Inverse DCT: spectral → physical
-    4. Mapping correction
-    """
-    # Forward transform
-    f_cheb = costf(f)
-    # Differentiate in spectral space
-    df_cheb = _get_dcheb(f_cheb)
-    # Inverse transform (costf is self-inverse)
-    df = costf(df_cheb)
-    # Apply mapping correction
-    df = drx * df
-    return df
-
 
 # --- IC (inner core) derivatives using even Chebyshev polynomials ---
 

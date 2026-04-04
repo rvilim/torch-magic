@@ -639,28 +639,6 @@ def extract_tridiag(dat: torch.Tensor):
     return dl, d, du
 
 
-def extract_pentadiag(dat: torch.Tensor):
-    """Extract pentadiagonal bands from a dense matrix.
-
-    Args:
-        dat: (N, N) dense matrix
-
-    Returns:
-        dl2: (N-2,) second lower diagonal
-        dl1: (N-1,) first lower diagonal
-        d:   (N,) main diagonal
-        du1: (N-1,) first upper diagonal
-        du2: (N-2,) second upper diagonal
-    """
-    N = dat.shape[0]
-    d = dat[range(N), range(N)].clone()
-    dl1 = dat[range(1, N), range(N - 1)].clone()
-    du1 = dat[range(N - 1), range(1, N)].clone()
-    dl2 = dat[range(2, N), range(N - 2)].clone()
-    du2 = dat[range(N - 2), range(2, N)].clone()
-    return dl2, dl1, d, du1, du2
-
-
 def dense_to_band_storage(A_dense: torch.Tensor, kl: int, ku: int) -> torch.Tensor:
     """Convert dense matrix to LAPACK-style band storage for prepare_band.
 

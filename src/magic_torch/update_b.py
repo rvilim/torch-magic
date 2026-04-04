@@ -19,7 +19,7 @@ from .radial_functions import or1, or2, lambda_, dLlambda
 from .horizontal_data import dLh, hdif_B
 from .pre_calculations import opm
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_complex, solve_mat_real, chunked_solve_complex
+from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex
 from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_ddr
 
@@ -46,15 +46,6 @@ _lm_l0 = st_lm2[0, 0].item()
 _or2_icb_py = or2[n_r_max - 1].item()
 # Precompute m*dLh for finish_exp_mag_ic (constant across steps)
 _im_dLh = (1j * st_lm2m.to(CDTYPE) * dLh.to(CDTYPE)).unsqueeze(1)  # (lm_max, 1)
-
-# --- LU-factored matrices storage (one per l degree, l>=1) ---
-_bMat_lu = [None] * (l_max + 1)
-_bMat_ip = [None] * (l_max + 1)
-_bMat_fac = [None] * (l_max + 1)
-
-_jMat_lu = [None] * (l_max + 1)
-_jMat_ip = [None] * (l_max + 1)
-_jMat_fac = [None] * (l_max + 1)
 
 # Unique inverses per l degree — l=0 is zero
 _b_inv_by_l = None
