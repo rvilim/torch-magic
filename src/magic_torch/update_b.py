@@ -15,7 +15,7 @@ from .precision import DTYPE, CDTYPE, DEVICE
 from .params import (n_r_max, n_r_ic_max, n_r_tot, n_cheb_max, n_cheb_ic_max,
                      lm_max, l_max, l_cond_ic, sigma_ratio)
 from .radial_scheme import rMat, drMat, d2rMat, rnorm, boundary_fac
-from .radial_functions import or1, or2
+from .radial_functions import or1, or2, lambda_, dLlambda
 from .horizontal_data import dLh, hdif_B
 from .pre_calculations import opm
 from .blocking import st_lm2, st_lm2l, st_lm2m
@@ -36,6 +36,8 @@ _m0_mask = (st_lm2m == 0)
 _hdif_lm = hdif_B[st_lm2l].to(CDTYPE).unsqueeze(1)  # (lm_max, 1)
 _dLh_lm = dLh.to(CDTYPE).unsqueeze(1)                # (lm_max, 1)
 _or2_r = or2.unsqueeze(0)                             # (1, n_r_max)
+_lambda_r = lambda_.unsqueeze(0).to(CDTYPE)           # (1, n_r_max)
+_dLlambda_r = dLlambda.unsqueeze(0).to(CDTYPE)        # (1, n_r_max)
 
 # l=0 index
 _lm_l0 = st_lm2[0, 0].item()
@@ -107,7 +109,11 @@ def _build_b_matrices_insulating(wimp_lin0: float):
     _or2 = or2.to(cpu)
     _rnorm = rnorm.to(cpu) if isinstance(rnorm, torch.Tensor) else rnorm
     _bfac = boundary_fac.to(cpu) if isinstance(boundary_fac, torch.Tensor) else boundary_fac
+    _lambda = lambda_.to(cpu)
+    _dLlambda = dLlambda.to(cpu)
     or2_col = _or2.unsqueeze(1)
+    lambda_col = _lambda.unsqueeze(1)
+    dLlambda_col = _dLlambda.unsqueeze(1)
 
     eye = torch.eye(N, dtype=DTYPE, device=cpu)
     b_inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
@@ -138,7 +144,7 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         # === bMat (poloidal magnetic field) ===
         dat_b = torch.zeros(N, N, dtype=DTYPE, device=cpu)
         dat_b[1:N-1, :] = _rnorm * dL * or2_col[1:N-1] * (
-            _rMat[1:N-1] - wimp_lin0 * opm * hdif_l * (
+            _rMat[1:N-1] - wimp_lin0 * opm * lambda_col[1:N-1] * hdif_l * (
                 _d2rMat[1:N-1] - dL * or2_col[1:N-1] * _rMat[1:N-1]
             )
         )
@@ -173,8 +179,9 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         # === jMat (toroidal magnetic field) ===
         dat_j = torch.zeros(N, N, dtype=DTYPE, device=cpu)
         dat_j[1:N-1, :] = _rnorm * dL * or2_col[1:N-1] * (
-            _rMat[1:N-1] - wimp_lin0 * opm * hdif_l * (
-                _d2rMat[1:N-1] - dL * or2_col[1:N-1] * _rMat[1:N-1]
+            _rMat[1:N-1] - wimp_lin0 * opm * lambda_col[1:N-1] * hdif_l * (
+                _d2rMat[1:N-1] + dLlambda_col[1:N-1] * _drMat[1:N-1]
+                - dL * or2_col[1:N-1] * _rMat[1:N-1]
             )
         )
         dat_j[0, :] = _rnorm * _rMat[0, :]
@@ -255,6 +262,10 @@ def _build_b_matrices_coupled(wimp_lin0: float):
 
     or2_col = _or2.unsqueeze(1)
     or2_icb = _or2[N - 1].item()  # 1/r_icb^2
+    _lambda = lambda_.to(cpu)
+    _dLlambda = dLlambda.to(cpu)
+    lambda_col = _lambda.unsqueeze(1)
+    dLlambda_col = _dLlambda.unsqueeze(1)
 
     if l_finite_diff:
         _bj_kl = max(fd_order // 2, fd_order_bound)
@@ -280,7 +291,7 @@ def _build_b_matrices_coupled(wimp_lin0: float):
 
         # --- OC bulk (rows 1..N-2, cols 0..N-1) ---
         dat_b[1:N-1, :N] = _rnorm * dL * or2_col[1:N-1] * (
-            _rMat[1:N-1] - wimp * opm * hdif_l * (
+            _rMat[1:N-1] - wimp * opm * lambda_col[1:N-1] * hdif_l * (
                 _d2rMat[1:N-1] - dL * or2_col[1:N-1] * _rMat[1:N-1]
             )
         )
@@ -356,12 +367,11 @@ def _build_b_matrices_coupled(wimp_lin0: float):
         # ===== jMat =====
         dat_j = torch.zeros(NT, NT, dtype=DTYPE, device=cpu)
 
-        # --- OC bulk (same as bMat for Boussinesq: dLlambda=0) ---
-        dat_j[1:N-1, :N] = dat_b[1:N-1, :N] / (fac_b[1:N-1].unsqueeze(1))
-        # Actually rebuild to avoid fac_b contamination
+        # --- OC bulk ---
         dat_j[1:N-1, :N] = _rnorm * dL * or2_col[1:N-1] * (
-            _rMat[1:N-1] - wimp * opm * hdif_l * (
-                _d2rMat[1:N-1] - dL * or2_col[1:N-1] * _rMat[1:N-1]
+            _rMat[1:N-1] - wimp * opm * lambda_col[1:N-1] * hdif_l * (
+                _d2rMat[1:N-1] + dLlambda_col[1:N-1] * _drMat[1:N-1]
+                - dL * or2_col[1:N-1] * _rMat[1:N-1]
             )
         )
 
@@ -529,12 +539,12 @@ def _updateB_insulating(b_LMloc, db_LMloc, ddb_LMloc,
 
     # 7. Compute implicit terms
     idx = tscheme.next_impl_idx
-    dbdt.impl[:, :, idx] = opm * _hdif_lm * _dLh_lm * _or2_r * (
+    dbdt.impl[:, :, idx] = opm * _lambda_r * _hdif_lm * _dLh_lm * _or2_r * (
         ddb_LMloc - _dLh_lm * _or2_r * b_LMloc
     )
 
-    djdt.impl[:, :, idx] = opm * _hdif_lm * _dLh_lm * _or2_r * (
-        ddj_LMloc - _dLh_lm * _or2_r * aj_LMloc
+    djdt.impl[:, :, idx] = opm * _lambda_r * _hdif_lm * _dLh_lm * _or2_r * (
+        ddj_LMloc + _dLlambda_r * dj_LMloc - _dLh_lm * _or2_r * aj_LMloc
     )
 
 
@@ -669,11 +679,11 @@ def _updateB_coupled(b_LMloc, db_LMloc, ddb_LMloc,
 
     # 11. Compute OC implicit terms
     idx = tscheme.next_impl_idx
-    dbdt.impl[:, :, idx] = opm * _hdif_lm * _dLh_lm * _or2_r * (
+    dbdt.impl[:, :, idx] = opm * _lambda_r * _hdif_lm * _dLh_lm * _or2_r * (
         ddb_LMloc - _dLh_lm * _or2_r * b_LMloc
     )
-    djdt.impl[:, :, idx] = opm * _hdif_lm * _dLh_lm * _or2_r * (
-        ddj_LMloc - _dLh_lm * _or2_r * aj_LMloc
+    djdt.impl[:, :, idx] = opm * _lambda_r * _hdif_lm * _dLh_lm * _or2_r * (
+        ddj_LMloc + _dLlambda_r * dj_LMloc - _dLh_lm * _or2_r * aj_LMloc
     )
 
     # 12. Compute IC implicit terms

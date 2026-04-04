@@ -2162,3 +2162,29 @@ Energy comparison vs fresh Fortran: 9 significant digits match across all 3 step
 
 ### Fortran reference data regenerated
 `samples/hydro_bench_anel_lowres/fortran_ref/` regenerated from fresh Fortran build (gfortran-15, -O3). `input.nml` changed to `n_time_steps=4` (3 integrating steps + 1 output). 36 arrays (9 fields × 4 steps).
+
+## Fix: Add lambda/dLlambda to magnetic diffusion terms (2026-04-04)
+
+### Problem
+The magnetic field solver `update_b.py` omitted `lambda_(nR)` (magnetic diffusivity) and `dLlambda(nR)` (its log derivative) from all diffusion formulas. These were always `1` and `0` respectively for all tested configs (constant conductivity), so the omission was numerically harmless. But structurally the code disagreed with Fortran which always includes these terms, and would produce wrong results for variable conductivity cases (`nVarCond > 0`).
+
+### Fix
+Threaded the existing `lambda_` and `dLlambda` arrays (already declared as `ones`/`zeros` in `radial_functions.py`) into 11 locations across 3 files:
+
+**`update_b.py`** (8 locations):
+- bMat bulk: `opm * hdif` → `opm * lambda_col * hdif` (insulating + coupled)
+- jMat bulk: same + added `dLlambda_col * drMat` inside diffusion operator (insulating + coupled)
+- `dbdt.impl`: `opm * hdif` → `opm * lambda_r * hdif` (insulating + coupled)
+- `djdt.impl`: same + added `dLlambda_r * dj` term (insulating + coupled)
+
+**`step_time.py`** (2 locations):
+- `setup_initial_state` dbdt.impl and djdt.impl: same pattern
+
+**`get_nl_anel.py`** (1 location):
+- Ohmic heating: `OhmLossFac * or2 * otemp1 * (...)` → `OhmLossFac * lambda_ * or2 * otemp1 * (...)`
+
+### Verification
+Since `lambda_=1` and `dLlambda=0` for all current configs, changes are mathematical no-ops:
+- 35/35 tests pass (implicit matrices + anelastic step)
+- 140/140 FD anel MHD tests pass
+- No numerical change for any existing benchmark

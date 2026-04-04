@@ -13,7 +13,7 @@ from .precision import DTYPE, DEVICE
 from .params import n_r_max, n_theta_max, n_phi_max
 from .radial_scheme import r
 from .radial_functions import (
-    or1, or2, or4, beta, orho1, otemp1, visc, ViscHeatFac, OhmLossFac,
+    or1, or2, or4, beta, orho1, otemp1, visc, lambda_, ViscHeatFac, OhmLossFac,
 )
 from .params import l_mag
 from .horizontal_data import O_sin_theta_E2_grid, cosn_theta_E2_grid
@@ -30,6 +30,7 @@ _beta_3 = beta.reshape(n_r_max, 1, 1)
 _orho1_3 = orho1.reshape(n_r_max, 1, 1)
 _otemp1_3 = otemp1.reshape(n_r_max, 1, 1)
 _visc_3 = visc.reshape(n_r_max, 1, 1)
+_lambda_3 = lambda_.reshape(n_r_max, 1, 1)
 _vhf_3 = torch.tensor(ViscHeatFac, dtype=DTYPE, device=DEVICE)
 
 # Theta-dependent (grid layout): (n_theta_max,) → (1, n_theta_max, 1)
@@ -129,7 +130,7 @@ def get_nl_anel(
     # Only active when both l_anel and l_mag are true.
     # lambda=1 for constant conductivity (nVarDiff=0).
     if l_mag and OhmLossFac != 0.0:
-        heatTerms = heatTerms + OhmLossFac * _or2_3 * _otemp1_3 * (
+        heatTerms = heatTerms + OhmLossFac * _lambda_3 * _or2_3 * _otemp1_3 * (
             _or2_3 * cbrc * cbrc + _Ost2 * (cbtc * cbtc + cbpc * cbpc))
 
     return Advr, Advt, Advp, VSr, VSt, VSp, VxBr, VxBt, VxBp, VXir, VXit, VXip, heatTerms

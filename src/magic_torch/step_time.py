@@ -15,7 +15,7 @@ from .params import (n_r_max, lm_max, l_max, n_theta_max, n_phi_max, alpha,
                      l_correct_AMz, l_correct_AMe, l_heat, l_SRIC,
                      l_double_curl, l_finite_diff)
 from .courant import courant_check, dt_courant
-from .radial_functions import or2
+from .radial_functions import or2, lambda_, dLlambda
 from .horizontal_data import dLh, hdif_S, hdif_V, hdif_B, hdif_Xi
 from .pre_calculations import opr, opm, BuoFac, ChemFac, CorFac, LFfac, l_z10mat, osc
 from .blocking import st_lm2l, st_lm2m
@@ -524,16 +524,19 @@ def setup_initial_state():
         # djdt.old = dLh * or2 * aj
         d.djdt.old[:, :, 0] = _dLh_lm * _or2_r * f.aj_LMloc
 
-        # dbdt.impl = opm * hdif_B * dLh * or2 * (ddb - dLh * or2 * b)
+        # dbdt.impl = opm * lambda * hdif_B * dLh * or2 * (ddb - dLh * or2 * b)
         # Fortran only computes interior (n_r_cmb+1 to n_r_icb-1); boundaries stay zero.
         or2_int = _or2_r[:, 1:-1]
-        d.dbdt.impl[:, 1:-1, 0] = opm * _hdif_B_lm * _dLh_lm * or2_int * (
+        lambda_int = lambda_.unsqueeze(0).to(CDTYPE)[:, 1:-1]
+        dLlambda_int = dLlambda.unsqueeze(0).to(CDTYPE)[:, 1:-1]
+        d.dbdt.impl[:, 1:-1, 0] = opm * lambda_int * _hdif_B_lm * _dLh_lm * or2_int * (
             ddb[:, 1:-1] - _dLh_lm * or2_int * f.b_LMloc[:, 1:-1]
         )
 
-        # djdt.impl = opm * hdif_B * dLh * or2 * (ddj - dLh * or2 * aj)
-        d.djdt.impl[:, 1:-1, 0] = opm * _hdif_B_lm * _dLh_lm * or2_int * (
-            ddj[:, 1:-1] - _dLh_lm * or2_int * f.aj_LMloc[:, 1:-1]
+        # djdt.impl = opm * lambda * hdif_B * dLh * or2 * (ddj + dLlambda*dj - dLh * or2 * aj)
+        d.djdt.impl[:, 1:-1, 0] = opm * lambda_int * _hdif_B_lm * _dLh_lm * or2_int * (
+            ddj[:, 1:-1] + dLlambda_int * dj[:, 1:-1]
+            - _dLh_lm * or2_int * f.aj_LMloc[:, 1:-1]
         )
 
         # --- IC magnetic field (if conducting inner core) ---
