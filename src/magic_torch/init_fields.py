@@ -12,7 +12,7 @@ import math
 import torch
 
 from .precision import DTYPE, CDTYPE, DEVICE
-from .params import (n_r_max, n_r_ic_max, lm_max, l_max, init_b1, amp_b1,
+from .params import (n_r_max, n_r_ic_max, n_cheb_max, lm_max, l_max, init_b1, amp_b1,
                      init_s1, amp_s1, radratio, l_cond_ic, l_mag, l_chemical_conv,
                      l_heat, l_SRIC, l_rot_ic, omega_ic1, nRotIC)
 from .constants import (pi, one, two, three, four, half, third, osq4pi,
@@ -314,13 +314,12 @@ def _ps_cond_anel():
 def xi_cond():
     """Compute conduction state for composition.
 
-    Same structure as ps_cond but:
-    - Uses osc (1/Schmidt) instead of opr (1/Prandtl)
-    - Uses ChemFac instead of BuoFac
-    - BC: top=0, bot=sq4pi (same as entropy, set in preCalculations.f90 line 617)
+    Simple N×N diffusion solve matching Fortran init_fields.f90 xi_cond.
+    Unlike entropy (ps_cond), there is no coupled pressure equation —
+    Fortran solves composition diffusion independently.
 
     Returns:
-        (xi0, p_xi0): each shape (n_r_max,) in physical (radial) space
+        xi0: shape (n_r_max,) in physical (radial) space
     """
     N = n_r_max
 
@@ -329,54 +328,52 @@ def xi_cond():
     _drMat = drMat.to(cpu)
     _d2rMat = d2rMat.to(cpu)
     _or1 = or1.to(cpu)
-    _rgrav = rgrav.to(cpu)
-    _rho0 = rho0.to(cpu)
+    _beta = beta.to(cpu)
     _rnorm = rnorm.to(cpu) if isinstance(rnorm, torch.Tensor) else rnorm
     _bfac = boundary_fac.to(cpu) if isinstance(boundary_fac, torch.Tensor) else boundary_fac
 
-    ps0Mat = torch.zeros(2 * N, 2 * N, dtype=DTYPE, device=cpu)
+    dat = torch.zeros(N, N, dtype=DTYPE, device=cpu)
 
-    # Composition diffusion block
-    ps0Mat[:N, :N] = _rnorm * osc * (
-        _d2rMat + two * _or1.unsqueeze(1) * _drMat
+    # Bulk: rnorm * osc * (d2r + (beta + 2/r) * dr)
+    dat[1:N-1, :] = _rnorm * osc * (
+        _d2rMat[1:N-1] + (_beta[1:N-1].unsqueeze(1) + two * _or1[1:N-1].unsqueeze(1)) * _drMat[1:N-1]
     )
-    # Hydrostatic equilibrium block (ChemFac instead of BuoFac)
-    ps0Mat[N:, :N] = -_rnorm * (_rho0 * ChemFac * _rgrav).unsqueeze(1) * _rMat
-    # Pressure gradient block
-    ps0Mat[N:, N:] = _rnorm * _drMat
 
-    # Boundary conditions
-    ps0Mat[0, :N] = _rnorm * _rMat[0, :]
-    ps0Mat[0, N:] = 0.0
-    ps0Mat[N - 1, :N] = _rnorm * _rMat[N - 1, :]
-    ps0Mat[N - 1, N:] = 0.0
-    ps0Mat[N, :N] = 0.0
-    ps0Mat[N, N:] = _rnorm * _rMat[0, :]
+    # BCs: Dirichlet (ktopxi=1, kbotxi=1)
+    dat[0, :] = _rnorm * _rMat[0, :]       # xi(CMB) = topxi
+    dat[N-1, :] = _rnorm * _rMat[N-1, :]   # xi(ICB) = botxi
 
-    for col in [0, N - 1, N, 2 * N - 1]:
-        ps0Mat[:, col] *= _bfac
+    # n_cheb_max truncation in boundary rows
+    if n_cheb_max < N:
+        dat[0, n_cheb_max:] = 0.0
+        dat[N-1, n_cheb_max:] = 0.0
 
-    ps0Mat_fac = 1.0 / ps0Mat.abs().max(dim=1).values
-    ps0Mat = ps0Mat * ps0Mat_fac.unsqueeze(1)
+    # boundary_fac (Chebyshev endpoint scaling)
+    dat[:, 0] *= _bfac
+    dat[:, N-1] *= _bfac
 
-    a_lu, ip, info = prepare_mat(ps0Mat)
-    assert info == 0, f'Singular xi_ps0Mat, info={info}'
+    # Row preconditioning
+    fac = 1.0 / dat.abs().max(dim=1).values
+    dat = fac.unsqueeze(1) * dat
 
-    rhs = torch.zeros(2 * N, dtype=DTYPE, device=cpu)
-    rhs[0] = 0.0                        # top: xi = 0
-    rhs[N - 1] = math.sqrt(4.0 * math.pi)  # bot: xi = sq4pi (preCalculations.f90:617)
-    rhs[N] = 0.0       # pressure at top = 0
-    rhs = ps0Mat_fac * rhs
+    a_lu, ip, info = prepare_mat(dat)
+    assert info == 0, f'Singular xiMat in xi_cond, info={info}'
 
-    rhs = solve_mat_real(a_lu, ip, rhs)
+    # RHS: top=0, bot=sqrt(4pi)
+    rhs = torch.zeros(N, dtype=DTYPE, device=cpu)
+    rhs[0] = 0.0                            # topxi(0,0) = 0
+    rhs[N-1] = math.sqrt(4.0 * math.pi)     # botxi(0,0) = sq4pi
+    rhs = fac * rhs
 
-    xi0 = rhs[:N].clone().to(DEVICE)
-    p_xi0 = rhs[N:].clone().to(DEVICE)
+    xi0 = solve_mat_real(a_lu, ip, rhs)
 
-    xi0 = costf(xi0)
-    p_xi0 = costf(p_xi0)
+    # n_cheb_max truncation of solution
+    if n_cheb_max < N:
+        xi0[n_cheb_max:] = 0.0
 
-    return xi0, p_xi0
+    xi0 = costf(xi0.to(DEVICE))
+
+    return xi0
 
 
 def initS(s_LMloc, p_LMloc):
@@ -514,10 +511,10 @@ def initialize_fields():
         compute_cond_diagnostics()
 
     # Initialize composition field
-    if l_chemical_conv:
-        xi0, p_xi0 = xi_cond()
-        fields.xi_LMloc[0, :] = xi0.to(CDTYPE)
-        fields.p_LMloc[0, :] += p_xi0.to(CDTYPE)
+    # Composition: xi starts at zero for init_xi1=0 (default).
+    # Fortran only calls xi_cond inside initXi, which is gated by init_xi1 != 0.
+    # Currently init_xi1 is not configurable in the Python port;
+    # xi_cond() exists but is only called when explicitly needed.
 
     # Initialize magnetic field
     if l_mag:
