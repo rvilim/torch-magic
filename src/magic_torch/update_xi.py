@@ -55,6 +55,11 @@ _xi_piv_by_l = None
 _xi_fac_by_l = None
 _xi_kl = 1
 _xi_ku = 1
+# FD tridiag: pre-computed Thomas weights, expanded to per-lm
+_xi_thomas_w_fwd = None   # (lm_max, N-1) real
+_xi_thomas_inv_d = None   # (lm_max, N) real
+_xi_thomas_du = None      # (lm_max, N-1) real
+_xi_thomas_fac = None     # (lm_max, N) real (row preconditioning)
 
 
 def build_xi_matrices(wimp_lin0: float):
@@ -66,6 +71,7 @@ def build_xi_matrices(wimp_lin0: float):
     Must be called whenever dt changes.
     """
     global _xi_inv_by_l, _xi_bands_by_l, _xi_piv_by_l, _xi_fac_by_l, _xi_kl, _xi_ku
+    global _xi_thomas_w_fwd, _xi_thomas_inv_d, _xi_thomas_du, _xi_thomas_fac
     from .params import l_finite_diff
     N = n_r_max
 
@@ -96,6 +102,10 @@ def build_xi_matrices(wimp_lin0: float):
     abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
     piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
     fac_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+    # Thomas precomputation storage (filled in per-l loop for tridiag FD)
+    _xi_thomas_w_fwd_by_l = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu) if (l_finite_diff and _xi_kl == 1) else None
+    _xi_thomas_inv_d_by_l = torch.zeros(l_max + 1, N, dtype=DTYPE, device=cpu) if (l_finite_diff and _xi_kl == 1) else None
+    _xi_thomas_du_by_l = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu) if (l_finite_diff and _xi_kl == 1) else None
 
     for l in range(l_max + 1):
         dL = float(l * (l + 1))
@@ -126,6 +136,16 @@ def build_xi_matrices(wimp_lin0: float):
             abd_all[l] = abd_f
             piv_all[l] = piv
             fac_all[l] = fac
+            # Pre-compute Thomas weights from the preconditioned dense matrix
+            if _xi_thomas_w_fwd_by_l is not None:
+                from .algebra import precompute_thomas
+                dl_l = dat_precond[range(1, N), range(N - 1)]
+                d_l = dat_precond.diag()
+                du_l = dat_precond[range(N - 1), range(1, N)]
+                w, inv_d, du_c = precompute_thomas(dl_l, d_l, du_l)
+                _xi_thomas_w_fwd_by_l[l] = w
+                _xi_thomas_inv_d_by_l[l] = inv_d
+                _xi_thomas_du_by_l[l] = du_c
         else:
             lu, ip, info = prepare_mat(dat_precond)
             assert info == 0, f"Singular xiMat for l={l}, info={info}"
@@ -137,6 +157,14 @@ def build_xi_matrices(wimp_lin0: float):
         _xi_piv_by_l = piv_all.to(DEVICE)
         _xi_fac_by_l = fac_all.to(DEVICE)
         _xi_inv_by_l = None
+        # Expand Thomas weights to per-lm for tridiag FD (kl=ku=1)
+        if _xi_kl == 1 and _xi_ku == 1:
+            _xi_thomas_w_fwd = _xi_thomas_w_fwd_by_l[st_lm2l].to(DEVICE)
+            _xi_thomas_inv_d = _xi_thomas_inv_d_by_l[st_lm2l].to(DEVICE)
+            _xi_thomas_du = _xi_thomas_du_by_l[st_lm2l].to(DEVICE)
+            _xi_thomas_fac = fac_all[st_lm2l].to(DEVICE)
+        else:
+            _xi_thomas_w_fwd = None
     else:
         _xi_inv_by_l = inv_by_l.to(DEVICE)
         _xi_bands_by_l = None
@@ -179,7 +207,16 @@ def updateXi(xi_LMloc, dxi_LMloc, dxidt, tscheme):
     rhs[:, 0] = _topxi
     rhs[:, N - 1] = _botxi
 
-    if _xi_bands_by_l is not None:
+    if _xi_thomas_w_fwd is not None:
+        # FD tridiag: batched Thomas (no Python loop over l)
+        from .algebra import batched_thomas_solve
+        rhs_precond = _xi_thomas_fac * rhs
+        xi_phys = batched_thomas_solve(_xi_thomas_w_fwd, _xi_thomas_inv_d,
+                                       _xi_thomas_du, rhs_precond)
+        xi_phys[_m0_mask] = xi_phys[_m0_mask].real.to(CDTYPE)
+        xi_LMloc[:] = xi_phys
+    elif _xi_bands_by_l is not None:
+        # FD non-tridiag (fd_order>2): fallback to pivoted banded LU
         from .algebra import banded_solve_by_l
         xi_phys = banded_solve_by_l(
             _xi_bands_by_l, _xi_piv_by_l, st_lm2l, rhs,

@@ -50,12 +50,17 @@ _kappa_r = kappa.unsqueeze(0)                         # (1, n_r_max)
 
 # Unique inverse per l degree: (l_max+1, N, N) float64 (Chebyshev)
 _s_inv_by_l = None
-# FD: banded LU storage per l for pivoted solve
+# FD: banded LU storage per l for pivoted solve (fallback for non-tridiag)
 _s_bands_by_l = None   # (l_max+1, n_abd_rows, N) band LU factors
 _s_piv_by_l = None     # (l_max+1, N) pivot indices
 _s_fac_by_l = None     # (l_max+1, N) row preconditioning
 _s_kl = 1              # bandwidth (set in build_s_matrices for FD)
 _s_ku = 1
+# FD tridiag: pre-computed Thomas weights, expanded to per-lm
+_s_thomas_w_fwd = None   # (lm_max, N-1) real
+_s_thomas_inv_d = None   # (lm_max, N) real
+_s_thomas_du = None      # (lm_max, N-1) real
+_s_thomas_fac = None     # (lm_max, N) real (row preconditioning)
 
 
 def build_s_matrices(wimp_lin0: float):
@@ -69,6 +74,7 @@ def build_s_matrices(wimp_lin0: float):
     Must be called whenever dt changes.
     """
     global _s_inv_by_l, _s_bands_by_l, _s_piv_by_l, _s_fac_by_l, _s_kl, _s_ku
+    global _s_thomas_w_fwd, _s_thomas_inv_d, _s_thomas_du, _s_thomas_fac
     from .params import l_finite_diff
     N = n_r_max
 
@@ -97,6 +103,10 @@ def build_s_matrices(wimp_lin0: float):
     abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
     piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
     fac_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+    # Thomas precomputation storage (filled in per-l loop for tridiag FD)
+    _s_thomas_w_fwd_by_l = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu) if (l_finite_diff and _s_kl == 1) else None
+    _s_thomas_inv_d_by_l = torch.zeros(l_max + 1, N, dtype=DTYPE, device=cpu) if (l_finite_diff and _s_kl == 1) else None
+    _s_thomas_du_by_l = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu) if (l_finite_diff and _s_kl == 1) else None
 
     # Anelastic: first-derivative coefficient includes beta + dLtemp0 + dLkappa
     # Boussinesq: beta=0, dLtemp0=0, dLkappa=0 → just 2/r
@@ -136,6 +146,16 @@ def build_s_matrices(wimp_lin0: float):
             abd_all[l] = abd_f
             piv_all[l] = piv
             fac_all[l] = fac
+            # Pre-compute Thomas weights from the preconditioned dense matrix
+            if _s_thomas_w_fwd_by_l is not None:
+                from .algebra import precompute_thomas
+                dl_l = dat_precond[range(1, N), range(N - 1)]
+                d_l = dat_precond.diag()
+                du_l = dat_precond[range(N - 1), range(1, N)]
+                w, inv_d, du_c = precompute_thomas(dl_l, d_l, du_l)
+                _s_thomas_w_fwd_by_l[l] = w
+                _s_thomas_inv_d_by_l[l] = inv_d
+                _s_thomas_du_by_l[l] = du_c
         else:
             lu, ip, info = prepare_mat(dat_precond)
             assert info == 0, f"Singular sMat for l={l}, info={info}"
@@ -147,6 +167,14 @@ def build_s_matrices(wimp_lin0: float):
         _s_piv_by_l = piv_all.to(DEVICE)
         _s_fac_by_l = fac_all.to(DEVICE)
         _s_inv_by_l = None
+        # Pre-compute Thomas weights for tridiag FD (kl=ku=1)
+        if _s_kl == 1 and _s_ku == 1:
+            _s_thomas_w_fwd = _s_thomas_w_fwd_by_l[st_lm2l].to(DEVICE)
+            _s_thomas_inv_d = _s_thomas_inv_d_by_l[st_lm2l].to(DEVICE)
+            _s_thomas_du = _s_thomas_du_by_l[st_lm2l].to(DEVICE)
+            _s_thomas_fac = fac_all[st_lm2l].to(DEVICE)
+        else:
+            _s_thomas_w_fwd = None
     else:
         _s_inv_by_l = inv_by_l.to(DEVICE)
         _s_bands_by_l = None
@@ -193,14 +221,22 @@ def updateS(s_LMloc, ds_LMloc, dsdt, tscheme):
     rhs[:, 0] = _tops
     rhs[:, N - 1] = _bots
 
-    if _s_bands_by_l is not None:
-        # FD: pivoted banded LU solve
+    if _s_thomas_w_fwd is not None:
+        # FD tridiag: batched Thomas (no Python loop over l)
+        from .algebra import batched_thomas_solve
+        rhs_precond = _s_thomas_fac * rhs
+        s_phys = batched_thomas_solve(_s_thomas_w_fwd, _s_thomas_inv_d,
+                                      _s_thomas_du, rhs_precond)
+        s_phys[_m0_mask] = s_phys[_m0_mask].real.to(CDTYPE)
+        s_LMloc[:] = s_phys
+    elif _s_bands_by_l is not None:
+        # FD non-tridiag (fd_order>2): fallback to pivoted banded LU
         from .algebra import banded_solve_by_l
         s_phys = banded_solve_by_l(
             _s_bands_by_l, _s_piv_by_l, st_lm2l, rhs,
             n=N, kl=_s_kl, ku=_s_ku, fac_row_by_l=_s_fac_by_l)
         s_phys[_m0_mask] = s_phys[_m0_mask].real.to(CDTYPE)
-        s_LMloc[:] = s_phys  # already physical space for FD
+        s_LMloc[:] = s_phys
     else:
         s_cheb = chunked_solve_complex(_s_inv_by_l, st_lm2l, rhs)
         s_cheb[_m0_mask] = s_cheb[_m0_mask].real.to(CDTYPE)

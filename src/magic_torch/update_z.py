@@ -76,6 +76,11 @@ _z_piv_by_l = None
 _z_fac_by_l = None
 _z_kl = 0
 _z_ku = 0
+# FD tridiag: pre-computed Thomas weights, expanded to per-lm
+_z_thomas_w_fwd = None   # (lm_max, N-1) real
+_z_thomas_inv_d = None   # (lm_max, N) real
+_z_thomas_du = None      # (lm_max, N-1) real
+_z_thomas_fac = None     # (lm_max, N) real (row preconditioning)
 
 # Separate z10Mat inverse for l=1,m=0 when l_z10mat
 _z10_inv = None
@@ -94,6 +99,7 @@ def build_z_matrices(wimp_lin0: float):
     Must be called whenever dt changes.
     """
     global _z_inv_by_l, _z10_inv, _z_bands_by_l, _z_piv_by_l, _z_fac_by_l, _z_kl, _z_ku
+    global _z_thomas_w_fwd, _z_thomas_inv_d, _z_thomas_du, _z_thomas_fac
     from .params import l_finite_diff
     N = n_r_max
 
@@ -121,10 +127,18 @@ def build_z_matrices(wimp_lin0: float):
     abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
     piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
     fac_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+    # Thomas precomputation storage (filled in per-l loop for tridiag FD)
+    _z_thomas_w_fwd_by_l = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu) if (l_finite_diff and _z_kl == 1) else None
+    _z_thomas_inv_d_by_l = torch.zeros(l_max + 1, N, dtype=DTYPE, device=cpu) if (l_finite_diff and _z_kl == 1) else None
+    _z_thomas_du_by_l = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu) if (l_finite_diff and _z_kl == 1) else None
     if l_finite_diff:
         # l=0: identity bands
         abd_all[0, _z_kl + _z_ku, :] = 1.0
         piv_all[0] = torch.arange(1, N + 1, dtype=torch.long)
+        # l=0: Thomas identity (w_fwd=0, inv_d=1, du=0)
+        if _z_thomas_w_fwd_by_l is not None:
+            _z_thomas_inv_d_by_l[0] = 1.0
+            # w_fwd and du already zero from torch.zeros
 
     # Anelastic profiles for bulk equation
     _beta = beta.to(cpu)
@@ -181,6 +195,16 @@ def build_z_matrices(wimp_lin0: float):
             abd_all[l] = abd_f
             piv_all[l] = piv
             fac_all[l] = fac
+            # Pre-compute Thomas weights from the preconditioned dense matrix
+            if _z_thomas_w_fwd_by_l is not None:
+                from .algebra import precompute_thomas
+                dl_l = dat_precond[range(1, N), range(N - 1)]
+                d_l = dat_precond.diag()
+                du_l = dat_precond[range(N - 1), range(1, N)]
+                w, inv_d, du_c = precompute_thomas(dl_l, d_l, du_l)
+                _z_thomas_w_fwd_by_l[l] = w
+                _z_thomas_inv_d_by_l[l] = inv_d
+                _z_thomas_du_by_l[l] = du_c
         else:
             lu, ip, info = prepare_mat(dat_precond)
             assert info == 0, f"Singular zMat for l={l}, info={info}"
@@ -192,6 +216,14 @@ def build_z_matrices(wimp_lin0: float):
         _z_piv_by_l = piv_all.to(DEVICE)
         _z_fac_by_l = fac_all.to(DEVICE)
         _z_inv_by_l = None
+        # Expand Thomas weights to per-lm for tridiag FD (kl=ku=1)
+        if _z_kl == 1 and _z_ku == 1:
+            _z_thomas_w_fwd = _z_thomas_w_fwd_by_l[st_lm2l].to(DEVICE)
+            _z_thomas_inv_d = _z_thomas_inv_d_by_l[st_lm2l].to(DEVICE)
+            _z_thomas_du = _z_thomas_du_by_l[st_lm2l].to(DEVICE)
+            _z_thomas_fac = fac_all[st_lm2l].to(DEVICE)
+        else:
+            _z_thomas_w_fwd = None
     else:
         _z_inv_by_l = inv_by_l.to(DEVICE)
         _z_bands_by_l = None
@@ -332,28 +364,60 @@ def updateZ(z_LMloc, dz_LMloc, dzdt, tscheme,
         rhs[:, N - 1] = 0.0
 
     # 3. Solve: batched for all modes, then override l=1,m=0 with z10Mat
-    if _z_bands_by_l is not None:
+    if _z_thomas_w_fwd is not None:
+        # FD tridiag: batched Thomas (no Python loop over l)
+        from .algebra import batched_thomas_solve
+        rhs_precond = _z_thomas_fac * rhs
+        z_phys = batched_thomas_solve(_z_thomas_w_fwd, _z_thomas_inv_d,
+                                      _z_thomas_du, rhs_precond)
+        if l_z10mat:
+            # Override l=1,m=0 with z10Mat solve (always Chebyshev)
+            rhs_z10 = rhs[_l1m0, :]  # (N,) complex
+            z10_cheb = torch.mv(_z10_inv.to(CDTYPE), rhs_z10)
+            z10_cheb_m = z10_cheb.real.to(CDTYPE)
+            if n_cheb_max < N:
+                z10_cheb_m[n_cheb_max:] = 0.0
+            z_phys[_l1m0, :] = costf(z10_cheb_m.unsqueeze(0)).squeeze(0)
+        z_phys[_m0_mask] = z_phys[_m0_mask].real.to(CDTYPE)
+        z_LMloc[:] = z_phys
+    elif _z_bands_by_l is not None:
+        # FD non-tridiag (fd_order>2): fallback to pivoted banded LU
         from .algebra import banded_solve_by_l
         z_cheb = banded_solve_by_l(
             _z_bands_by_l, _z_piv_by_l, st_lm2l, rhs,
             n=N, kl=_z_kl, ku=_z_ku, fac_row_by_l=_z_fac_by_l)
+
+        if l_z10mat:
+            # Override l=1,m=0 with z10Mat solve
+            rhs_z10 = rhs[_l1m0, :]  # (N,) complex
+            z10_cheb = torch.mv(_z10_inv.to(CDTYPE), rhs_z10)
+            z_cheb[_l1m0, :] = z10_cheb
+
+        z_cheb[_m0_mask] = z_cheb[_m0_mask].real.to(CDTYPE)
+
+        # 3b. Truncate high Chebyshev modes (Fortran only stores n_cheb_max modes)
+        if n_cheb_max < N:
+            z_cheb[:, n_cheb_max:] = 0.0
+
+        # 4. Convert to physical space
+        z_LMloc[:] = costf(z_cheb)
     else:
         z_cheb = chunked_solve_complex(_z_inv_by_l, st_lm2l, rhs)
 
-    if l_z10mat:
-        # Override l=1,m=0 with z10Mat solve
-        rhs_z10 = rhs[_l1m0, :]  # (N,) complex
-        z10_cheb = torch.mv(_z10_inv.to(CDTYPE), rhs_z10)
-        z_cheb[_l1m0, :] = z10_cheb
+        if l_z10mat:
+            # Override l=1,m=0 with z10Mat solve
+            rhs_z10 = rhs[_l1m0, :]  # (N,) complex
+            z10_cheb = torch.mv(_z10_inv.to(CDTYPE), rhs_z10)
+            z_cheb[_l1m0, :] = z10_cheb
 
-    z_cheb[_m0_mask] = z_cheb[_m0_mask].real.to(CDTYPE)
+        z_cheb[_m0_mask] = z_cheb[_m0_mask].real.to(CDTYPE)
 
-    # 3b. Truncate high Chebyshev modes (Fortran only stores n_cheb_max modes)
-    if n_cheb_max < N:
-        z_cheb[:, n_cheb_max:] = 0.0
+        # 3b. Truncate high Chebyshev modes (Fortran only stores n_cheb_max modes)
+        if n_cheb_max < N:
+            z_cheb[:, n_cheb_max:] = 0.0
 
-    # 4. Convert to physical space
-    z_LMloc[:] = costf(z_cheb)
+        # 4. Convert to physical space
+        z_LMloc[:] = costf(z_cheb)
 
     # 5. Extract omega_ic from z10 at ICB (after costf)
     # For l_SRIC: omega_ic is prescribed, NOT extracted from z10

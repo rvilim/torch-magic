@@ -998,3 +998,65 @@ def batched_pentadiag_solve(dl2: torch.Tensor, dl1: torch.Tensor,
                      - bands[:, 4, i] * rhs[:, i + 2]) / bands[:, 2, i]
 
     return rhs
+
+
+# ===========================================================================
+# Pre-computed Thomas solver for batched tridiagonal systems
+# ===========================================================================
+
+def precompute_thomas(dl, d, du):
+    """Pre-compute Thomas elimination weights from tridiagonal bands.
+
+    The forward elimination depends only on the matrix (not the RHS),
+    so it can be done once at build time. At solve time, only the RHS
+    updates remain.
+
+    Args:
+        dl: (N-1,) lower diagonal (real, float64)
+        d:  (N,)   main diagonal (real, float64)
+        du: (N-1,) upper diagonal (real, float64)
+
+    Returns:
+        w_fwd: (N-1,) forward elimination weights
+        inv_d: (N,)   reciprocal of modified diagonal
+        du:    (N-1,) upper diagonal (unchanged, returned for convenience)
+    """
+    N = d.shape[0]
+    d_mod = d.clone()
+    w_fwd = torch.zeros(N - 1, dtype=d.dtype, device=d.device)
+    for i in range(N - 1):
+        w_fwd[i] = dl[i] / d_mod[i]
+        d_mod[i + 1] -= w_fwd[i] * du[i]
+    inv_d = 1.0 / d_mod
+    return w_fwd, inv_d, du.clone()
+
+
+def batched_thomas_solve(w_fwd_lm, inv_d_lm, du_lm, rhs):
+    """Batched Thomas solve with pre-computed elimination weights.
+
+    Sweeps over N radial points sequentially. At each step, ALL lm modes
+    are processed in parallel via vectorized tensor ops. Supports complex
+    RHS with real weights (PyTorch handles real*complex natively).
+
+    Args:
+        w_fwd_lm: (lm_max, N-1) real — forward elimination weights per lm
+        inv_d_lm: (lm_max, N)   real — reciprocal modified diagonal per lm
+        du_lm:    (lm_max, N-1) real — upper diagonal per lm
+        rhs:      (lm_max, N)   complex — right-hand side (modified in-place)
+
+    Returns:
+        (lm_max, N) complex — solution
+    """
+    rhs = rhs.clone()
+    N = rhs.shape[1]
+
+    # Forward sweep: eliminate lower diagonal
+    for i in range(1, N):
+        rhs[:, i] -= w_fwd_lm[:, i - 1] * rhs[:, i - 1]
+
+    # Backward sweep: solve upper triangular
+    rhs[:, N - 1] *= inv_d_lm[:, N - 1]
+    for i in range(N - 2, -1, -1):
+        rhs[:, i] = (rhs[:, i] - du_lm[:, i] * rhs[:, i + 1]) * inv_d_lm[:, i]
+
+    return rhs
