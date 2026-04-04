@@ -159,10 +159,10 @@ def build_xi_matrices(wimp_lin0: float):
         _xi_inv_by_l = None
         # Expand Thomas weights to per-lm for tridiag FD (kl=ku=1)
         if _xi_kl == 1 and _xi_ku == 1:
-            _xi_thomas_w_fwd = _xi_thomas_w_fwd_by_l[st_lm2l].to(DEVICE)
-            _xi_thomas_inv_d = _xi_thomas_inv_d_by_l[st_lm2l].to(DEVICE)
-            _xi_thomas_du = _xi_thomas_du_by_l[st_lm2l].to(DEVICE)
-            _xi_thomas_fac = fac_all[st_lm2l].to(DEVICE)
+            _xi_thomas_w_fwd = _xi_thomas_w_fwd_by_l[st_lm2l.cpu()].to(DEVICE)
+            _xi_thomas_inv_d = _xi_thomas_inv_d_by_l[st_lm2l.cpu()].to(DEVICE)
+            _xi_thomas_du = _xi_thomas_du_by_l[st_lm2l.cpu()].to(DEVICE)
+            _xi_thomas_fac = fac_all[st_lm2l.cpu()].to(DEVICE)
         else:
             _xi_thomas_w_fwd = None
     else:

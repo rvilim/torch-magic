@@ -256,16 +256,16 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         _j_inv_by_l = None
         if _use_batched_bj:
             # Expand per-l to per-lm for batched solve
-            _b_penta_w1 = b_w1_all[st_lm2l].to(DEVICE)
-            _b_penta_w2 = b_w2_all[st_lm2l].to(DEVICE)
-            _b_penta_inv_d = b_inv_d_all[st_lm2l].to(DEVICE)
-            _b_penta_du1 = b_du1_all[st_lm2l].to(DEVICE)
-            _b_penta_du2 = b_du2_all[st_lm2l].to(DEVICE)
-            _b_penta_fac = b_fac_all[st_lm2l].to(DEVICE)
-            _j_thomas_w_fwd = j_w_all[st_lm2l].to(DEVICE)
-            _j_thomas_inv_d = j_inv_d_all[st_lm2l].to(DEVICE)
-            _j_thomas_du = j_du_all[st_lm2l].to(DEVICE)
-            _j_thomas_fac = j_fac_all[st_lm2l].to(DEVICE)
+            _b_penta_w1 = b_w1_all[st_lm2l.cpu()].to(DEVICE)
+            _b_penta_w2 = b_w2_all[st_lm2l.cpu()].to(DEVICE)
+            _b_penta_inv_d = b_inv_d_all[st_lm2l.cpu()].to(DEVICE)
+            _b_penta_du1 = b_du1_all[st_lm2l.cpu()].to(DEVICE)
+            _b_penta_du2 = b_du2_all[st_lm2l.cpu()].to(DEVICE)
+            _b_penta_fac = b_fac_all[st_lm2l.cpu()].to(DEVICE)
+            _j_thomas_w_fwd = j_w_all[st_lm2l.cpu()].to(DEVICE)
+            _j_thomas_inv_d = j_inv_d_all[st_lm2l.cpu()].to(DEVICE)
+            _j_thomas_du = j_du_all[st_lm2l.cpu()].to(DEVICE)
+            _j_thomas_fac = j_fac_all[st_lm2l.cpu()].to(DEVICE)
         else:
             _b_penta_w1 = None
             _j_thomas_w_fwd = None

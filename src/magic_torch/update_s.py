@@ -169,10 +169,10 @@ def build_s_matrices(wimp_lin0: float):
         _s_inv_by_l = None
         # Pre-compute Thomas weights for tridiag FD (kl=ku=1)
         if _s_kl == 1 and _s_ku == 1:
-            _s_thomas_w_fwd = _s_thomas_w_fwd_by_l[st_lm2l].to(DEVICE)
-            _s_thomas_inv_d = _s_thomas_inv_d_by_l[st_lm2l].to(DEVICE)
-            _s_thomas_du = _s_thomas_du_by_l[st_lm2l].to(DEVICE)
-            _s_thomas_fac = fac_all[st_lm2l].to(DEVICE)
+            _s_thomas_w_fwd = _s_thomas_w_fwd_by_l[st_lm2l.cpu()].to(DEVICE)
+            _s_thomas_inv_d = _s_thomas_inv_d_by_l[st_lm2l.cpu()].to(DEVICE)
+            _s_thomas_du = _s_thomas_du_by_l[st_lm2l.cpu()].to(DEVICE)
+            _s_thomas_fac = fac_all[st_lm2l.cpu()].to(DEVICE)
         else:
             _s_thomas_w_fwd = None
     else:

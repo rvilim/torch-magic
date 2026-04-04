@@ -218,10 +218,10 @@ def build_z_matrices(wimp_lin0: float):
         _z_inv_by_l = None
         # Expand Thomas weights to per-lm for tridiag FD (kl=ku=1)
         if _z_kl == 1 and _z_ku == 1:
-            _z_thomas_w_fwd = _z_thomas_w_fwd_by_l[st_lm2l].to(DEVICE)
-            _z_thomas_inv_d = _z_thomas_inv_d_by_l[st_lm2l].to(DEVICE)
-            _z_thomas_du = _z_thomas_du_by_l[st_lm2l].to(DEVICE)
-            _z_thomas_fac = fac_all[st_lm2l].to(DEVICE)
+            _z_thomas_w_fwd = _z_thomas_w_fwd_by_l[st_lm2l.cpu()].to(DEVICE)
+            _z_thomas_inv_d = _z_thomas_inv_d_by_l[st_lm2l.cpu()].to(DEVICE)
+            _z_thomas_du = _z_thomas_du_by_l[st_lm2l.cpu()].to(DEVICE)
+            _z_thomas_fac = fac_all[st_lm2l.cpu()].to(DEVICE)
         else:
             _z_thomas_w_fwd = None
     else:
