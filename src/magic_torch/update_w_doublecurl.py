@@ -44,14 +44,21 @@ _m0_mask = (st_lm2m == 0)
 
 # Unique inverse per l degree: (l_max+1, N, N) — Chebyshev
 _w_inv_by_l = None
-# Banded LU per l degree — FD
-# FD: banded storage — uses pivoted LU (wMat is not diag dominant)
+# Banded LU per l degree — FD (fallback for non-pentadiag)
 _w_bands_by_l = None
 _w_piv_by_l = None
 _w_fac_row_by_l = None
 _w_fac_col_by_l = None
 _w_kl = 0
 _w_ku = 0
+# Batched pentadiag: precomputed weights per-lm
+_w_penta_w1 = None
+_w_penta_w2 = None
+_w_penta_inv_d = None
+_w_penta_du1 = None
+_w_penta_du2 = None
+_w_penta_fac_row = None
+_w_penta_fac_col = None
 
 
 def build_w_matrices(wimp_lin0: float):
@@ -66,6 +73,8 @@ def build_w_matrices(wimp_lin0: float):
     Must be called whenever dt changes.
     """
     global _w_inv_by_l, _w_bands_by_l, _w_piv_by_l, _w_fac_row_by_l, _w_fac_col_by_l, _w_kl, _w_ku
+    global _w_penta_w1, _w_penta_w2, _w_penta_inv_d, _w_penta_du1, _w_penta_du2
+    global _w_penta_fac_row, _w_penta_fac_col
     from .params import l_finite_diff
     N = n_r_max
 
@@ -107,6 +116,14 @@ def build_w_matrices(wimp_lin0: float):
     w_piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
     w_fac_row_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
     w_fac_col_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+    # Pentadiag precompute storage
+    _use_batched_w = l_finite_diff and _w_kl == 2 and _w_ku == 2 and fd_order <= 2
+    if _use_batched_w:
+        w_pw1_all = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu)
+        w_pw2_all = torch.zeros(l_max + 1, N - 2, dtype=DTYPE, device=cpu)
+        w_pinv_d_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+        w_pdu1_all = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu)
+        w_pdu2_all = torch.zeros(l_max + 1, N - 2, dtype=DTYPE, device=cpu)
     if l_finite_diff:
         # l=0: identity bands
         w_abd_all[0, _w_kl + _w_ku, :] = 1.0
@@ -204,6 +221,20 @@ def build_w_matrices(wimp_lin0: float):
             w_piv_all[l] = piv
             w_fac_row_all[l] = fac_row
             w_fac_col_all[l] = fac_col
+            # Precompute pentadiag weights for batched solve
+            if _w_kl == 2 and _w_ku == 2:
+                from .algebra import precompute_pentadiag
+                dl2 = dat[range(2, N), range(N - 2)]
+                dl1 = dat[range(1, N), range(N - 1)]
+                d_w = dat.diag()
+                du1 = dat[range(N - 1), range(1, N)]
+                du2 = dat[range(N - 2), range(2, N)]
+                pw1, pw2, pinv_d, pdu1, pdu2 = precompute_pentadiag(dl2, dl1, d_w, du1, du2)
+                w_pw1_all[l] = pw1
+                w_pw2_all[l] = pw2
+                w_pinv_d_all[l] = pinv_d
+                w_pdu1_all[l] = pdu1
+                w_pdu2_all[l] = pdu2
         else:
             lu, ip, info = prepare_mat(dat)
             assert info == 0, f"Singular wMat for l={l}, info={info}"
@@ -216,6 +247,17 @@ def build_w_matrices(wimp_lin0: float):
         _w_fac_row_by_l = w_fac_row_all.to(DEVICE)
         _w_fac_col_by_l = w_fac_col_all.to(DEVICE)
         _w_inv_by_l = None
+        if _use_batched_w:
+            _lm2l_cpu = st_lm2l.cpu()
+            _w_penta_w1 = w_pw1_all[_lm2l_cpu].to(DEVICE)
+            _w_penta_w2 = w_pw2_all[_lm2l_cpu].to(DEVICE)
+            _w_penta_inv_d = w_pinv_d_all[_lm2l_cpu].to(DEVICE)
+            _w_penta_du1 = w_pdu1_all[_lm2l_cpu].to(DEVICE)
+            _w_penta_du2 = w_pdu2_all[_lm2l_cpu].to(DEVICE)
+            _w_penta_fac_row = w_fac_row_all[_lm2l_cpu].to(DEVICE)
+            _w_penta_fac_col = w_fac_col_all[_lm2l_cpu].to(DEVICE)
+        else:
+            _w_penta_w1 = None
     else:
         _w_inv_by_l = inv_by_l.to(DEVICE)
         _w_bands_by_l = None
@@ -344,7 +386,18 @@ def updateW(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
     rhs_w[lm0_idx] = 0.0
 
     # 4. Solve
-    if _w_bands_by_l is not None:
+    if _w_penta_w1 is not None:
+        # FD batched pentadiag (no Python loop over l)
+        from .algebra import batched_pentadiag_solve_precomp
+        rhs_precond = _w_penta_fac_row * rhs_w
+        w_phys = batched_pentadiag_solve_precomp(
+            _w_penta_w1, _w_penta_w2, _w_penta_inv_d,
+            _w_penta_du1, _w_penta_du2, rhs_precond)
+        w_phys = _w_penta_fac_col * w_phys  # column post-scaling
+        w_phys[_m0_mask] = w_phys[_m0_mask].real.to(CDTYPE)
+        w_LMloc[:] = w_phys
+    elif _w_bands_by_l is not None:
+        # FD fallback: per-l pivoted banded LU
         from .algebra import banded_solve_by_l
         w_phys = banded_solve_by_l(
             _w_bands_by_l, _w_piv_by_l, st_lm2l, rhs_w,
