@@ -21,7 +21,7 @@ app = modal.App("magic-torch")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("torch", "numpy", "pyyaml")
+    .pip_install("torch", "numpy", "pyyaml", "tensorboard")
     .add_local_dir("src", remote_path="/root/src")
 )
 
@@ -69,6 +69,18 @@ def run_remote(cfg: dict, run_name: str):
         "l_correct_AMe": "MAGIC_L_CORRECT_AME",
         "init_s1": "MAGIC_INIT_S1",
         "amp_s1": "MAGIC_AMP_S1",
+        "prmag": "MAGIC_PRMAG",
+        "radial_scheme": "MAGIC_RADIAL_SCHEME",
+        "fd_order": "MAGIC_FD_ORDER",
+        "fd_order_bound": "MAGIC_FD_ORDER_BOUND",
+        "fd_stretch": "MAGIC_FD_STRETCH",
+        "fd_ratio": "MAGIC_FD_RATIO",
+        "radratio": "MAGIC_RADRATIO",
+        "ktops": "MAGIC_KTOPS",
+        "kbots": "MAGIC_KBOTS",
+        "ktopxi": "MAGIC_KTOPXI",
+        "kbotxi": "MAGIC_KBOTXI",
+        "intfac": "MAGIC_INTFAC",
     }
     for key, env_var in _CFG_TO_ENV.items():
         if key in cfg:
