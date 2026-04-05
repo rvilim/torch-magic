@@ -82,11 +82,21 @@ def run_benchmark(lmax: int, steps: int):
                 return orig(*a, **kw)
         setattr(mod, funcname, timed)
 
+    # Wrap on both the source module AND step_time's reference
     _wrap(update_s, "updateS", "updateS")
     _wrap(update_z, "updateZ", "updateZ")
     _wrap(update_b, "updateB", "updateB")
     if update_w_doublecurl:
         _wrap(update_w_doublecurl, "updateW", "updateW")
+    # Patch step_time's resolved references too
+    if hasattr(step_time, 'updateS'):
+        step_time.updateS = update_s.updateS
+    if hasattr(step_time, 'updateZ'):
+        step_time.updateZ = update_z.updateZ
+    if hasattr(step_time, 'updateB'):
+        step_time.updateB = update_b.updateB
+    if update_w_doublecurl and hasattr(step_time, 'updateW'):
+        step_time.updateW = update_w_doublecurl.updateW
 
     _orig_rl = step_time.radial_loop
     _orig_lm = step_time.lm_loop
@@ -104,18 +114,31 @@ def run_benchmark(lmax: int, steps: int):
                "torpol_to_curl_spat", "pol_to_grad_spat"]:
         if hasattr(_sht, fn):
             _wrap(_sht, fn, f"sht.{fn}")
+            # Also patch step_time's reference
+            if hasattr(step_time, fn):
+                setattr(step_time, fn, getattr(_sht, fn))
 
     from magic_torch import get_nl as _gnl
     _wrap(_gnl, "get_nl", "get_nl")
+    if hasattr(step_time, 'get_nl'):
+        step_time.get_nl = _gnl.get_nl
 
     from magic_torch import get_td as _gtd
     for fn in ["get_dwdt", "get_dwdt_double_curl", "get_dzdt", "get_dsdt", "get_dbdt"]:
         if hasattr(_gtd, fn):
             _wrap(_gtd, fn, f"td.{fn}")
+            if hasattr(step_time, fn):
+                setattr(step_time, fn, getattr(_gtd, fn))
     _wrap(update_s, "finish_exp_entropy", "finish_exp_s")
+    if hasattr(step_time, 'finish_exp_entropy'):
+        step_time.finish_exp_entropy = update_s.finish_exp_entropy
     _wrap(update_b, "finish_exp_mag", "finish_exp_mag")
+    if hasattr(step_time, 'finish_exp_mag'):
+        step_time.finish_exp_mag = update_b.finish_exp_mag
     from magic_torch import courant as _crt
     _wrap(_crt, "courant_check", "courant_check")
+    if hasattr(step_time, 'courant_check'):
+        step_time.courant_check = _crt.courant_check
 
     print(f"Profiling FD: device=cuda, l_max={lmax}, N={2*lmax+1}, steps={steps}")
     print()
