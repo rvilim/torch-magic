@@ -555,6 +555,7 @@ def run(cfg=None):
             tb_writer.add_scalar('energy/mag_tor', e_mag_tor, step)
             tb_writer.add_scalar('energy/kin_total', e_kin_pol + e_kin_tor, step)
             tb_writer.add_scalar('energy/mag_total', e_mag_pol + e_mag_tor, step)
+            tb_writer.add_scalar('perf/ms_per_step', ms, step)
 
             # Write Fortran-format energy files
             t_out = sim_time * tScale
