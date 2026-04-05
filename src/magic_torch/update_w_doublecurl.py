@@ -26,7 +26,7 @@ from .radial_functions import (
 from .horizontal_data import dLh, hdif_V
 from .pre_calculations import BuoFac, ChemFac
 from .blocking import st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex
+from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex, chunked_lu_solve_complex
 from .radial_derivatives import get_dr, get_ddr, get_dddr
 
 # --- Precompute broadcast arrays ---
@@ -51,6 +51,11 @@ _w_fac_row_by_l = None
 _w_fac_col_by_l = None
 _w_kl = 0
 _w_ku = 0
+# Dense LU factors per l degree — FD with N <= 1024
+_w_lu_by_l = None
+_w_pivots_by_l = None
+_w_lu_fac_row_by_l = None
+_w_lu_fac_col_by_l = None
 # Batched pentadiag: precomputed weights per-lm
 _w_penta_w1 = None
 _w_penta_w2 = None
@@ -73,6 +78,7 @@ def build_w_matrices(wimp_lin0: float):
     Must be called whenever dt changes.
     """
     global _w_inv_by_l, _w_bands_by_l, _w_piv_by_l, _w_fac_row_by_l, _w_fac_col_by_l, _w_kl, _w_ku
+    global _w_lu_by_l, _w_pivots_by_l, _w_lu_fac_row_by_l, _w_lu_fac_col_by_l
     global _w_penta_w1, _w_penta_w2, _w_penta_inv_d, _w_penta_du1, _w_penta_du2
     global _w_penta_fac_row, _w_penta_fac_col
     from .params import l_finite_diff
@@ -116,8 +122,13 @@ def build_w_matrices(wimp_lin0: float):
     w_piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
     w_fac_row_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
     w_fac_col_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
+    # Dense LU storage for N <= 1024 (4th-order operator, use LU solve not inverse)
+    _use_dense_lu_w = l_finite_diff and N <= 1024
+    if _use_dense_lu_w:
+        lu_by_l = torch.eye(N, dtype=DTYPE, device=cpu).unsqueeze(0).expand(l_max + 1, -1, -1).clone()
+        pivots_by_l = torch.arange(1, N + 1, dtype=torch.int32, device=cpu).unsqueeze(0).expand(l_max + 1, -1).clone()
     # Pentadiag precompute storage
-    _use_batched_w = l_finite_diff and _w_kl == 2 and _w_ku == 2 and fd_order <= 2
+    _use_batched_w = l_finite_diff and _w_kl == 2 and _w_ku == 2 and fd_order <= 2 and not _use_dense_lu_w
     if _use_batched_w:
         w_pw1_all = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu)
         w_pw2_all = torch.zeros(l_max + 1, N - 2, dtype=DTYPE, device=cpu)
@@ -212,7 +223,16 @@ def build_w_matrices(wimp_lin0: float):
         fac_col = 1.0 / dat.abs().max(dim=0).values
         dat = dat * fac_col.unsqueeze(0)
 
-        if l_finite_diff:
+        if _use_dense_lu_w:
+            # Dense LU factorization for GPU — batched LU solve (not inverse,
+            # because the 4th-order double-curl operator can be ill-conditioned)
+            lu_f, piv = torch.linalg.lu_factor(dat)
+            lu_by_l[l] = lu_f
+            pivots_by_l[l] = piv
+            w_fac_row_all[l] = fac_row
+            w_fac_col_all[l] = fac_col
+        elif l_finite_diff:
+            # Banded + pentadiag for large N (N > 1024)
             from .algebra import dense_to_band_storage, prepare_band
             abd = dense_to_band_storage(dat, _w_kl, _w_ku)
             abd_f, piv, info = prepare_band(abd, N, _w_kl, _w_ku)
@@ -241,7 +261,18 @@ def build_w_matrices(wimp_lin0: float):
             inv_precond = solve_mat_real(lu, ip, eye)
             inv_by_l[l] = fac_col.unsqueeze(1) * inv_precond * fac_row.unsqueeze(0)
 
-    if l_finite_diff:
+    if _use_dense_lu_w:
+        # Dense LU path for GPU
+        _w_lu_by_l = lu_by_l.to(DEVICE)
+        _w_pivots_by_l = pivots_by_l.to(DEVICE)
+        _w_lu_fac_row_by_l = w_fac_row_all.to(DEVICE)
+        _w_lu_fac_col_by_l = w_fac_col_all.to(DEVICE)
+        _w_bands_by_l = None
+        _w_penta_w1 = None
+        _w_inv_by_l = None
+    elif l_finite_diff:
+        # Banded + pentadiag path for large N
+        _w_lu_by_l = None
         _w_bands_by_l = w_abd_all.to(DEVICE)
         _w_piv_by_l = w_piv_all.to(DEVICE)
         _w_fac_row_by_l = w_fac_row_all.to(DEVICE)
@@ -259,6 +290,8 @@ def build_w_matrices(wimp_lin0: float):
         else:
             _w_penta_w1 = None
     else:
+        # Chebyshev path
+        _w_lu_by_l = None
         _w_inv_by_l = inv_by_l.to(DEVICE)
         _w_bands_by_l = None
 
@@ -386,7 +419,16 @@ def updateW(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
     rhs_w[lm0_idx] = 0.0
 
     # 4. Solve
-    if _w_penta_w1 is not None:
+    if _w_lu_by_l is not None:
+        # FD dense LU solve (N <= 1024) — batched LU solve preserves accuracy
+        sol = chunked_lu_solve_complex(
+            _w_lu_by_l, _w_pivots_by_l,
+            _w_lu_fac_row_by_l, _w_lu_fac_col_by_l,
+            st_lm2l, rhs_w)
+        sol[lm0_idx] = 0.0
+        sol[_m0_mask] = sol[_m0_mask].real.to(CDTYPE)
+        w_LMloc[:] = sol
+    elif _w_penta_w1 is not None:
         # FD batched pentadiag (no Python loop over l)
         from .algebra import batched_pentadiag_solve_precomp
         rhs_precond = _w_penta_fac_row * rhs_w

@@ -180,7 +180,14 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         fac_b = 1.0 / dat_b.abs().max(dim=1).values
         dat_b_precond = fac_b.unsqueeze(1) * dat_b
 
-        if l_finite_diff:
+        if l_finite_diff and N <= 1024:
+            # Dense inverse for GPU — single batched bmm instead of sequential sweeps
+            lu_b, ip_b, info_b = prepare_mat(dat_b_precond)
+            assert info_b == 0, f"Singular bMat for l={l}, info={info_b}"
+            b_inv_precond = solve_mat_real(lu_b, ip_b, eye)
+            b_inv_by_l[l] = b_inv_precond * fac_b.unsqueeze(0)
+        elif l_finite_diff:
+            # Banded + pentadiag/Thomas for large N (N > 1024)
             from .algebra import dense_to_band_storage, prepare_band
             abd = dense_to_band_storage(dat_b_precond, _bj_kl, _bj_ku)
             abd_f, piv, info_b = prepare_band(abd, N, _bj_kl, _bj_ku)
@@ -224,7 +231,14 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         fac_j = 1.0 / dat_j.abs().max(dim=1).values
         dat_j_precond = fac_j.unsqueeze(1) * dat_j
 
-        if l_finite_diff:
+        if l_finite_diff and N <= 1024:
+            # Dense inverse for GPU
+            lu_j, ip_j, info_j = prepare_mat(dat_j_precond)
+            assert info_j == 0, f"Singular jMat for l={l}, info={info_j}"
+            j_inv_precond = solve_mat_real(lu_j, ip_j, eye)
+            j_inv_by_l[l] = j_inv_precond * fac_j.unsqueeze(0)
+        elif l_finite_diff:
+            # Banded + Thomas for large N (N > 1024)
             abd = dense_to_band_storage(dat_j_precond, _bj_kl, _bj_ku)
             abd_f, piv, info_j = prepare_band(abd, N, _bj_kl, _bj_ku)
             assert info_j == 0, f"Singular jMat (band) for l={l}, info={info_j}"
@@ -245,7 +259,16 @@ def _build_b_matrices_insulating(wimp_lin0: float):
             j_inv_precond = solve_mat_real(lu_j, ip_j, eye)
             j_inv_by_l[l] = j_inv_precond * fac_j.unsqueeze(0)
 
-    if l_finite_diff:
+    if l_finite_diff and N <= 1024:
+        # Dense inverse path for GPU
+        _b_inv_by_l = b_inv_by_l.to(DEVICE)
+        _j_inv_by_l = j_inv_by_l.to(DEVICE)
+        _b_bands_by_l = None
+        _j_bands_by_l = None
+        _b_penta_w1 = None
+        _j_thomas_w_fwd = None
+    elif l_finite_diff:
+        # Banded + pentadiag/Thomas path for large N
         _b_bands_by_l = b_abd_all.to(DEVICE)
         _b_piv_by_l = b_piv_all.to(DEVICE)
         _b_fac_by_l = b_fac_all.to(DEVICE)
@@ -270,6 +293,7 @@ def _build_b_matrices_insulating(wimp_lin0: float):
             _b_penta_w1 = None
             _j_thomas_w_fwd = None
     else:
+        # Chebyshev path
         _b_inv_by_l = b_inv_by_l.to(DEVICE)
         _j_inv_by_l = j_inv_by_l.to(DEVICE)
         _b_bands_by_l = None

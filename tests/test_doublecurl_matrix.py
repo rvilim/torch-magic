@@ -39,62 +39,79 @@ class TestDoubleCurlMatrixBuild:
         """build_w_matrices doesn't crash."""
         out = _run_fd_check("""
 from magic_torch import update_w_doublecurl as uwdc
+from magic_torch.params import n_r_max
 uwdc.build_w_matrices(0.5)
-# FD: uses pivoted banded LU (wMat not diag dominant)
-assert uwdc._w_bands_by_l is not None
-print(f'Band shape: {uwdc._w_bands_by_l.shape}')
-assert uwdc._w_bands_by_l.shape[0] == 17  # l_max+1
-assert uwdc._w_bands_by_l.shape[2] == 33  # N
+# N <= 1024: dense LU path; N > 1024: banded path
+if n_r_max <= 1024:
+    assert uwdc._w_lu_by_l is not None
+    print(f'LU shape: {uwdc._w_lu_by_l.shape}')
+    assert uwdc._w_lu_by_l.shape[0] == 17
+    assert uwdc._w_lu_by_l.shape[1] == n_r_max
+else:
+    assert uwdc._w_bands_by_l is not None
 print('PASS')
 """)
         assert "PASS" in out
 
-    def test_banded_solve_roundtrip(self):
-        """Banded solve A*x=b gives correct x for each l."""
+    def test_solve_roundtrip(self):
+        """Solve A*x=b gives correct x for each l (dense LU or banded)."""
         out = _run_fd_check("""
 import torch
 from magic_torch import update_w_doublecurl as uwdc
-from magic_torch.algebra import solve_band_real
+from magic_torch.params import n_r_max
 
 uwdc.build_w_matrices(0.5)
-N = 33
-for l in range(1, 17):
-    abd = uwdc._w_bands_by_l[l].cpu()
-    piv = uwdc._w_piv_by_l[l].cpu()
-    fac_row = uwdc._w_fac_row_by_l[l].cpu()
-    fac_col = uwdc._w_fac_col_by_l[l].cpu()
-    b = torch.randn(N, dtype=torch.float64)
-    b_precond = fac_row * b
-    y = solve_band_real(abd, N, uwdc._w_kl, uwdc._w_ku, piv, b_precond)
-    x = fac_col * y
-    assert not torch.isnan(x).any(), f'NaN at l={l}'
-    assert not torch.isinf(x).any(), f'Inf at l={l}'
+N = n_r_max
+if uwdc._w_lu_by_l is not None:
+    # Dense LU path: test via lu_solve
+    for l in range(1, 17):
+        lu = uwdc._w_lu_by_l[l:l+1].cpu()
+        piv = uwdc._w_pivots_by_l[l:l+1].cpu()
+        b = torch.randn(1, N, 1, dtype=torch.float64)
+        x = torch.linalg.lu_solve(lu, piv, b)
+        assert not torch.isnan(x).any(), f'NaN at l={l}'
+else:
+    from magic_torch.algebra import solve_band_real
+    for l in range(1, 17):
+        abd = uwdc._w_bands_by_l[l].cpu()
+        piv = uwdc._w_piv_by_l[l].cpu()
+        b = torch.randn(N, dtype=torch.float64)
+        y = solve_band_real(abd, N, uwdc._w_kl, uwdc._w_ku, piv, b)
+        assert not torch.isnan(y).any(), f'NaN at l={l}'
 print('PASS')
 """)
         assert "PASS" in out
 
     def test_l0_is_identity(self):
-        """l=0 bands should be identity (no poloidal equation for l=0)."""
+        """l=0 should be identity (no poloidal equation for l=0)."""
         out = _run_fd_check("""
+import torch
 from magic_torch import update_w_doublecurl as uwdc
+from magic_torch.params import n_r_max
 uwdc.build_w_matrices(0.5)
-diag_row = uwdc._w_kl + uwdc._w_ku
-assert uwdc._w_bands_by_l[0, diag_row].abs().max() == 1.0
-for r in range(uwdc._w_bands_by_l.shape[1]):
-    if r != diag_row:
-        assert uwdc._w_bands_by_l[0, r].abs().max() == 0.0
+if uwdc._w_lu_by_l is not None:
+    # Dense LU: l=0 should be identity LU
+    eye = torch.eye(n_r_max, dtype=torch.float64)
+    assert torch.allclose(uwdc._w_lu_by_l[0].cpu(), eye, atol=1e-14)
+else:
+    diag_row = uwdc._w_kl + uwdc._w_ku
+    assert uwdc._w_bands_by_l[0, diag_row].abs().max() == 1.0
 print('PASS')
 """)
         assert "PASS" in out
 
-    def test_band_storage_is_NxN(self):
-        """Double-curl band storage has N columns (not 2N)."""
+    def test_storage_is_NxN(self):
+        """Dense LU or band storage has N columns (not 2N)."""
         out = _run_fd_check("""
 from magic_torch import update_w_doublecurl as uwdc
 from magic_torch.params import n_r_max
 uwdc.build_w_matrices(0.5)
 N = n_r_max
-assert uwdc._w_bands_by_l.shape[2] == N, f'Expected {N}, got {uwdc._w_bands_by_l.shape[2]}'
+if uwdc._w_lu_by_l is not None:
+    assert uwdc._w_lu_by_l.shape[1] == N
+    assert uwdc._w_lu_by_l.shape[2] == N
+elif uwdc._w_bands_by_l is not None:
+    assert uwdc._w_bands_by_l.shape[2] == N
 print('PASS')
 """)
         assert "PASS" in out

@@ -138,7 +138,14 @@ def build_s_matrices(wimp_lin0: float):
         fac = 1.0 / dat.abs().max(dim=1).values
         dat_precond = fac.unsqueeze(1) * dat
 
-        if l_finite_diff:
+        if l_finite_diff and N <= 1024:
+            # Dense inverse for GPU — single batched bmm instead of sequential sweeps
+            lu, ip, info = prepare_mat(dat_precond)
+            assert info == 0, f"Singular sMat for l={l}, info={info}"
+            inv_precond = solve_mat_real(lu, ip, eye)
+            inv_by_l[l] = inv_precond * fac.unsqueeze(0)
+        elif l_finite_diff:
+            # Banded + Thomas for large N (N > 1024)
             from .algebra import dense_to_band_storage, prepare_band
             abd = dense_to_band_storage(dat_precond, _s_kl, _s_ku)
             abd_f, piv, info = prepare_band(abd, N, _s_kl, _s_ku)
@@ -146,7 +153,6 @@ def build_s_matrices(wimp_lin0: float):
             abd_all[l] = abd_f
             piv_all[l] = piv
             fac_all[l] = fac
-            # Pre-compute Thomas weights from the preconditioned dense matrix
             if _s_thomas_w_fwd_by_l is not None:
                 from .algebra import precompute_thomas
                 dl_l = dat_precond[range(1, N), range(N - 1)]
@@ -162,12 +168,17 @@ def build_s_matrices(wimp_lin0: float):
             inv_precond = solve_mat_real(lu, ip, eye)
             inv_by_l[l] = inv_precond * fac.unsqueeze(0)
 
-    if l_finite_diff:
+    if l_finite_diff and N <= 1024:
+        # Dense inverse path for GPU
+        _s_inv_by_l = inv_by_l.to(DEVICE)
+        _s_bands_by_l = None
+        _s_thomas_w_fwd = None
+    elif l_finite_diff:
+        # Banded + Thomas path for large N
         _s_bands_by_l = abd_all.to(DEVICE)
         _s_piv_by_l = piv_all.to(DEVICE)
         _s_fac_by_l = fac_all.to(DEVICE)
         _s_inv_by_l = None
-        # Pre-compute Thomas weights for tridiag FD (kl=ku=1)
         if _s_kl == 1 and _s_ku == 1:
             _s_thomas_w_fwd = _s_thomas_w_fwd_by_l[st_lm2l.cpu()].to(DEVICE)
             _s_thomas_inv_d = _s_thomas_inv_d_by_l[st_lm2l.cpu()].to(DEVICE)
@@ -176,6 +187,7 @@ def build_s_matrices(wimp_lin0: float):
         else:
             _s_thomas_w_fwd = None
     else:
+        # Chebyshev path
         _s_inv_by_l = inv_by_l.to(DEVICE)
         _s_bands_by_l = None
 

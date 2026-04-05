@@ -187,7 +187,14 @@ def build_z_matrices(wimp_lin0: float):
         fac = 1.0 / dat.abs().max(dim=1).values
         dat_precond = fac.unsqueeze(1) * dat
 
-        if l_finite_diff:
+        if l_finite_diff and N <= 1024:
+            # Dense inverse for GPU — single batched bmm instead of sequential sweeps
+            lu, ip, info = prepare_mat(dat_precond)
+            assert info == 0, f"Singular zMat for l={l}, info={info}"
+            inv_precond = solve_mat_real(lu, ip, eye)
+            inv_by_l[l] = inv_precond * fac.unsqueeze(0)
+        elif l_finite_diff:
+            # Banded + Thomas for large N (N > 1024)
             from .algebra import dense_to_band_storage, prepare_band
             abd = dense_to_band_storage(dat_precond, _z_kl, _z_ku)
             abd_f, piv, info = prepare_band(abd, N, _z_kl, _z_ku)
@@ -211,7 +218,13 @@ def build_z_matrices(wimp_lin0: float):
             inv_precond = solve_mat_real(lu, ip, eye)
             inv_by_l[l] = inv_precond * fac.unsqueeze(0)
 
-    if l_finite_diff:
+    if l_finite_diff and N <= 1024:
+        # Dense inverse path for GPU (l=0 stays zero in inv_by_l → zero output)
+        _z_inv_by_l = inv_by_l.to(DEVICE)
+        _z_bands_by_l = None
+        _z_thomas_w_fwd = None
+    elif l_finite_diff:
+        # Banded + Thomas path for large N
         _z_bands_by_l = abd_all.to(DEVICE)
         _z_piv_by_l = piv_all.to(DEVICE)
         _z_fac_by_l = fac_all.to(DEVICE)
@@ -225,6 +238,7 @@ def build_z_matrices(wimp_lin0: float):
         else:
             _z_thomas_w_fwd = None
     else:
+        # Chebyshev path
         _z_inv_by_l = inv_by_l.to(DEVICE)
         _z_bands_by_l = None
 
