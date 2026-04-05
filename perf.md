@@ -227,3 +227,37 @@ Energy validation (300 steps at l=143, compared to Fortran reference.out):
 - e_kin_pol max rel err: 4.1e-9
 - e_kin_tor max rel err: 4.6e-9
 - Agreement to ~9 significant digits over 300 steps
+
+### H100 CUDA dense solver optimization (2026-04-05)
+
+Eliminated sequential kernel launches in FD solvers on CUDA GPU (N ≤ 1024).
+
+**Problem**: At l_max=64, N=129 on H100, lm_loop was 77ms/step (92% of total 84ms).
+Sequential Thomas/pentadiag sweeps launched one kernel per radial point, starving the GPU.
+
+**Three fixes**:
+1. **Dense inverse for s/z/xi/b solvers**: precompute `A^{-1}` at build time, use
+   `chunked_solve_complex` (single batched bmm) instead of sequential Thomas/pentadiag.
+   Condition numbers ~O(N²) — safe for inverse up to N=1024.
+2. **Dense inverse for w (double-curl) solver**: same approach. Despite 4th-order operator,
+   condition numbers are at most ~7e9 at N=1024 (still ~6 digits in float64).
+   Previous LU factorization approach was 14ms on H100 vs 0.12ms with inverse.
+3. **p0Mat dense inverse**: the l=0 pressure tridiagonal solver used `solve_tridiag_real`
+   with a Python for-loop and `.item()` calls — each `.item()` forces a CPU-GPU sync (~100μs).
+   129 syncs × 100μs = 13ms. Fixed by precomputing p0Mat inverse on GPU.
+
+| Component | Before | After | Speedup |
+|-----------|--------|-------|---------|
+| lm_loop | 77ms | 4.4ms | 17.5× |
+| updateW | 18ms | 1.9ms | 9.5× |
+| updateS | 0.8ms | 0.7ms | — |
+| updateZ | 0.7ms | 0.6ms | — |
+| updateB | 1.4ms | 1.2ms | — |
+| radial_loop | 5.7ms | 5.2ms | — |
+| **Total step** | **84ms** | **9.9ms** | **8.5×** |
+
+Bottleneck shifted: lm_loop (92% → 45%), radial_loop (7% → 53%).
+Radial loop now dominated by SHT matmuls (torpol_to_spat 1.4ms, spat_to_sphertor 1.1ms).
+
+Memory: ~43MB for 5 solver inverses at N=129 (65×129×129 float64 each).
+Gate: N ≤ 1024. For N > 1024, falls back to batched Thomas/pentadiag.

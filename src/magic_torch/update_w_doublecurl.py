@@ -26,7 +26,7 @@ from .radial_functions import (
 from .horizontal_data import dLh, hdif_V
 from .pre_calculations import BuoFac, ChemFac
 from .blocking import st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex, chunked_lu_solve_complex
+from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex
 from .radial_derivatives import get_dr, get_ddr, get_dddr
 
 # --- Precompute broadcast arrays ---
@@ -41,6 +41,7 @@ _rho0_r = rho0.unsqueeze(0).to(CDTYPE)           # (1, n_r_max)
 _hdif_lm = hdif_V[st_lm2l].to(CDTYPE).unsqueeze(1)  # (lm_max, 1)
 
 _m0_mask = (st_lm2m == 0)
+_l0_mask = (st_lm2l == 0)
 
 # Unique inverse per l degree: (l_max+1, N, N) — Chebyshev
 _w_inv_by_l = None
@@ -51,11 +52,8 @@ _w_fac_row_by_l = None
 _w_fac_col_by_l = None
 _w_kl = 0
 _w_ku = 0
-# Dense LU factors per l degree — FD with N <= 1024
-_w_lu_by_l = None
-_w_pivots_by_l = None
-_w_lu_fac_row_by_l = None
-_w_lu_fac_col_by_l = None
+# Dense inverse per l degree — FD with N <= 1024
+_w_dense_inv_by_l = None
 # Batched pentadiag: precomputed weights per-lm
 _w_penta_w1 = None
 _w_penta_w2 = None
@@ -78,7 +76,7 @@ def build_w_matrices(wimp_lin0: float):
     Must be called whenever dt changes.
     """
     global _w_inv_by_l, _w_bands_by_l, _w_piv_by_l, _w_fac_row_by_l, _w_fac_col_by_l, _w_kl, _w_ku
-    global _w_lu_by_l, _w_pivots_by_l, _w_lu_fac_row_by_l, _w_lu_fac_col_by_l
+    global _w_dense_inv_by_l
     global _w_penta_w1, _w_penta_w2, _w_penta_inv_d, _w_penta_du1, _w_penta_du2
     global _w_penta_fac_row, _w_penta_fac_col
     from .params import l_finite_diff
@@ -122,13 +120,13 @@ def build_w_matrices(wimp_lin0: float):
     w_piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
     w_fac_row_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
     w_fac_col_all = torch.ones(l_max + 1, N, dtype=DTYPE, device=cpu)
-    # Dense LU storage for N <= 1024 (4th-order operator, use LU solve not inverse)
-    _use_dense_lu_w = l_finite_diff and N <= 1024
-    if _use_dense_lu_w:
-        lu_by_l = torch.eye(N, dtype=DTYPE, device=cpu).unsqueeze(0).expand(l_max + 1, -1, -1).clone()
-        pivots_by_l = torch.arange(1, N + 1, dtype=torch.int32, device=cpu).unsqueeze(0).expand(l_max + 1, -1).clone()
+    # Dense inverse for N <= 1024 — condition numbers are safe
+    # (max ~7e9 at N=1024, giving ~6 digits in float64)
+    _use_dense_inv_w = l_finite_diff and N <= 1024 and fd_order <= 2
+    if _use_dense_inv_w:
+        dense_inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
     # Pentadiag precompute storage
-    _use_batched_w = l_finite_diff and _w_kl == 2 and _w_ku == 2 and fd_order <= 2 and not _use_dense_lu_w
+    _use_batched_w = l_finite_diff and _w_kl == 2 and _w_ku == 2 and fd_order <= 2 and not _use_dense_inv_w
     if _use_batched_w:
         w_pw1_all = torch.zeros(l_max + 1, N - 1, dtype=DTYPE, device=cpu)
         w_pw2_all = torch.zeros(l_max + 1, N - 2, dtype=DTYPE, device=cpu)
@@ -140,52 +138,65 @@ def build_w_matrices(wimp_lin0: float):
         w_abd_all[0, _w_kl + _w_ku, :] = 1.0
         w_piv_all[0] = torch.arange(1, N + 1, dtype=torch.long)
 
+    # Precompute bulk-range (2..N-3) radial profile vectors for vectorized build
+    b = slice(2, N - 2)
+    _or1_b = _or1[b]           # (Nb,)
+    _or2_b = _or2[b]           # (Nb,)
+    _beta_b = _beta[b]
+    _dbeta_b = _dbeta[b]
+    _ddbeta_b = _ddbeta[b]
+    _visc_b = _visc[b]
+    _dLvisc_b = _dLvisc[b]
+    _ddLvisc_b = _ddLvisc[b]
+    _orho1_b = _orho1[b]
+    # l-independent parts of c0-c3 (terms that don't involve dL)
+    _c3_base = 2.0 * (_dLvisc_b - _beta_b)  # (Nb,)
+    _c2_nodL = (_ddLvisc_b - 2.0 * _dbeta_b
+                + _dLvisc_b ** 2 + _beta_b ** 2
+                - 3.0 * _dLvisc_b * _beta_b
+                - 2.0 * _or1_b * (_dLvisc_b + _beta_b))  # (Nb,)
+    _c1_nodL = (-_ddbeta_b
+                - _dbeta_b * (2.0 * _dLvisc_b - _beta_b + 2.0 * _or1_b)
+                - _ddLvisc_b * (_beta_b + 2.0 * _or1_b)
+                + _beta_b ** 2 * (_dLvisc_b + 2.0 * _or1_b)
+                - _beta_b * (_dLvisc_b ** 2 - 2.0 * _or2_b)
+                - 2.0 * _dLvisc_b * _or1_b * (_dLvisc_b - _or1_b))  # (Nb,)
+    _c0_nodL = (2.0 * _dbeta_b + _ddLvisc_b
+                + _dLvisc_b ** 2 - (2.0 / 3.0) * _beta_b ** 2
+                + _dLvisc_b * _beta_b
+                + 2.0 * _or1_b * (2.0 * _dLvisc_b - _beta_b - 3.0 * _or1_b))  # (Nb,)
+    _c1_dL_coeff = 2.0 * (2.0 * _or1_b + _beta_b - _dLvisc_b) * _or2_b  # (Nb,)
+
     for l in range(1, l_max + 1):
         dL = float(l * (l + 1))
         hdif_l = hdif_V[l].item()
 
         dat = torch.zeros(N, N, dtype=DTYPE, device=cpu)
 
-        # Bulk rows (nR=2..N-3 in 0-based, Fortran nR=3..n_r_max-2)
-        for nR in range(2, N - 2):
-            # "old" part: -dLh*or2*orho1*(d2 - beta*d - dLh*or2) at row nR
-            old_part = -dL * _or2[nR] * _orho1[nR] * (
-                _d2rMat[nR, :]
-                - _beta[nR] * _drMat[nR, :]
-                - dL * _or2[nR] * _rMat[nR, :]
-            )
+        # Bulk rows — vectorized over nR (no Python loop)
+        # "old" part: -dL*or2*orho1*(d2 - beta*d - dL*or2*I)
+        old_coeff = (-dL * _or2_b * _orho1_b).unsqueeze(1)  # (Nb, 1)
+        old_rows = old_coeff * (
+            _d2rMat[b] - _beta_b.unsqueeze(1) * _drMat[b]
+            - dL * _or2_b.unsqueeze(1) * _rMat[b]
+        )  # (Nb, N)
 
-            # Implicit diffusion coefficients
-            c3 = 2.0 * (_dLvisc[nR] - _beta[nR])
-            c2 = (_ddLvisc[nR] - 2.0 * _dbeta[nR]
-                  + _dLvisc[nR] ** 2 + _beta[nR] ** 2
-                  - 3.0 * _dLvisc[nR] * _beta[nR]
-                  - 2.0 * _or1[nR] * (_dLvisc[nR] + _beta[nR])
-                  - 2.0 * dL * _or2[nR])
-            c1 = (-_ddbeta[nR]
-                  - _dbeta[nR] * (2.0 * _dLvisc[nR] - _beta[nR] + 2.0 * _or1[nR])
-                  - _ddLvisc[nR] * (_beta[nR] + 2.0 * _or1[nR])
-                  + _beta[nR] ** 2 * (_dLvisc[nR] + 2.0 * _or1[nR])
-                  - _beta[nR] * (_dLvisc[nR] ** 2 - 2.0 * _or2[nR])
-                  - 2.0 * _dLvisc[nR] * _or1[nR] * (_dLvisc[nR] - _or1[nR])
-                  + 2.0 * (2.0 * _or1[nR] + _beta[nR] - _dLvisc[nR]) * dL * _or2[nR])
-            c0 = dL * _or2[nR] * (
-                2.0 * _dbeta[nR] + _ddLvisc[nR]
-                + _dLvisc[nR] ** 2 - (2.0 / 3.0) * _beta[nR] ** 2
-                + _dLvisc[nR] * _beta[nR]
-                + 2.0 * _or1[nR] * (2.0 * _dLvisc[nR] - _beta[nR] - 3.0 * _or1[nR])
-                + dL * _or2[nR]
-            )
+        # Diffusion coefficients (vectorized)
+        c3 = _c3_base                                    # (Nb,)
+        c2 = _c2_nodL - 2.0 * dL * _or2_b               # (Nb,)
+        c1 = _c1_nodL + dL * _c1_dL_coeff                # (Nb,)
+        c0 = dL * _or2_b * (_c0_nodL + dL * _or2_b)      # (Nb,)
 
-            impl_part = _orho1[nR] * hdif_l * _visc[nR] * dL * _or2[nR] * (
-                _d4rMat[nR, :]
-                + c3 * _d3rMat[nR, :]
-                + c2 * _d2rMat[nR, :]
-                + c1 * _drMat[nR, :]
-                + c0 * _rMat[nR, :]
-            )
+        impl_coeff = (_orho1_b * hdif_l * _visc_b * dL * _or2_b).unsqueeze(1)  # (Nb, 1)
+        impl_rows = impl_coeff * (
+            _d4rMat[b]
+            + c3.unsqueeze(1) * _d3rMat[b]
+            + c2.unsqueeze(1) * _d2rMat[b]
+            + c1.unsqueeze(1) * _drMat[b]
+            + c0.unsqueeze(1) * _rMat[b]
+        )  # (Nb, N)
 
-            dat[nR, :] = _rnorm * (old_part + wimp_lin0 * impl_part)
+        dat[b] = _rnorm * (old_rows + wimp_lin0 * impl_rows)
 
         # Boundary conditions
         # Row 0: w=0 at CMB
@@ -223,12 +234,9 @@ def build_w_matrices(wimp_lin0: float):
         fac_col = 1.0 / dat.abs().max(dim=0).values
         dat = dat * fac_col.unsqueeze(0)
 
-        if _use_dense_lu_w:
-            # Dense LU factorization for GPU — batched LU solve (not inverse,
-            # because the 4th-order double-curl operator can be ill-conditioned)
-            lu_f, piv = torch.linalg.lu_factor(dat)
-            lu_by_l[l] = lu_f
-            pivots_by_l[l] = piv
+        if _use_dense_inv_w:
+            # Store preconditioned matrix; batch-invert after loop
+            dense_inv_by_l[l] = dat
             w_fac_row_all[l] = fac_row
             w_fac_col_all[l] = fac_col
         elif l_finite_diff:
@@ -261,18 +269,21 @@ def build_w_matrices(wimp_lin0: float):
             inv_precond = solve_mat_real(lu, ip, eye)
             inv_by_l[l] = fac_col.unsqueeze(1) * inv_precond * fac_row.unsqueeze(0)
 
-    if _use_dense_lu_w:
-        # Dense LU path for GPU
-        _w_lu_by_l = lu_by_l.to(DEVICE)
-        _w_pivots_by_l = pivots_by_l.to(DEVICE)
-        _w_lu_fac_row_by_l = w_fac_row_all.to(DEVICE)
-        _w_lu_fac_col_by_l = w_fac_col_all.to(DEVICE)
+    if _use_dense_inv_w:
+        # Batch-invert on GPU: move matrices, invert, apply preconditioning
+        dense_inv_by_l[0] = eye
+        dense_inv_by_l = torch.linalg.inv(dense_inv_by_l.to(DEVICE))
+        dense_inv_by_l = (w_fac_col_all.to(DEVICE).unsqueeze(2)
+                          * dense_inv_by_l
+                          * w_fac_row_all.to(DEVICE).unsqueeze(1))
+        dense_inv_by_l[0] = 0.0
+        _w_dense_inv_by_l = dense_inv_by_l
         _w_bands_by_l = None
         _w_penta_w1 = None
         _w_inv_by_l = None
     elif l_finite_diff:
         # Banded + pentadiag path for large N
-        _w_lu_by_l = None
+        _w_dense_inv_by_l = None
         _w_bands_by_l = w_abd_all.to(DEVICE)
         _w_piv_by_l = w_piv_all.to(DEVICE)
         _w_fac_row_by_l = w_fac_row_all.to(DEVICE)
@@ -291,7 +302,7 @@ def build_w_matrices(wimp_lin0: float):
             _w_penta_w1 = None
     else:
         # Chebyshev path
-        _w_lu_by_l = None
+        _w_dense_inv_by_l = None
         _w_inv_by_l = inv_by_l.to(DEVICE)
         _w_bands_by_l = None
 
@@ -382,15 +393,7 @@ def get_w_impl(w, dw, ddw, dddw, ddddw, s, xi=None):
 def updateW(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
             dwdt, p_LMloc, dp_LMloc, tscheme,
             xi_LMloc=None):
-    """Double-curl poloidal velocity solve + post-processing.
-
-    Solves the N×N 4th-order system for w only. Pressure is NOT co-solved
-    (recovered separately when needed for diagnostics).
-
-    The l=0 pressure is still solved via p0Mat (same as standard formulation).
-
-    Modifies w, dw, ddw, dwdt, p, dp in place.
-    """
+    """Double-curl poloidal velocity solve + post-processing."""
     from .radial_derivatives import get_ddr
 
     N = n_r_max
@@ -398,48 +401,36 @@ def updateW(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
     # 1. Assemble IMEX RHS for w
     rhs_w = tscheme.set_imex_rhs(dwdt)  # (lm_max, n_r_max)
 
-    # 2. Add buoyancy coupling: wimp * BuoFac * dLh * or2 * rgrav * s
+    # 2. Add buoyancy coupling
     wimp_lin0 = tscheme.wimp_lin[0]
     buo_fac_r = (or2[2:N-2] * rgrav[2:N-2]).unsqueeze(0).to(CDTYPE)
     rhs_w[:, 2:N-2] += wimp_lin0 * BuoFac * _dLh_lm * buo_fac_r * s_LMloc[:, 2:N-2]
     if xi_LMloc is not None:
         rhs_w[:, 2:N-2] += wimp_lin0 * ChemFac * _dLh_lm * buo_fac_r * xi_LMloc[:, 2:N-2]
 
-    # 3. Boundary conditions: 4 BCs for 4th-order system
-    # Row 0: w=0 at CMB, Row 1: dw/dr=0 at CMB (no-slip)
-    # Row N-2: dw/dr=0 at ICB, Row N-1: w=0 at ICB
+    # 3. Boundary conditions
     rhs_w[:, 0] = 0.0
     rhs_w[:, 1] = 0.0
     rhs_w[:, N - 2] = 0.0
     rhs_w[:, N - 1] = 0.0
-    # l=0 has no poloidal equation — zero its RHS
-    # (For dense inverse, inv[l=0]=0 gives zero output.
-    #  For banded solve, l=0 identity bands would return the RHS unchanged.)
-    lm0_idx = (st_lm2l == 0)
-    rhs_w[lm0_idx] = 0.0
+    rhs_w[_l0_mask] = 0.0
 
     # 4. Solve
-    if _w_lu_by_l is not None:
-        # FD dense LU solve (N <= 1024) — batched LU solve preserves accuracy
-        sol = chunked_lu_solve_complex(
-            _w_lu_by_l, _w_pivots_by_l,
-            _w_lu_fac_row_by_l, _w_lu_fac_col_by_l,
-            st_lm2l, rhs_w)
-        sol[lm0_idx] = 0.0
+    if _w_dense_inv_by_l is not None:
+        sol = chunked_solve_complex(_w_dense_inv_by_l, st_lm2l, rhs_w)
+        sol[_l0_mask] = 0.0
         sol[_m0_mask] = sol[_m0_mask].real.to(CDTYPE)
         w_LMloc[:] = sol
     elif _w_penta_w1 is not None:
-        # FD batched pentadiag (no Python loop over l)
         from .algebra import batched_pentadiag_solve_precomp
         rhs_precond = _w_penta_fac_row * rhs_w
         w_phys = batched_pentadiag_solve_precomp(
             _w_penta_w1, _w_penta_w2, _w_penta_inv_d,
             _w_penta_du1, _w_penta_du2, rhs_precond)
-        w_phys = _w_penta_fac_col * w_phys  # column post-scaling
+        w_phys = _w_penta_fac_col * w_phys
         w_phys[_m0_mask] = w_phys[_m0_mask].real.to(CDTYPE)
         w_LMloc[:] = w_phys
     elif _w_bands_by_l is not None:
-        # FD fallback: per-l pivoted banded LU
         from .algebra import banded_solve_by_l
         w_phys = banded_solve_by_l(
             _w_bands_by_l, _w_piv_by_l, st_lm2l, rhs_w,
@@ -455,17 +446,13 @@ def updateW(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
         from .radial_scheme import costf
         w_LMloc[:] = costf(w_cheb)
 
-    # 7. Compute derivatives: dw, ddw via direct matrices, then
-    #    dddw, ddddw via chaining D1(D2(w)), D2(D2(w)) — matches Fortran
-    #    get_pol_rhs_imp (updateWP.f90:1172-1176) which calls get_ddr(w)→dw,ddw
-    #    then get_ddr(ddw)→dddw,ddddw. For FD, chaining gives different
-    #    results than direct D3/D4 matrices.
+    # 7. Derivatives
     dw_new, ddw_new = get_ddr(w_LMloc)
     dw_LMloc[:] = dw_new
     ddw_LMloc[:] = ddw_new
-    dddw, ddddw = get_ddr(ddw_LMloc)  # chain: D1(D2(w)), D2(D2(w))
+    dddw, ddddw = get_ddr(ddw_LMloc)
 
-    # 8. l=0 pressure from p0Mat (same as standard formulation)
+    # 8. l=0 pressure
     from .update_wp import solve_p0, _lm_l0, _l_p0_integ_bc
     lm0 = _lm_l0
     expl_idx = max(0, tscheme.istage - 1) if tscheme.nstages > 1 else 0
@@ -474,7 +461,6 @@ def updateW(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
                   + dwdt.expl[lm0, 1:, expl_idx].real)
     if xi_LMloc is not None:
         p0_rhs[1:] += rho0[1:] * ChemFac * rgrav[1:] * xi_LMloc[lm0, 1:].real
-    # Row 0: integral BC for Chebyshev+anelastic (FD uses Dirichlet, stays 0)
     if _l_p0_integ_bc:
         from .radial_functions import alpha0, temp0, ThExpNb
         from .radial_scheme import r as _r_p0
@@ -482,17 +468,15 @@ def updateW(s_LMloc, w_LMloc, dw_LMloc, ddw_LMloc,
         work = ThExpNb * alpha0 * temp0 * rho0 * _r_p0 * _r_p0 * s_LMloc[lm0].real
         p0_rhs[0] = rInt_R(work)
     p_LMloc[lm0, :] = solve_p0(p0_rhs).to(CDTYPE)
-    # dp not computed in double-curl (Fortran doesn't either — pressure
-    # derivative is only needed when l_RMS or l_FluxProfs is active)
 
-    # 9. Rotate IMEX time arrays (w only, NOT dpdt)
+    # 9. Rotate IMEX time arrays
     tscheme.rotate_imex(dwdt)
 
     # 10. Store old state
     if tscheme.store_old:
         dwdt.old[:, :, 0] = get_w_old(w_LMloc, dw_LMloc, ddw_LMloc)
 
-    # 11. Compute implicit term for next step
+    # 11. Implicit term
     idx = tscheme.next_impl_idx
     dwdt.impl[:, :, idx] = get_w_impl(
         w_LMloc, dw_LMloc, ddw_LMloc, dddw, ddddw,

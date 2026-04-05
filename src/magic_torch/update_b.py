@@ -124,9 +124,11 @@ def _build_b_matrices_insulating(wimp_lin0: float):
     j_inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
 
     # FD: pentadiag for bMat (vacuum BCs use drMat boundary stencil)
+    _use_dense = False
     if l_finite_diff:
         _bj_kl = max(fd_order // 2, fd_order_bound)
         _bj_ku = _bj_kl
+        _use_dense = N <= 1024 and fd_order <= 2
     n_abd = 2 * _bj_kl + _bj_ku + 1 if l_finite_diff else 1
     b_abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
     b_piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
@@ -180,12 +182,10 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         fac_b = 1.0 / dat_b.abs().max(dim=1).values
         dat_b_precond = fac_b.unsqueeze(1) * dat_b
 
-        if l_finite_diff and N <= 1024:
-            # Dense inverse for GPU — single batched bmm instead of sequential sweeps
-            lu_b, ip_b, info_b = prepare_mat(dat_b_precond)
-            assert info_b == 0, f"Singular bMat for l={l}, info={info_b}"
-            b_inv_precond = solve_mat_real(lu_b, ip_b, eye)
-            b_inv_by_l[l] = b_inv_precond * fac_b.unsqueeze(0)
+        if _use_dense:
+            # Store preconditioned matrix; batch-invert after loop
+            b_inv_by_l[l] = dat_b_precond
+            b_fac_all[l] = fac_b
         elif l_finite_diff:
             # Banded + pentadiag/Thomas for large N (N > 1024)
             from .algebra import dense_to_band_storage, prepare_band
@@ -208,10 +208,9 @@ def _build_b_matrices_insulating(wimp_lin0: float):
                 b_du1_all[l] = du1m
                 b_du2_all[l] = du2c
         else:
-            lu_b, ip_b, info_b = prepare_mat(dat_b_precond)
-            assert info_b == 0, f"Singular bMat for l={l}, info={info_b}"
-            b_inv_precond = solve_mat_real(lu_b, ip_b, eye)
-            b_inv_by_l[l] = b_inv_precond * fac_b.unsqueeze(0)
+            # Chebyshev: store preconditioned matrix; batch-invert after loop
+            b_inv_by_l[l] = dat_b_precond
+            b_fac_all[l] = fac_b
 
         # === jMat (toroidal magnetic field) ===
         dat_j = torch.zeros(N, N, dtype=DTYPE, device=cpu)
@@ -231,12 +230,10 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         fac_j = 1.0 / dat_j.abs().max(dim=1).values
         dat_j_precond = fac_j.unsqueeze(1) * dat_j
 
-        if l_finite_diff and N <= 1024:
-            # Dense inverse for GPU
-            lu_j, ip_j, info_j = prepare_mat(dat_j_precond)
-            assert info_j == 0, f"Singular jMat for l={l}, info={info_j}"
-            j_inv_precond = solve_mat_real(lu_j, ip_j, eye)
-            j_inv_by_l[l] = j_inv_precond * fac_j.unsqueeze(0)
+        if _use_dense:
+            # Store preconditioned matrix; batch-invert after loop
+            j_inv_by_l[l] = dat_j_precond
+            j_fac_all[l] = fac_j
         elif l_finite_diff:
             # Banded + Thomas for large N (N > 1024)
             abd = dense_to_band_storage(dat_j_precond, _bj_kl, _bj_ku)
@@ -254,15 +251,22 @@ def _build_b_matrices_insulating(wimp_lin0: float):
                 j_inv_d_all[l] = inv_dj
                 j_du_all[l] = duj
         else:
-            lu_j, ip_j, info_j = prepare_mat(dat_j_precond)
-            assert info_j == 0, f"Singular jMat for l={l}, info={info_j}"
-            j_inv_precond = solve_mat_real(lu_j, ip_j, eye)
-            j_inv_by_l[l] = j_inv_precond * fac_j.unsqueeze(0)
+            # Chebyshev: store preconditioned matrix; batch-invert after loop
+            j_inv_by_l[l] = dat_j_precond
+            j_fac_all[l] = fac_j
 
-    if l_finite_diff and N <= 1024:
-        # Dense inverse path for GPU
-        _b_inv_by_l = b_inv_by_l.to(DEVICE)
-        _j_inv_by_l = j_inv_by_l.to(DEVICE)
+    if _use_dense or not l_finite_diff:
+        # Batch-invert on GPU: l=0 set to identity for inv, then zeroed
+        b_inv_by_l[0] = eye
+        j_inv_by_l[0] = eye
+        b_fac_all[0] = 1.0
+        j_fac_all[0] = 1.0
+        b_inv_by_l = torch.linalg.inv(b_inv_by_l.to(DEVICE)) * b_fac_all.to(DEVICE).unsqueeze(1)
+        j_inv_by_l = torch.linalg.inv(j_inv_by_l.to(DEVICE)) * j_fac_all.to(DEVICE).unsqueeze(1)
+        b_inv_by_l[0] = 0.0
+        j_inv_by_l[0] = 0.0
+        _b_inv_by_l = b_inv_by_l
+        _j_inv_by_l = j_inv_by_l
         _b_bands_by_l = None
         _j_bands_by_l = None
         _b_penta_w1 = None
@@ -292,12 +296,6 @@ def _build_b_matrices_insulating(wimp_lin0: float):
         else:
             _b_penta_w1 = None
             _j_thomas_w_fwd = None
-    else:
-        # Chebyshev path
-        _b_inv_by_l = b_inv_by_l.to(DEVICE)
-        _j_inv_by_l = j_inv_by_l.to(DEVICE)
-        _b_bands_by_l = None
-        _j_bands_by_l = None
 
 
 def _build_b_matrices_coupled(wimp_lin0: float):

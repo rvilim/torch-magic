@@ -277,14 +277,24 @@ def _zero_mag_boundaries(accum):
         accum.profiles[3][-1] = 0.0  # e_t_as_r at ICB
 
 
-def run(cfg=None):
+def run(cfg=None, on_log=None):
     """Run the dynamo benchmark.
 
     Args:
         cfg: dict from YAML config, or None for legacy defaults.
+        on_log: optional callback called after each log step (for volume sync etc.)
     """
     if cfg is None:
         cfg = {}
+
+    from .precision import DEVICE as _dev
+    from . import fields as _flds
+    from .precision import DTYPE as _dtype
+    print(f"  DEVICE={_dev}, DTYPE={_dtype}")
+    print(f"  s_LMloc.device={_flds.s_LMloc.device}")
+    if _dev.type == 'cuda':
+        import torch
+        print(f"  GPU: {torch.cuda.get_device_name()}")
 
     n_steps = cfg.get("n_steps", n_time_steps)
     dt = cfg.get("dt", dtmax)
@@ -863,6 +873,8 @@ def run(cfg=None):
                 write_row(n, sim_time, elapsed, steps_done, accumulate=True)
                 write_log_step(f_log, n, elapsed / steps_done)
                 f_log.flush()
+                if on_log:
+                    on_log()
 
             if checkpoint_every and (n % checkpoint_every == 0 or n == n_steps):
                 cp_path = os.path.join(output_dir, f"checkpoint_{n:06d}.pt")

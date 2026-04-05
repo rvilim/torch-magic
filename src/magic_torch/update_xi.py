@@ -21,7 +21,7 @@ from .horizontal_data import dLh, hdif_Xi
 from .params import l_anel
 from .pre_calculations import osc
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex
+from .algebra import chunked_solve_complex
 from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_ddr
 
@@ -91,6 +91,7 @@ def build_xi_matrices(wimp_lin0: float):
     eye = torch.eye(N, dtype=DTYPE, device=cpu)
     inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
     # FD bandwidth (same as sMat: Dirichlet BCs → tridiag for fd_order<=2)
+    _use_dense = False
     if l_finite_diff:
         from .params import fd_order, fd_order_bound
         if fd_order <= 2 and fd_order_bound <= 2:
@@ -98,6 +99,7 @@ def build_xi_matrices(wimp_lin0: float):
         else:
             hw = max(fd_order // 2, fd_order_bound)
             _xi_kl, _xi_ku = hw, hw
+        _use_dense = N <= 1024 and fd_order <= 2
     n_abd = 2 * _xi_kl + _xi_ku + 1 if l_finite_diff else 1
     abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
     piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
@@ -128,12 +130,10 @@ def build_xi_matrices(wimp_lin0: float):
         fac = 1.0 / dat.abs().max(dim=1).values
         dat_precond = fac.unsqueeze(1) * dat
 
-        if l_finite_diff and N <= 1024:
-            # Dense inverse for GPU — single batched bmm instead of sequential sweeps
-            lu, ip, info = prepare_mat(dat_precond)
-            assert info == 0, f"Singular xiMat for l={l}, info={info}"
-            inv_precond = solve_mat_real(lu, ip, eye)
-            inv_by_l[l] = inv_precond * fac.unsqueeze(0)
+        if _use_dense:
+            # Store preconditioned matrix; batch-invert after loop
+            inv_by_l[l] = dat_precond
+            fac_all[l] = fac
         elif l_finite_diff:
             # Banded + Thomas for large N (N > 1024)
             from .algebra import dense_to_band_storage, prepare_band
@@ -154,14 +154,14 @@ def build_xi_matrices(wimp_lin0: float):
                 _xi_thomas_inv_d_by_l[l] = inv_d
                 _xi_thomas_du_by_l[l] = du_c
         else:
-            lu, ip, info = prepare_mat(dat_precond)
-            assert info == 0, f"Singular xiMat for l={l}, info={info}"
-            inv_precond = solve_mat_real(lu, ip, eye)
-            inv_by_l[l] = inv_precond * fac.unsqueeze(0)
+            # Chebyshev: store preconditioned matrix; batch-invert after loop
+            inv_by_l[l] = dat_precond
+            fac_all[l] = fac
 
-    if l_finite_diff and N <= 1024:
-        # Dense inverse path for GPU
-        _xi_inv_by_l = inv_by_l.to(DEVICE)
+    if _use_dense or not l_finite_diff:
+        # Batch-invert on GPU (both FD dense and Chebyshev paths)
+        inv_by_l = torch.linalg.inv(inv_by_l.to(DEVICE)) * fac_all.to(DEVICE).unsqueeze(1)
+        _xi_inv_by_l = inv_by_l
         _xi_bands_by_l = None
         _xi_thomas_w_fwd = None
     elif l_finite_diff:
@@ -178,10 +178,6 @@ def build_xi_matrices(wimp_lin0: float):
             _xi_thomas_fac = fac_all[st_lm2l.cpu()].to(DEVICE)
         else:
             _xi_thomas_w_fwd = None
-    else:
-        # Chebyshev path
-        _xi_inv_by_l = inv_by_l.to(DEVICE)
-        _xi_bands_by_l = None
 
 
 def finish_exp_comp(dxi_exp, dVXirLM):

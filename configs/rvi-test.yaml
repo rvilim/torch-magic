@@ -1,24 +1,20 @@
-# Dynamo benchmark with movie output
-# Standard Christensen et al. 2001 case 1
-# Ra=1e5, Ek=1e-3, Pr=1, Pm=5, l_max=16
+# Dynamo benchmark case 1 at l=64 — Modal CUDA
+# Ra=1e5, Ek=1e-3, Pr=1, Pm=5, radratio=0.35
 
-# Grid
-l_max: 16
-n_r_max: 33
+l_max: 64
+n_r_max: 129
 
-# Physics (defaults: ra=1e5, ek=1e-3, pr=1, prmag=5)
+ra: 1.0e5
+ek: 1.0e-3
+pr: 1.0
+prmag: 5.0
+radratio: 0.35
 
-# Time stepping
-n_steps: 1000
+n_steps: 4000
 dt: 1.0e-4
 
-# Output
-output_dir: ./output/rvi-test
 log_every: 100
 
-# Movies
 movies: ["Br CMB", "Vr EQ"]
 n_movie_step: 5
 
-# Device
-device: mps

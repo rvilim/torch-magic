@@ -2190,3 +2190,112 @@ Since `lambda_=1` and `dLlambda=0` for all current configs, changes are mathemat
 - 35/35 tests pass (implicit matrices + anelastic step)
 - 140/140 FD anel MHD tests pass
 - No numerical change for any existing benchmark
+
+---
+
+## H100 CUDA Performance Optimization (2026-04-05)
+
+### Problem: lm_loop dominated H100 step time (92%)
+At l_max=64, N=129, the H100 benchmark showed 84ms/step with lm_loop taking 77ms (92%). The FD solvers used sequential Thomas/pentadiag sweeps — one kernel per radial point, starving the GPU.
+
+### Fix 1: Dense precomputed inverse for all FD solvers (N ≤ 1024)
+**Files**: `update_s.py`, `update_z.py`, `update_xi.py`, `update_b.py`, `update_w_doublecurl.py`
+
+Replaced sequential Thomas/pentadiag solvers with precomputed dense matrix inverse + single batched `torch.bmm` via `chunked_solve_complex`. For each l-degree, compute `A^{-1}` at matrix build time, store as `(l_max+1, N, N)` float64 tensor on GPU. At solve time, one `torch.bmm` call replaces the entire per-l Python loop.
+
+- Condition numbers verified safe: max ~1.8e6 at N=129, ~7e9 at N=1024 (≥6 digits in float64)
+- Gated on `fd_order ≤ 2` — higher-order FD operators are too ill-conditioned for precomputed inverse
+- W solver (4th-order double-curl): also uses precomputed inverse (condition numbers manageable)
+- l=0 handled via zero inverse (produces zero output, correct for toroidal/poloidal l=0)
+
+### Fix 2: p0Mat dense inverse
+**File**: `update_wp.py`
+
+The l=0 pressure tridiagonal solver used `solve_tridiag_real` with a Python for-loop and `.item()` calls — each `.item()` forces a CPU-GPU sync (~100μs). At N=129, that's 129 syncs × 100μs = 13ms per step. Replaced with precomputed `torch.linalg.inv` on GPU.
+
+### Fix 3: Fast matrix rebuild with `torch.linalg.inv`
+**Files**: all solver build functions + `update_wp.py` (build_p0_matrix)
+
+The original matrix build used our custom `prepare_mat` + `solve_mat_real` (Python for-loop LU factorization). With CFL adaptive timestepping, dt changes trigger full matrix rebuilds — 13 changes in 100 steps at Ra=3e6. Each rebuild took ~8 seconds on Modal's CPU due to millions of Python loop iterations across 5 solvers × 65 l-values.
+
+Replaced with:
+1. **`torch.linalg.inv`** instead of `prepare_mat` + `solve_mat_real` — single LAPACK call per matrix instead of Python-loop LU
+2. **Batched inversion** — store all l-degree matrices in loop, then one `torch.linalg.inv(all_matrices.to(DEVICE))` call after loop
+3. **GPU-side inversion** — matrices moved to GPU before `torch.linalg.inv`, eliminating CPU→GPU transfer of the result
+4. Applied to BOTH Chebyshev and FD build paths (not just FD dense)
+
+**Bug found and fixed**: `fac_all.unsqueeze(2)` was wrong — should be `fac_all.unsqueeze(1)` for column-wise preconditioning scaling. Caused 40% errors in anelastic tests.
+
+### Fix 4: Vectorized W matrix construction
+**File**: `update_w_doublecurl.py`
+
+The inner `for nR in range(2, N-2)` Python loop (125 iterations × 64 l-values = 8000 iterations) computed the 4th-order double-curl operator row by row. Vectorized by precomputing radial profile vectors (c0-c3 base terms) outside the l-loop, then computing all bulk rows simultaneously with tensor broadcasting.
+
+W build time: 651ms → 20ms (32× faster).
+
+### Fix 5: Precomputed masks
+**File**: `update_w_doublecurl.py`
+
+`lm0_idx = (st_lm2l == 0)` was recomputed every step. Moved to module-level `_l0_mask`.
+
+### Results
+
+**H100 benchmark (l_max=64, N=129, FD):**
+
+| Component | Before | After | Speedup |
+|-----------|--------|-------|---------|
+| lm_loop | 77ms | 4.4ms | 17.5× |
+| updateW | 18ms | 1.9ms | 9.5× |
+| radial_loop | 5.7ms | 5.2ms | — |
+| **Total step** | **84ms** | **9.9ms** | **8.5×** |
+
+**H100 Chebyshev (l_max=64, N=129):** 6.7ms/step (eager baseline)
+
+**Matrix rebuild time:** ~8s → ~70ms per rebuild (with batched GPU inv)
+
+**Bottleneck shifted**: lm_loop (92% → 45%) → radial_loop (7% → 53%). Now dominated by SHT matmuls.
+
+### torch.compile evaluation (2026-04-05)
+Tested 5 compile strategies on H100, l_max=64, Chebyshev:
+
+| Mode | ms/step | vs eager |
+|------|---------|----------|
+| eager (baseline) | 6.72ms | 1.00× |
+| compile_nl_td | 6.90ms | 0.97× |
+| compile_solvers | 8.21ms | 0.82× |
+| compile_radial_lm | 13.17ms | 0.51× |
+| compile_one_step | 17.22ms | 0.39× |
+
+**Conclusion**: torch.compile makes things WORSE at this resolution. Root causes:
+- `.item()` calls in algebra.py, courant.py cause graph breaks (fragmented subgraphs)
+- Complex128 codegen in Inductor is worse than eager cuBLAS dispatch
+- Tensor sizes too small (2145×129) to amortize compilation overhead
+- bmm/matmul already call cuBLAS directly — nothing for compile to improve
+
+### GPU utilization
+At l=64, GPU utilization is ~10% on H100 — problem is too small to saturate the hardware. The GPU does ~1 GFLOP per step, H100 can do 30 TFLOPS. Most time is kernel launch overhead (~5-10μs × hundreds of kernels).
+
+Expected utilization by resolution:
+- l=64: ~10%, l=128: ~30-40%, l=256: ~60-80%, l=512: ~90%+
+
+### GPU memory estimates
+At float64/complex128:
+- l=128: ~2 GB (comfortable on any GPU)
+- l=256: ~17 GB (fits H100 80GB easily)
+- l=384: ~55 GB (tight on H100)
+- l=512: ~110 GB (doesn't fit single H100)
+
+Dominant cost: dt_fields (6 × 5 slots × lm_max × N × complex128 = 65% of total).
+
+### Full production run (2026-04-05)
+30,000 steps at l=64, N=129, Chebyshev, Ra=3e6, Ek=1e-4 on H100:
+- Total wall time: 2228.6s (74.3ms/step average)
+- Steady-state step time: ~6.7ms (per benchmark)
+- Overhead from CFL matrix rebuilds + movie output every 5 steps
+- Final energies: e_kin=2.31e4, e_mag=3.30e5
+
+### Infrastructure additions
+- **Modal TensorBoard**: web server function in `run_modal.py` serves TensorBoard from Modal volume, auto-refreshes every 15s
+- **Volume sync**: `on_log` callback commits Modal volume every `log_every` steps for live TensorBoard monitoring
+- **Movie rendering on Modal**: `scripts/make_movie_modal.py` — parallel frame rendering on Modal, downloads mp4 locally
+- **Recursive volume download**: fixed `_download_from_volume` to handle subdirectories

@@ -30,7 +30,7 @@ from .pre_calculations import BuoFac, ChemFac
 from .params import l_finite_diff as _l_fd_p0
 _l_p0_integ_bc = (ViscHeatFac * ThExpNb != 0.0) and not _l_fd_p0
 from .blocking import st_lm2, st_lm2l, st_lm2m
-from .algebra import prepare_mat, solve_mat_real, chunked_solve_complex, chunked_lu_solve_complex
+from .algebra import chunked_solve_complex, chunked_lu_solve_complex
 from .radial_scheme import costf
 from .radial_derivatives import get_dr, get_dddr
 
@@ -87,7 +87,7 @@ def build_p0_matrix():
     global _p0Mat_inv, _p0Mat_bands
     N = n_r_max
 
-    # Build on CPU (scalar loops in prepare_mat)
+    # Build on CPU
     cpu = torch.device("cpu")
     _rMat = rMat.to(cpu)
     _drMat = drMat.to(cpu)
@@ -141,23 +141,23 @@ def build_p0_matrix():
     dat[:, 0] = dat[:, 0] * _bfac
     dat[:, N - 1] = dat[:, N - 1] * _bfac
 
-    if l_finite_diff:
-        # FD: match Fortran's solver exactly.
-        # Fortran type_bandmat with n_bands=3 uses prepare_tridiag/solve_tridiag.
-        # Fortran type_bandmat with n_bands>3 uses prepare_band/solve_band.
+    if l_finite_diff and N <= 1024:
+        # FD with N <= 1024: precomputed dense inverse on GPU
+        _p0Mat_inv = torch.linalg.inv(dat.to(DEVICE))
+        _p0Mat_bands = None
+    elif l_finite_diff:
+        # FD with N > 1024: banded/tridiag solver (CPU fallback)
         from .params import fd_order as _fd_order_p0_build
         p0_kl = _fd_order_p0_build // 2
         p0_ku = p0_kl
         n_bands_p0 = _fd_order_p0_build + 1
         if n_bands_p0 == 3:
-            # Tridiagonal: use prepare_tridiag (matches Fortran exactly)
             from .algebra import prepare_tridiag, extract_tridiag
             dl, d, du = extract_tridiag(dat)
             dl, d, du, du2, pivot, info = prepare_tridiag(dl, d, du)
             assert info == 0, f"Singular p0Mat (tridiag), info={info}"
             _p0Mat_bands = ('tridiag', dl, d, du, du2, pivot)
         else:
-            # Wider band: use prepare_band (matches Fortran exactly)
             from .algebra import dense_to_band_storage, prepare_band
             abd = dense_to_band_storage(dat, p0_kl, p0_ku)
             abd_f, piv, info = prepare_band(abd, N, p0_kl, p0_ku)
@@ -165,14 +165,8 @@ def build_p0_matrix():
             _p0Mat_bands = ('band', abd_f, piv, N, p0_kl, p0_ku)
         _p0Mat_inv = None
     else:
-        # Chebyshev: dense LU + precomputed inverse
-        lu, ip, info = prepare_mat(dat)
-        assert info == 0, "Singular p0Mat"
-        eye = torch.eye(N, dtype=DTYPE, device=cpu)
-        inv_cols = []
-        for i in range(N):
-            inv_cols.append(solve_mat_real(lu, ip, eye[:, i]))
-        _p0Mat_inv = torch.stack(inv_cols, dim=1).to(device=DEVICE)
+        # Chebyshev: precomputed inverse via torch.linalg.inv
+        _p0Mat_inv = torch.linalg.inv(dat.to(DEVICE))
         _p0Mat_bands = None
 
 
@@ -213,7 +207,7 @@ def build_wp_matrices(wimp_lin0: float):
     global _wp_inv_by_l, _wp_lu_by_l, _wp_pivots_by_l, _wp_fac_row_by_l, _wp_fac_col_by_l
     N = n_r_max
 
-    # Build on CPU (scalar loops in prepare_mat/solve_mat_real)
+    # Build on CPU
     cpu = torch.device("cpu")
     _rMat = rMat.to(cpu)
     _drMat = drMat.to(cpu)
@@ -238,13 +232,13 @@ def build_wp_matrices(wimp_lin0: float):
 
     eye = torch.eye(2 * N, dtype=DTYPE, device=cpu)
     inv_by_l = torch.zeros(l_max + 1, 2 * N, 2 * N, dtype=DTYPE, device=cpu)
+    fac_row_all = torch.ones(l_max + 1, 2 * N, dtype=DTYPE, device=cpu)
+    fac_col_all = torch.ones(l_max + 1, 2 * N, dtype=DTYPE, device=cpu)
     # For anelastic: store LU factors for accurate solve (precomputed inverse loses
     # digits when cond(wpMat) ~ 1e12 due to variable density/viscosity profiles)
     if l_anel:
         lu_factors = torch.eye(2 * N, dtype=DTYPE, device=cpu).unsqueeze(0).expand(l_max + 1, -1, -1).clone()
         pivots_all = torch.arange(1, 2 * N + 1, dtype=torch.int32, device=cpu).unsqueeze(0).expand(l_max + 1, -1).clone()
-        fac_row_all = torch.ones(l_max + 1, 2 * N, dtype=DTYPE, device=cpu)
-        fac_col_all = torch.ones(l_max + 1, 2 * N, dtype=DTYPE, device=cpu)
 
     for l in range(1, l_max + 1):
         dL = float(l * (l + 1))
@@ -350,10 +344,10 @@ def build_wp_matrices(wimp_lin0: float):
             fac_row_all[l] = fac_row
             fac_col_all[l] = fac_col
         else:
-            lu, ip, info = prepare_mat(dat)
-            assert info == 0, f"Singular wpMat for l={l}, info={info}"
-            inv_precond = solve_mat_real(lu, ip, eye)
-            inv_by_l[l] = fac_col.unsqueeze(1) * inv_precond * fac_row.unsqueeze(0)
+            # Chebyshev: store preconditioned matrix; batch-invert after loop
+            inv_by_l[l] = dat
+            fac_row_all[l] = fac_row
+            fac_col_all[l] = fac_col
 
     if l_anel:
         _wp_lu_by_l = lu_factors.to(DEVICE)
@@ -362,7 +356,12 @@ def build_wp_matrices(wimp_lin0: float):
         _wp_fac_col_by_l = fac_col_all.to(DEVICE)
         _wp_inv_by_l = None
     else:
-        _wp_inv_by_l = inv_by_l.to(DEVICE)
+        # Batch-invert on GPU: l=0 set to identity for inv, then zeroed
+        inv_by_l[0] = eye
+        inv_by_l = torch.linalg.inv(inv_by_l.to(DEVICE))
+        inv_by_l *= fac_col_all.to(DEVICE).unsqueeze(2) * fac_row_all.to(DEVICE).unsqueeze(1)
+        inv_by_l[0] = 0.0
+        _wp_inv_by_l = inv_by_l
         _wp_lu_by_l = None
         _wp_pivots_by_l = None
         _wp_fac_row_by_l = None

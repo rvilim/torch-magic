@@ -43,10 +43,10 @@ from magic_torch.params import n_r_max
 uwdc.build_w_matrices(0.5)
 # N <= 1024: dense LU path; N > 1024: banded path
 if n_r_max <= 1024:
-    assert uwdc._w_lu_by_l is not None
-    print(f'LU shape: {uwdc._w_lu_by_l.shape}')
-    assert uwdc._w_lu_by_l.shape[0] == 17
-    assert uwdc._w_lu_by_l.shape[1] == n_r_max
+    assert uwdc._w_dense_inv_by_l is not None
+    print(f'LU shape: {uwdc._w_dense_inv_by_l.shape}')
+    assert uwdc._w_dense_inv_by_l.shape[0] == 17
+    assert uwdc._w_dense_inv_by_l.shape[1] == n_r_max
 else:
     assert uwdc._w_bands_by_l is not None
 print('PASS')
@@ -54,7 +54,7 @@ print('PASS')
         assert "PASS" in out
 
     def test_solve_roundtrip(self):
-        """Solve A*x=b gives correct x for each l (dense LU or banded)."""
+        """Solve A*x=b gives correct x for each l (dense inv or banded)."""
         out = _run_fd_check("""
 import torch
 from magic_torch import update_w_doublecurl as uwdc
@@ -62,13 +62,12 @@ from magic_torch.params import n_r_max
 
 uwdc.build_w_matrices(0.5)
 N = n_r_max
-if uwdc._w_lu_by_l is not None:
-    # Dense LU path: test via lu_solve
+if uwdc._w_dense_inv_by_l is not None:
+    # Dense inverse path: test via matmul
     for l in range(1, 17):
-        lu = uwdc._w_lu_by_l[l:l+1].cpu()
-        piv = uwdc._w_pivots_by_l[l:l+1].cpu()
-        b = torch.randn(1, N, 1, dtype=torch.float64)
-        x = torch.linalg.lu_solve(lu, piv, b)
+        inv_l = uwdc._w_dense_inv_by_l[l].cpu()
+        b = torch.randn(N, dtype=torch.float64)
+        x = inv_l @ b
         assert not torch.isnan(x).any(), f'NaN at l={l}'
 else:
     from magic_torch.algebra import solve_band_real
@@ -82,17 +81,16 @@ print('PASS')
 """)
         assert "PASS" in out
 
-    def test_l0_is_identity(self):
-        """l=0 should be identity (no poloidal equation for l=0)."""
+    def test_l0_is_zero(self):
+        """l=0 inverse should be zero (no poloidal equation for l=0)."""
         out = _run_fd_check("""
 import torch
 from magic_torch import update_w_doublecurl as uwdc
 from magic_torch.params import n_r_max
 uwdc.build_w_matrices(0.5)
-if uwdc._w_lu_by_l is not None:
-    # Dense LU: l=0 should be identity LU
-    eye = torch.eye(n_r_max, dtype=torch.float64)
-    assert torch.allclose(uwdc._w_lu_by_l[0].cpu(), eye, atol=1e-14)
+if uwdc._w_dense_inv_by_l is not None:
+    # Dense inverse: l=0 should be all zeros
+    assert uwdc._w_dense_inv_by_l[0].cpu().abs().max() == 0.0
 else:
     diag_row = uwdc._w_kl + uwdc._w_ku
     assert uwdc._w_bands_by_l[0, diag_row].abs().max() == 1.0
@@ -107,9 +105,9 @@ from magic_torch import update_w_doublecurl as uwdc
 from magic_torch.params import n_r_max
 uwdc.build_w_matrices(0.5)
 N = n_r_max
-if uwdc._w_lu_by_l is not None:
-    assert uwdc._w_lu_by_l.shape[1] == N
-    assert uwdc._w_lu_by_l.shape[2] == N
+if uwdc._w_dense_inv_by_l is not None:
+    assert uwdc._w_dense_inv_by_l.shape[1] == N
+    assert uwdc._w_dense_inv_by_l.shape[2] == N
 elif uwdc._w_bands_by_l is not None:
     assert uwdc._w_bands_by_l.shape[2] == N
 print('PASS')

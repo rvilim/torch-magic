@@ -25,8 +25,20 @@ image = (
     .add_local_dir("src", remote_path="/root/src")
 )
 
+tb_image = modal.Image.debian_slim(python_version="3.12").pip_install("tensorboard", "pyyaml")
+
 vol = modal.Volume.from_name("magic-output", create_if_missing=True)
 input_vol = modal.Volume.from_name("magic-input", create_if_missing=True)
+
+
+@app.function(image=tb_image, volumes={"/output": vol})
+@modal.concurrent(max_inputs=10)
+@modal.web_server(6006)
+def tensorboard():
+    """Serve TensorBoard from the output volume."""
+    import subprocess
+    subprocess.Popen(["tensorboard", "--logdir", "/output", "--host", "0.0.0.0",
+                      "--port", "6006", "--reload_interval", "15"])
 
 
 @app.function(
@@ -96,7 +108,10 @@ def run_remote(cfg: dict, run_name: str):
 
     from magic_torch.main import run
 
-    result = run(cfg)
+    def _sync_volume():
+        vol.commit()
+
+    result = run(cfg, on_log=_sync_volume)
     vol.commit()
     return result
 
@@ -138,17 +153,25 @@ def main(config: str):
 
 
 def _download_from_volume(run_name: str, local_dir: str):
-    """Download run output from Modal volume to local directory."""
+    """Download run output from Modal volume to local directory (recursive)."""
     try:
         vol_ref = modal.Volume.from_name("magic-output")
-        for entry in vol_ref.listdir(f"/{run_name}"):
-            remote_path = f"/{run_name}/{entry.path}"
-            local_path = os.path.join(local_dir, entry.path)
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            with open(local_path, "wb") as f:
-                for chunk in vol_ref.read_file(remote_path):
-                    f.write(chunk)
-            print(f"  Downloaded: {entry.path}")
+        _download_dir(vol_ref, f"/{run_name}", local_dir)
     except Exception as e:
         print(f"  Warning: Could not download output: {e}")
         print(f"  Files are still available in Modal volume 'magic-output' at /{run_name}/")
+
+
+def _download_dir(vol_ref, remote_dir: str, local_dir: str):
+    """Recursively download a directory from a Modal volume."""
+    os.makedirs(local_dir, exist_ok=True)
+    for entry in vol_ref.listdir(remote_dir):
+        remote_path = f"{remote_dir}/{entry.path}"
+        local_path = os.path.join(local_dir, entry.path)
+        if entry.type == modal.volume.FileEntryType.DIRECTORY:
+            _download_dir(vol_ref, remote_path, local_path)
+        else:
+            with open(local_path, "wb") as f:
+                for chunk in vol_ref.read_file(remote_path):
+                    f.write(chunk)
+            print(f"  {entry.path}")

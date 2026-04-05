@@ -1,0 +1,12 @@
+# Dynamo benchmark - CUDA f64 - 1000 steps comparison
+l_max: 16
+n_r_max: 33
+
+n_steps: 1000
+dt: 2.0e-4
+
+output_dir: ./output/compare_modal
+log_every: 10
+checkpoint_every: 0
+
+device: cuda

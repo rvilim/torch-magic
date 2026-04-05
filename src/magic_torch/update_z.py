@@ -116,6 +116,7 @@ def build_z_matrices(wimp_lin0: float):
     eye = torch.eye(N, dtype=DTYPE, device=cpu)
     inv_by_l = torch.zeros(l_max + 1, N, N, dtype=DTYPE, device=cpu)
     # FD bandwidth: depends on BCs (no-slip → narrower, stress-free → wider)
+    _use_dense = False
     if l_finite_diff:
         from .params import fd_order, fd_order_bound
         if ktopv != 1 and kbotv != 1 and fd_order <= 2 and fd_order_bound <= 2:
@@ -123,6 +124,7 @@ def build_z_matrices(wimp_lin0: float):
         else:
             hw = max(fd_order // 2, fd_order_bound)
             _z_kl, _z_ku = hw, hw
+        _use_dense = N <= 1024 and fd_order <= 2
     n_abd = 2 * _z_kl + _z_ku + 1 if l_finite_diff else 1
     abd_all = torch.zeros(l_max + 1, max(n_abd, 1), N, dtype=DTYPE, device=cpu)
     piv_all = torch.zeros(l_max + 1, N, dtype=torch.long, device=cpu)
@@ -187,12 +189,10 @@ def build_z_matrices(wimp_lin0: float):
         fac = 1.0 / dat.abs().max(dim=1).values
         dat_precond = fac.unsqueeze(1) * dat
 
-        if l_finite_diff and N <= 1024:
-            # Dense inverse for GPU — single batched bmm instead of sequential sweeps
-            lu, ip, info = prepare_mat(dat_precond)
-            assert info == 0, f"Singular zMat for l={l}, info={info}"
-            inv_precond = solve_mat_real(lu, ip, eye)
-            inv_by_l[l] = inv_precond * fac.unsqueeze(0)
+        if _use_dense:
+            # Store preconditioned matrix; batch-invert after loop
+            inv_by_l[l] = dat_precond
+            fac_all[l] = fac
         elif l_finite_diff:
             # Banded + Thomas for large N (N > 1024)
             from .algebra import dense_to_band_storage, prepare_band
@@ -213,14 +213,17 @@ def build_z_matrices(wimp_lin0: float):
                 _z_thomas_inv_d_by_l[l] = inv_d
                 _z_thomas_du_by_l[l] = du_c
         else:
-            lu, ip, info = prepare_mat(dat_precond)
-            assert info == 0, f"Singular zMat for l={l}, info={info}"
-            inv_precond = solve_mat_real(lu, ip, eye)
-            inv_by_l[l] = inv_precond * fac.unsqueeze(0)
+            # Chebyshev: store preconditioned matrix; batch-invert after loop
+            inv_by_l[l] = dat_precond
+            fac_all[l] = fac
 
-    if l_finite_diff and N <= 1024:
-        # Dense inverse path for GPU (l=0 stays zero in inv_by_l → zero output)
-        _z_inv_by_l = inv_by_l.to(DEVICE)
+    if _use_dense or not l_finite_diff:
+        # Batch-invert on GPU: l=0 set to identity for inv, then zeroed
+        inv_by_l[0] = eye
+        fac_all[0] = 1.0
+        inv_by_l = torch.linalg.inv(inv_by_l.to(DEVICE)) * fac_all.to(DEVICE).unsqueeze(1)
+        inv_by_l[0] = 0.0
+        _z_inv_by_l = inv_by_l
         _z_bands_by_l = None
         _z_thomas_w_fwd = None
     elif l_finite_diff:
@@ -237,10 +240,6 @@ def build_z_matrices(wimp_lin0: float):
             _z_thomas_fac = fac_all[st_lm2l.cpu()].to(DEVICE)
         else:
             _z_thomas_w_fwd = None
-    else:
-        # Chebyshev path
-        _z_inv_by_l = inv_by_l.to(DEVICE)
-        _z_bands_by_l = None
 
     # --- Build z10Mat for l=1,m=0 (angular momentum coupling at ICB) ---
     if l_z10mat:

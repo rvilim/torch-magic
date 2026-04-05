@@ -4,11 +4,11 @@
 l_max: 64
 n_r_max: 129
 
-ra: 3.0e5
+ra: 3.0e6
 ek: 1.0e-4
 
-n_steps: 100000
-dt: 1.0e-5
+n_steps: 30000
+dt: 1.0e-2
 
 output_dir: ./output/rvi-test-hires
 log_every: 100
