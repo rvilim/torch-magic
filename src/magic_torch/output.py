@@ -11,7 +11,7 @@ from collections import namedtuple
 
 import torch
 
-from .precision import CDTYPE, DEVICE
+from .precision import DTYPE, CDTYPE, DEVICE
 from .params import (n_r_max, lm_max, l_max, l_mag, l_cond_ic, l_heat, l_chemical_conv,
                      minc, kbotb, ktopb, m_max, prmag, ek, n_theta_max, n_phi_max)
 from .radial_scheme import r, r_cmb, r_icb
@@ -43,28 +43,28 @@ _eas_p_mag = _m0 & _l_odd
 _eas_t_mag = _m0 & _l_even
 
 # Float masks for matmul-based masked sums (avoids copies from boolean indexing)
-_m0_f = _m0.to(dtype=torch.float64)
-_lpm_even_f = _lpm_even.to(dtype=torch.float64)
-_lpm_odd_f = _lpm_odd.to(dtype=torch.float64)
-_eas_p_kin_f = _eas_p_kin.to(dtype=torch.float64)
-_eas_t_kin_f = _eas_t_kin.to(dtype=torch.float64)
-_eas_p_mag_f = _eas_p_mag.to(dtype=torch.float64)
-_eas_t_mag_f = _eas_t_mag.to(dtype=torch.float64)
+_m0_f = _m0.to(dtype=DTYPE)
+_lpm_even_f = _lpm_even.to(dtype=DTYPE)
+_lpm_odd_f = _lpm_odd.to(dtype=DTYPE)
+_eas_p_kin_f = _eas_p_kin.to(dtype=DTYPE)
+_eas_t_kin_f = _eas_t_kin.to(dtype=DTYPE)
+_eas_p_mag_f = _eas_p_mag.to(dtype=DTYPE)
+_eas_t_mag_f = _eas_t_mag.to(dtype=DTYPE)
 
 # l-array as float for outside-shell / IC energy
-_l_f = st_lm2l.to(dtype=torch.float64)
+_l_f = st_lm2l.to(dtype=DTYPE)
 # m-array expanded for cc2real
 _m_arr = st_lm2m.unsqueeze(1)  # (lm_max, 1) for broadcasting
 
 # --- Additional masks for radial profiles and dipole ---
-_l1_f = (st_lm2l == 1).to(dtype=torch.float64)  # l=1 modes
-_l1m0_f = ((st_lm2l == 1) & (st_lm2m == 0)).to(dtype=torch.float64)
+_l1_f = (st_lm2l == 1).to(dtype=DTYPE)  # l=1 modes
+_l1m0_f = ((st_lm2l == 1) & (st_lm2m == 0)).to(dtype=DTYPE)
 
 # Geostrophic: l <= l_geo = 11 (Namelists.f90:1572)
 _L_GEO = 11
-_l_le_lgeo_f = (st_lm2l <= _L_GEO).to(dtype=torch.float64)
-_l_le_lgeo_es_f = ((st_lm2l <= _L_GEO) & _lpm_odd).to(dtype=torch.float64)
-_l_le_lgeo_as_f = ((st_lm2l <= _L_GEO) & _m0).to(dtype=torch.float64)
+_l_le_lgeo_f = (st_lm2l <= _L_GEO).to(dtype=DTYPE)
+_l_le_lgeo_es_f = ((st_lm2l <= _L_GEO) & _lpm_odd).to(dtype=DTYPE)
+_l_le_lgeo_as_f = ((st_lm2l <= _L_GEO) & _m0).to(dtype=DTYPE)
 
 # lm indices for dipole tilt angles
 _lm_l1m0 = ((st_lm2l == 1) & (st_lm2m == 0)).nonzero(as_tuple=True)[0].item()
@@ -123,7 +123,7 @@ def get_e_kin_full(w, dw, z):
     e_tor_r = 0.5 * orho1_r * dLh_lm * _cc2real(z, _m_arr)
 
     # Use matmul for masked sums: mask (lm_max,) @ e (lm_max, n_r_max) -> (n_r_max,)
-    ones = torch.ones(lm_max, dtype=torch.float64, device=e_pol_r.device)
+    ones = torch.ones(lm_max, dtype=DTYPE, device=e_pol_r.device)
 
     e_p = rInt_R(ones @ e_pol_r).item()
     e_t = rInt_R(ones @ e_tor_r).item()
@@ -163,7 +163,7 @@ def get_e_mag_oc_full(b, db, aj):
         dLh_lm * or2_r * _cc2real(b, _m_arr) + _cc2real(db, _m_arr))
     e_tor_r = fac * dLh_lm * _cc2real(aj, _m_arr)
 
-    ones = torch.ones(lm_max, dtype=torch.float64, device=e_pol_r.device)
+    ones = torch.ones(lm_max, dtype=DTYPE, device=e_pol_r.device)
 
     e_p = rInt_R(ones @ e_pol_r).item()
     e_t = rInt_R(ones @ e_tor_r).item()
@@ -216,7 +216,7 @@ def _rIntIC(f_r):
     a[0] = 0.5 * a[0]
     a[-1] = 0.5 * a[-1]
     # Vectorized IC Chebyshev weights: nChebInt = 2*(k+1)-1 for k=1..N-1
-    k = torch.arange(1, n_r_ic_max, dtype=torch.float64, device=a.device)
+    k = torch.arange(1, n_r_ic_max, dtype=DTYPE, device=a.device)
     nChebInt = 2.0 * (k + 1.0) - 1.0
     weights = -1.0 / (nChebInt * (nChebInt - 2.0))
     result = (a[0] + (weights * a[1:]).sum()).item()
@@ -340,7 +340,7 @@ def get_e_kin_radial(w, dw, z):
         dLh_lm * or2_r * _cc2real(w, _m_arr) + _cc2real(dw, _m_arr))
     e_tor_r = orho1_r * dLh_lm * _cc2real(z, _m_arr)
 
-    ones = torch.ones(lm_max, dtype=torch.float64, device=e_pol_r.device)
+    ones = torch.ones(lm_max, dtype=DTYPE, device=e_pol_r.device)
     return (ones @ e_pol_r, _m0_f @ e_pol_r,
             ones @ e_tor_r, _m0_f @ e_tor_r)
 
@@ -357,7 +357,7 @@ def get_e_mag_radial(b, db, aj):
         dLh_lm * or2_r * _cc2real(b, _m_arr) + _cc2real(db, _m_arr))
     e_tor_r = dLh_lm * _cc2real(aj, _m_arr)
 
-    ones = torch.ones(lm_max, dtype=torch.float64, device=e_pol_r.device)
+    ones = torch.ones(lm_max, dtype=DTYPE, device=e_pol_r.device)
     return (ones @ e_pol_r, _m0_f @ e_pol_r,
             ones @ e_tor_r, _m0_f @ e_tor_r,
             _l1_f @ e_pol_r)
@@ -458,7 +458,7 @@ class RadialAccumulator:
     """Trapezoidal time-integration of radial profiles, matching Fortran."""
 
     def __init__(self, n_profiles, n_r):
-        self.profiles = [torch.zeros(n_r, dtype=torch.float64) for _ in range(n_profiles)]
+        self.profiles = [torch.zeros(n_r, dtype=DTYPE) for _ in range(n_profiles)]
         self.n_e_sets = 0
         self.time_tot = 0.0
         self.time_last = 0.0
@@ -468,15 +468,15 @@ class RadialAccumulator:
         dt = time - self.time_last
         if self.n_e_sets == 1:
             for i, p in enumerate(new_profiles):
-                self.profiles[i] = p.clone().to(dtype=torch.float64, device='cpu')
+                self.profiles[i] = p.clone().to(dtype=DTYPE, device='cpu')
             self.time_tot = 1.0  # placeholder
         elif self.n_e_sets == 2:
             for i, p in enumerate(new_profiles):
-                self.profiles[i] = dt * (self.profiles[i] + p.to(dtype=torch.float64, device='cpu'))
+                self.profiles[i] = dt * (self.profiles[i] + p.to(dtype=DTYPE, device='cpu'))
             self.time_tot = 2.0 * dt
         else:
             for i, p in enumerate(new_profiles):
-                self.profiles[i] += dt * p.to(dtype=torch.float64, device='cpu')
+                self.profiles[i] += dt * p.to(dtype=DTYPE, device='cpu')
             self.time_tot += dt
         self.time_last = time
 
@@ -567,14 +567,14 @@ class MeanSD:
     """Welford online weighted mean + variance, matching mean_sd.f90."""
 
     def __init__(self, n_r):
-        self.mean = torch.zeros(n_r, dtype=torch.float64)
-        self.SD = torch.zeros(n_r, dtype=torch.float64)
+        self.mean = torch.zeros(n_r, dtype=DTYPE, device=DEVICE)
+        self.SD = torch.zeros(n_r, dtype=DTYPE, device=DEVICE)
         self.n_calls = 0
 
     def compute(self, input_data, dt, total_time):
         """Update mean and variance. dt=timePassed, total_time=timeNorm."""
         self.n_calls += 1
-        data = input_data.to(dtype=torch.float64) if input_data.dtype != torch.float64 else input_data
+        data = input_data.to(dtype=DTYPE) if input_data.dtype != DTYPE else input_data
         if self.n_calls == 1:
             self.mean = data.clone()
             self.SD = torch.zeros_like(self.mean)
@@ -772,36 +772,36 @@ def get_dlm(w, dw, z, switch='V'):
     e_total = e_p_lm + e_t_lm  # (lm_max, n_r_max)
 
     # Aggregate per-l: scatter_add over lm -> l
-    e_lr = torch.zeros(l_max + 1, n_r_max, dtype=torch.float64, device=e_total.device)
+    e_lr = torch.zeros(l_max + 1, n_r_max, dtype=DTYPE, device=e_total.device)
     e_lr.scatter_add_(0, _l_expanded, e_total)
 
-    e_pol_lr = torch.zeros(l_max + 1, n_r_max, dtype=torch.float64, device=e_total.device)
+    e_pol_lr = torch.zeros(l_max + 1, n_r_max, dtype=DTYPE, device=e_total.device)
     e_pol_lr.scatter_add_(0, _l_expanded, e_p_lm)
 
     # Per-m aggregation
-    e_mr = torch.zeros(m_max + 1, n_r_max, dtype=torch.float64, device=e_total.device)
+    e_mr = torch.zeros(m_max + 1, n_r_max, dtype=DTYPE, device=e_total.device)
     e_mr.scatter_add_(0, _m_expanded[:, :n_r_max], e_total)
 
     # Convective (m != 0) for 'V' only
     if switch == 'V':
         m_ne0 = (st_lm2m != 0).unsqueeze(1)  # (lm_max, 1)
         e_conv = e_total * m_ne0
-        e_lr_c = torch.zeros(l_max + 1, n_r_max, dtype=torch.float64, device=e_total.device)
+        e_lr_c = torch.zeros(l_max + 1, n_r_max, dtype=DTYPE, device=e_total.device)
         e_lr_c.scatter_add_(0, _l_expanded, e_conv)
 
     # --- Global scalars ---
     fac = 0.5  # half * eScale, eScale=1.0
 
     # Per-l integrated energy
-    e_l_integrated = torch.zeros(l_max + 1, dtype=torch.float64, device=e_total.device)
-    e_pol_l_integrated = torch.zeros(l_max + 1, dtype=torch.float64, device=e_total.device)
+    e_l_integrated = torch.zeros(l_max + 1, dtype=DTYPE, device=e_total.device)
+    e_pol_l_integrated = torch.zeros(l_max + 1, dtype=DTYPE, device=e_total.device)
     for l in range(lFirst, l_max + 1):
         e_l_integrated[l] = fac * rInt_R(e_lr[l, :])
         e_pol_l_integrated[l] = fac * rInt_R(e_pol_lr[l, :])
 
     E_slice = e_l_integrated[lFirst:]
     E = E_slice.sum().item()
-    l_range = torch.arange(lFirst, l_max + 1, dtype=torch.float64, device=e_total.device)
+    l_range = torch.arange(lFirst, l_max + 1, dtype=DTYPE, device=e_total.device)
     EL = (l_range * E_slice).sum().item()
 
     dl = math.pi * E / EL if EL != 0.0 else 0.0
@@ -813,7 +813,7 @@ def get_dlm(w, dw, z, switch='V'):
     dlPolPeak = math.pi / lpeak
 
     if switch == 'V':
-        e_l_c_integrated = torch.zeros(l_max + 1, dtype=torch.float64, device=e_total.device)
+        e_l_c_integrated = torch.zeros(l_max + 1, dtype=DTYPE, device=e_total.device)
         for l in range(lFirst, l_max + 1):
             e_l_c_integrated[l] = fac * rInt_R(e_lr_c[l, :])
         Ec = e_l_c_integrated[lFirst:].sum().item()
@@ -850,13 +850,13 @@ def get_dlm(w, dw, z, switch='V'):
         max_vals, max_idx = e_pol_per_r.max(dim=0)  # (n_r_max,)
         lpeak_r = max_idx + 1  # l starts at 1
         dlPolPeakR = torch.where(max_vals > 10.0 * _eps,
-                                 math.pi / lpeak_r.to(dtype=torch.float64),
-                                 torch.zeros(n_r_max, dtype=torch.float64,
+                                 math.pi / lpeak_r.to(dtype=DTYPE),
+                                 torch.zeros(n_r_max, dtype=DTYPE,
                                              device=e_total.device))
     else:  # 'B'
-        dlR = torch.zeros(n_r_max, dtype=torch.float64, device=e_total.device)
-        dlRc = torch.zeros(n_r_max, dtype=torch.float64, device=e_total.device)
-        dlPolPeakR = torch.zeros(n_r_max, dtype=torch.float64, device=e_total.device)
+        dlR = torch.zeros(n_r_max, dtype=DTYPE, device=e_total.device)
+        dlRc = torch.zeros(n_r_max, dtype=DTYPE, device=e_total.device)
+        dlPolPeakR = torch.zeros(n_r_max, dtype=DTYPE, device=e_total.device)
 
     return (dl, dlR, dm, dlc, dlPolPeak, dlRc, dlPolPeakR)
 
@@ -883,7 +883,7 @@ def get_u_square(w, dw, z):
     e_total = e_p_lm + e_t_lm  # (lm_max, n_r_max)
 
     # Total and axisymmetric sums
-    ones = torch.ones(lm_max, dtype=torch.float64, device=e_p_lm.device)
+    ones = torch.ones(lm_max, dtype=DTYPE, device=e_p_lm.device)
     fac = 0.5 * eScale
 
     e_p = fac * rInt_R(ones @ e_p_lm).item()
@@ -893,13 +893,13 @@ def get_u_square(w, dw, z):
     e_kin = e_p + e_t
 
     # Per-l energy decomposition via scatter_add
-    e_lr = torch.zeros(l_max + 1, n_r_max, dtype=torch.float64, device=e_total.device)
+    e_lr = torch.zeros(l_max + 1, n_r_max, dtype=DTYPE, device=e_total.device)
     e_lr.scatter_add_(0, _l_expanded, e_total)
 
     # Convective (m != 0) per-l
     m_ne0 = (st_lm2m != 0).unsqueeze(1)  # (lm_max, 1)
     e_conv = e_total * m_ne0
-    e_lr_c = torch.zeros(l_max + 1, n_r_max, dtype=torch.float64, device=e_total.device)
+    e_lr_c = torch.zeros(l_max + 1, n_r_max, dtype=DTYPE, device=e_total.device)
     e_lr_c.scatter_add_(0, _l_expanded, e_conv)
 
     # Rossby / Reynolds numbers
@@ -922,7 +922,7 @@ def get_u_square(w, dw, z):
 
     # Length scales: dl = pi*E/EL — batched rInt_R over all l
     e_l_all = fac * rInt_R(e_lr[1:, :])  # (l_max,) — radial integral per l
-    l_range = torch.arange(1, l_max + 1, dtype=torch.float64, device=e_total.device)
+    l_range = torch.arange(1, l_max + 1, dtype=DTYPE, device=e_total.device)
     E = e_l_all.sum().item()
     EL = (l_range * e_l_all).sum().item()
 
@@ -1287,14 +1287,14 @@ def get_power_spectral(w, s, xi, b, ddb, aj, dj):
     if l_heat:
         # buoy_r(nR) = Σ_lm eScale * dLh * BuoFac * rgrav(nR) * cc22real(w, s, m)
         buoy_lm = eScale * dLh_lm * BuoFac * rgrav_r * _cc22real(w, s, _m_arr)
-        ones = torch.ones(lm_max, dtype=torch.float64, device=w.device)
+        ones = torch.ones(lm_max, dtype=DTYPE, device=w.device)
         buoy = rInt_R(ones @ buoy_lm).item()
 
     # --- Chemical buoyancy ---
     buoy_chem = 0.0
     if l_chemical_conv and xi is not None:
         buoy_chem_lm = eScale * dLh_lm * ChemFac * rgrav_r * _cc22real(w, xi, _m_arr)
-        ones = torch.ones(lm_max, dtype=torch.float64, device=w.device)
+        ones = torch.ones(lm_max, dtype=DTYPE, device=w.device)
         buoy_chem = rInt_R(ones @ buoy_chem_lm).item()
 
     # --- Ohmic dissipation ---
@@ -1308,7 +1308,7 @@ def get_power_spectral(w, s, xi, b, ddb, aj, dj):
                      (dLh_lm * or2_r * _cc2real(aj, _m_arr) +
                       _cc2real(dj, _m_arr) +
                       _cc2real(laplace, _m_arr)))
-        ones = torch.ones(lm_max, dtype=torch.float64, device=b.device)
+        ones = torch.ones(lm_max, dtype=DTYPE, device=b.device)
         curlB2 = rInt_R(ones @ curlB2_lm).item()
 
     return buoy, buoy_chem, curlB2

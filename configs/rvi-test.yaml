@@ -1,0 +1,24 @@
+# Dynamo benchmark with movie output
+# Standard Christensen et al. 2001 case 1
+# Ra=1e5, Ek=1e-3, Pr=1, Pm=5, l_max=16
+
+# Grid
+l_max: 16
+n_r_max: 33
+
+# Physics (defaults: ra=1e5, ek=1e-3, pr=1, prmag=5)
+
+# Time stepping
+n_steps: 1000
+dt: 1.0e-4
+
+# Output
+output_dir: ./output/rvi-test
+log_every: 100
+
+# Movies
+movies: ["Br CMB", "Vr EQ"]
+n_movie_step: 5
+
+# Device
+device: mps
