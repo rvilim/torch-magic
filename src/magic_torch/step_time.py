@@ -54,6 +54,12 @@ _cvrc = torch.zeros_like(_vrc)
 _cvtc = torch.zeros_like(_vrc)
 _cvpc = torch.zeros_like(_vrc)
 
+# Grid-space fields persisted for movie output (set by radial_loop)
+last_brc = None  # (n_r, n_theta, n_phi)
+last_btc = None
+last_bpc = None
+last_sc = None
+
 # Precompute broadcast arrays for initial rhs_imp
 _hdif_S_lm = hdif_S[st_lm2l].to(CDTYPE).unsqueeze(1)
 _hdif_V_lm = hdif_V[st_lm2l].to(CDTYPE).unsqueeze(1)
@@ -684,6 +690,14 @@ def radial_loop():
         _vrc, _vtc, _vpc, _cvrc, _cvtc, _cvpc,
         sc, brc, btc, bpc, cbrc, cbtc, cbpc, xic)
     Advr, Advt, Advp, VSr, VSt, VSp, VxBr, VxBt, VxBp, VXir, VXit, VXip = nl_result
+
+    # Persist grid-space fields for movie output
+    global last_brc, last_btc, last_bpc, last_sc
+    if l_mag:
+        last_brc = brc
+        last_btc = btc
+        last_bpc = bpc
+    last_sc = sc
 
     # === 3. Forward SHT (batched) ===
     # For FD: all N levels (Fortran nBc=0 at boundaries, needed for p0 RHS)

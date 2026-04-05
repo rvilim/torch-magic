@@ -294,6 +294,8 @@ def run(cfg=None):
     restart = cfg.get("restart", None)
     fortran_restart = cfg.get("fortran_restart", None)
     n_graphs = cfg.get("n_graphs", 1)  # number of graph files to write
+    movie_list = cfg.get("movies", [])  # list of movie strings, e.g. ["Br CMB", "Vr EQ"]
+    n_movie_step = cfg.get("n_movie_step", 0)  # 0 = no movies
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -442,6 +444,22 @@ def run(cfg=None):
         from .radial_functions import vol_oc as _vol_oc, vol_ic as _vol_ic
         f_log = _file_stack.enter_context(
             open(os.path.join(output_dir, f"log.{tag}"), e_kin_mode))
+
+        # Movie files
+        movie_files = []
+        movie_configs = []
+        if n_movie_step > 0 and movie_list:
+            from .movie_output import (parse_movie_string, write_movie_header,
+                                       write_movie_frame, extract_surface_field,
+                                       extract_equat_field)
+            for ms in movie_list:
+                field_type, n_surface, const, fname = parse_movie_string(ms)
+                fpath = os.path.join(output_dir, f"{fname}.{tag}")
+                mf = _file_stack.enter_context(open(fpath, 'wb'))
+                write_movie_header(mf, n_surface, 1, const, [field_type])
+                movie_files.append(mf)
+                movie_configs.append((field_type, n_surface))
+                print(f"  Movie: {ms} → {fpath}")
 
         # Write once-at-init files (only on fresh start)
         if not appending:
@@ -802,6 +820,25 @@ def run(cfg=None):
                 f_timestep.flush()
             dt = dt_actual
             sim_time += dt
+
+            # Write movie frames
+            if n_movie_step > 0 and movie_files and n % n_movie_step == 0:
+                from . import step_time as _st
+                import numpy as _np
+                for mf, (ft, ns) in zip(movie_files, movie_configs):
+                    if ns == 1:  # r=const (CMB)
+                        frame = extract_surface_field(
+                            ft, 0, _st._vrc, _st._vtc, _st._vpc,
+                            _st.last_brc, _st.last_btc, _st.last_bpc, _st.last_sc)
+                    elif ns == 2:  # theta=const (equator)
+                        frame = extract_equat_field(
+                            ft, _st._vrc, _st._vtc, _st._vpc,
+                            _st.last_brc, _st.last_btc, _st.last_bpc, _st.last_sc)
+                    else:
+                        continue
+                    write_movie_frame(mf, sim_time, [frame])
+                    mf.flush()
+
             # Accumulate timePassedLog for power diagnostics (output.f90:289)
             timePassedLog += dt
             steps_done = n - start_step
