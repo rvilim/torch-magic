@@ -300,6 +300,10 @@ def run(cfg=None):
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
+    # TensorBoard writer
+    from torch.utils.tensorboard import SummaryWriter
+    tb_writer = SummaryWriter(log_dir=os.path.join(output_dir, 'tb'))
+
     # Initialize or restore
     if fortran_restart:
         ck = load_fortran_checkpoint(fortran_restart)
@@ -543,6 +547,15 @@ def run(cfg=None):
                 f"{wall_elapsed:.3f}", f"{ms:.3f}",
             ])
             log_file.flush()
+
+            # TensorBoard logging
+            tb_writer.add_scalar('energy/kin_pol', e_kin_pol, step)
+            tb_writer.add_scalar('energy/kin_tor', e_kin_tor, step)
+            tb_writer.add_scalar('energy/mag_pol', e_mag_pol, step)
+            tb_writer.add_scalar('energy/mag_tor', e_mag_tor, step)
+            tb_writer.add_scalar('energy/kin_total', e_kin_pol + e_kin_tor, step)
+            tb_writer.add_scalar('energy/mag_total', e_mag_pol + e_mag_tor, step)
+
             # Write Fortran-format energy files
             t_out = sim_time * tScale
             write_e_kin_line(f_ekin, t_out, ek)
@@ -949,6 +962,7 @@ def run(cfg=None):
             write_log_stop(f_log, sim_time * tScale, n_steps + 1, steps_done)
 
     # ExitStack closes all file handles here
+    tb_writer.close()
     if steps_done > 0:
         print(f"\nDone: {steps_done} steps in {elapsed:.1f}s "
               f"({elapsed / steps_done * 1000:.1f}ms/step)")

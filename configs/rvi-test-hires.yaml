@@ -1,0 +1,19 @@
+# Dynamo at l=64 with movie output
+# Ra=3e5, Ek=1e-4, Pr=1, Pm=5
+
+l_max: 64
+n_r_max: 129
+
+ra: 3.0e5
+ek: 1.0e-4
+
+n_steps: 100000
+dt: 1.0e-5
+
+output_dir: ./output/rvi-test-hires
+log_every: 100
+
+movies: ["Br CMB", "Vr EQ"]
+n_movie_step: 5
+
+device: mps

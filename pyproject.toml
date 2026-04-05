@@ -11,6 +11,8 @@ dependencies = [
     "modal>=1.4.0",
     "scipy>=1.15.3",
     "typing-extensions>=4.15.0",
+    "matplotlib>=3.10.8",
+    "tensorboard>=2.20.0",
 ]
 
 [build-system]
