@@ -165,16 +165,16 @@ def _scal_to_spat_kernel(
     acc_S_re *= osq4pi
     acc_S_im *= osq4pi
 
-    # Write output: (mc, th, batch) layout — store the 2D tile
-    # Output is (n_m_max, NHS, n_batch), so offset = (mc * NHS + th) * n_batch + batch
-    for ti in range(THETA_BLOCK):
-        th_idx = th_block * THETA_BLOCK + ti
-        if th_idx < NHS:
-            out_base = (mc * NHS + th_idx) * n_batch + batch_offs
-            tl.store(out_N_re_ptr + out_base, acc_N_re[ti, :], mask=batch_mask)
-            tl.store(out_N_im_ptr + out_base, acc_N_im[ti, :], mask=batch_mask)
-            tl.store(out_S_re_ptr + out_base, acc_S_re[ti, :], mask=batch_mask)
-            tl.store(out_S_im_ptr + out_base, acc_S_im[ti, :], mask=batch_mask)
+    # Write output: (mc, th, batch) layout
+    # Output is (n_m_max, NHS, n_batch). Use 2D offset grid for the tile.
+    # out_offs[i, j] = (mc * NHS + (th_block*THETA_BLOCK + i)) * n_batch + (bb*BATCH_BLOCK + j)
+    th_out = th_block * THETA_BLOCK + tl.arange(0, THETA_BLOCK)  # (THETA_BLOCK,)
+    out_offs = (mc * NHS + th_out[:, None]) * n_batch + batch_offs[None, :]  # (THETA_BLOCK, BATCH_BLOCK)
+    out_mask = th_mask[:, None] & batch_mask[None, :]  # (THETA_BLOCK, BATCH_BLOCK)
+    tl.store(out_N_re_ptr + out_offs, acc_N_re, mask=out_mask)
+    tl.store(out_N_im_ptr + out_offs, acc_N_im, mask=out_mask)
+    tl.store(out_S_re_ptr + out_offs, acc_S_re, mask=out_mask)
+    tl.store(out_S_im_ptr + out_offs, acc_S_im, mask=out_mask)
 
 
 def scal_to_spat_triton(Slm: torch.Tensor) -> torch.Tensor:
