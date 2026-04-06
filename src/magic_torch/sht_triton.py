@@ -40,7 +40,7 @@ _n_lm = torch.zeros(n_m_max, dtype=torch.int32, device="cpu")
 
 # Fill recurrence coefficients and seed table
 _pos = 0
-_sin_N = sinTheta[:_NHS].numpy()
+_sin_N = sinTheta[:_NHS].cpu().numpy()
 for _mc in range(n_m_max):
     _m = _mc * minc
     _nlm = l_max - _m + 1
