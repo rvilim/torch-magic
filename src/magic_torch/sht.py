@@ -174,7 +174,106 @@ _sphertor_D_r = torch.cat([_wdPlm_pad_r] * 4, dim=0)
 # Imag coeff group: 4 copies of -dm*wPlm (for input positions [f1N, f2N, f1S, f2S])
 _sphertor_C_r = torch.cat([_wPlm_dm_imag_pad_r] * 4, dim=0)
 
-# Free intermediate matrices only used to build the stacked versions above
+# === Bucketed BMM precomputation ===
+# Split m-modes into K buckets by nlm size to reduce padding waste.
+# At l=384: 50% of bmm FLOPs are wasted; bucketing reduces waste to ~20%.
+_N_BUCKETS = 4
+_USE_BUCKETED = (n_m_max >= 64)
+
+if _USE_BUCKETED:
+    _bucket_size = n_m_max // _N_BUCKETS
+    _buckets = []
+    for _k in range(_N_BUCKETS):
+        _ms = _k * _bucket_size
+        _me = (_k + 1) * _bucket_size if _k < _N_BUCKETS - 1 else n_m_max
+        _nm = _me - _ms
+        _max_nlm_k = _n_lm_m[_ms]  # largest nlm in this bucket (first m)
+        _buckets.append((_ms, _me, _nm, _max_nlm_k))
+
+    def _build_padded_T_r_b(mc_range, n_modes, max_nlm_k, per_m_list):
+        P = torch.zeros(n_modes, _NHS, max_nlm_k, dtype=DTYPE, device=DEVICE)
+        for i, mc in enumerate(mc_range):
+            nlm = _n_lm_m[mc]
+            P[i, :, :nlm] = per_m_list[mc].real.T
+        return P
+
+    def _build_padded_r_b(mc_range, n_modes, max_nlm_k, per_m_list):
+        P = torch.zeros(n_modes, max_nlm_k, _NHS, dtype=DTYPE, device=DEVICE)
+        for i, mc in enumerate(mc_range):
+            nlm = _n_lm_m[mc]
+            P[i, :nlm, :] = per_m_list[mc].real
+        return P
+
+    # Per-bucket gather/scatter indices
+    _spec_gather_b = []
+    _result_to_lm_b = []
+    for _ms, _me, _nm, _max_nlm_k in _buckets:
+        sg = torch.zeros(_nm, _max_nlm_k, dtype=torch.long, device=DEVICE)
+        lm_pos_list = []
+        flat_pos_list = []
+        for i, mc in enumerate(range(_ms, _me)):
+            nlm = _n_lm_m[mc]
+            sg[i, :nlm] = torch.arange(_ls_m[mc], _lmS_m[mc] + 1, device=DEVICE)
+            for j in range(nlm):
+                lm_pos_list.append(_ls_m[mc] + j)
+                flat_pos_list.append(i * _max_nlm_k + j)
+        _spec_gather_b.append(sg)
+        _result_to_lm_b.append((
+            torch.tensor(lm_pos_list, dtype=torch.long, device=DEVICE),
+            torch.tensor(flat_pos_list, dtype=torch.long, device=DEVICE),
+        ))
+
+    # Per-bucket sign vectors
+    _sign_ea_neg_r_b = [_sign_ea_neg_r[:mlk] for _, _, _, mlk in _buckets]
+    _sign_es_neg_r_b = [_sign_es_neg_r[:mlk] for _, _, _, mlk in _buckets]
+    _sign_ea_neg_b = [_sign_ea_neg[:mlk] for _, _, _, mlk in _buckets]
+
+    # Per-bucket forward SHT matrices
+    _torpol_mats_r_b = []
+    _P_plm_T_r_b = []
+    _P_plm_signS_T_r_b = []
+    _P_dplm_T_r_b = []
+    _P_dplm_signS_T_r_b = []
+    _P_mPlm_T_r_b = []
+    _P_mPlm_signS_T_r_b = []
+    for _ms, _me, _nm, _max_nlm_k in _buckets:
+        _r = range(_ms, _me)
+        _plm = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _Plm_c_m)
+        _plmS = _plm * _sign_ea_neg_r[:_max_nlm_k]
+        _plmG = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _PlmG_c_m)
+        _plmC = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _PlmC_c_m)
+        _plmCsign = _plmC * _sign_es_neg_r[:_max_nlm_k]
+        _plmGsign = _plmG * _sign_es_neg_r[:_max_nlm_k]
+        _torpol_mats_r_b.append(torch.cat([_plm, _plmS, _plmG, _plmC, _plmCsign, _plmGsign], dim=0))
+        _P_plm_T_r_b.append(_plm)
+        _P_plm_signS_T_r_b.append(_plmS)
+        _dplm = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _dPlm_c_m)
+        _P_dplm_T_r_b.append(_dplm)
+        _P_dplm_signS_T_r_b.append(_dplm * _sign_es_neg_r[:_max_nlm_k])
+        _mplm_c_map = {mc: _dm_m[mc] * _Plm_c_m[mc] for mc in _r}
+        _mplm = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _mplm_c_map)
+        _P_mPlm_T_r_b.append(_mplm)
+        _P_mPlm_signS_T_r_b.append(_mplm * _sign_ea_neg_r[:_max_nlm_k])
+
+    # Per-bucket inverse SHT matrices
+    _wPlm_pad_r_b = []
+    _wPlm_sign_pad_r_b = []
+    _sphertor_D_r_b = []
+    _sphertor_C_r_b = []
+    for _ms, _me, _nm, _max_nlm_k in _buckets:
+        _r = range(_ms, _me)
+        _wp = _build_padded_r_b(_r, _nm, _max_nlm_k, _wPlm_c_m)
+        _wPlm_pad_r_b.append(_wp)
+        _wPlm_sign_pad_r_b.append(_wp * _sign_ea_neg_r[:_max_nlm_k].unsqueeze(1))
+        _wd = _build_padded_r_b(_r, _nm, _max_nlm_k, _wdPlm_c_m)
+        _sphertor_D_r_b.append(torch.cat([_wd] * 4, dim=0))
+        _wdm = torch.zeros(_nm, _max_nlm_k, _NHS, dtype=DTYPE, device=DEVICE)
+        for i, mc in enumerate(_r):
+            nlm = _n_lm_m[mc]
+            _wdm[i, :nlm, :] = (-_dm_m[mc]) * _wPlm_c_m[mc].real
+        _sphertor_C_r_b.append(torch.cat([_wdm] * 4, dim=0))
+
+# Free intermediate matrices only used to build the stacked/bucketed versions above
 del _P_PlmG_T_r, _P_PlmC_T_r, _P_PlmC_sign_T_r, _P_PlmG_sign_T_r
 del _wdPlm_pad_r, _wPlm_dm_imag_pad_r
 del _Plm_c_m, _dPlm_c_m, _wPlm_c_m, _wdPlm_c_m, _PlmG_c_m, _PlmC_c_m
@@ -200,20 +299,28 @@ def scal_to_spat(Slm: torch.Tensor, lcut: int = None) -> torch.Tensor:
 
     n_batch = Slm.shape[1]
 
-    # Gather spectral coefficients for all m-modes: (n_m_max, max_nlm, n_batch)
-    Q_pad = Slm[_spec_gather]
-
-    # Real bmm: Plm matrices are real, use view_as_real for ~3x speedup
-    Q_ri = torch.view_as_real(Q_pad).flatten(-2)       # (n_m_max, max_nlm, 2*n_batch) float64
-    sN_ri = torch.bmm(_P_plm_T_r, Q_ri)               # (n_m_max, NHS, 2*n_batch) float64
-    sS_ri = torch.bmm(_P_plm_signS_T_r, Q_ri)         # (n_m_max, NHS, 2*n_batch) float64
-    sN = torch.view_as_complex(sN_ri.unflatten(-1, (-1, 2)))  # (n_m_max, NHS, n_batch) complex
-    sS = torch.view_as_complex(sS_ri.unflatten(-1, (-1, 2)))
-
     # Assemble frequency-domain array: (n_theta_max, n_phi_max//2+1, n_batch)
     tmp = torch.zeros(n_theta_max, n_phi_max // 2 + 1, n_batch, dtype=CDTYPE, device=DEVICE)
-    tmp[0::2, :n_m_max, :] = sN.permute(1, 0, 2)
-    tmp[1::2, :n_m_max, :] = sS.permute(1, 0, 2)
+
+    if _USE_BUCKETED:
+        for k, (ms, me, nm, mlk) in enumerate(_buckets):
+            Q_k = Slm[_spec_gather_b[k]]  # (nm, mlk, n_batch)
+            Q_ri = torch.view_as_real(Q_k).flatten(-2)
+            sN_ri = torch.bmm(_P_plm_T_r_b[k], Q_ri)
+            sS_ri = torch.bmm(_P_plm_signS_T_r_b[k], Q_ri)
+            sN = torch.view_as_complex(sN_ri.unflatten(-1, (-1, 2)))
+            sS = torch.view_as_complex(sS_ri.unflatten(-1, (-1, 2)))
+            tmp[0::2, ms:me, :] = sN.permute(1, 0, 2)
+            tmp[1::2, ms:me, :] = sS.permute(1, 0, 2)
+    else:
+        Q_pad = Slm[_spec_gather]
+        Q_ri = torch.view_as_real(Q_pad).flatten(-2)
+        sN_ri = torch.bmm(_P_plm_T_r, Q_ri)
+        sS_ri = torch.bmm(_P_plm_signS_T_r, Q_ri)
+        sN = torch.view_as_complex(sN_ri.unflatten(-1, (-1, 2)))
+        sS = torch.view_as_complex(sS_ri.unflatten(-1, (-1, 2)))
+        tmp[0::2, :n_m_max, :] = sN.permute(1, 0, 2)
+        tmp[1::2, :n_m_max, :] = sS.permute(1, 0, 2)
 
     sc = torch.fft.irfft(tmp, n=n_phi_max, dim=1, norm="forward")
 
@@ -255,15 +362,25 @@ def scal_to_SH(sc: torch.Tensor, lcut: int = None) -> torch.Tensor:
     f1N = f1_N.permute(2, 1, 0).contiguous()
     f1S = f1_S.permute(2, 1, 0).contiguous()
 
-    # Real bmm: wPlm matrices are real, use view_as_real for ~3x speedup
-    f1N_ri = torch.view_as_real(f1N).flatten(-2)   # (n_m_max, NHS, 2*n_batch) float64
-    f1S_ri = torch.view_as_real(f1S).flatten(-2)   # (n_m_max, NHS, 2*n_batch) float64
-    RN_ri = torch.bmm(_wPlm_pad_r, f1N_ri)         # (n_m_max, max_nlm, 2*n_batch) float64
-    RS_ri = torch.bmm(_wPlm_sign_pad_r, f1S_ri)    # (n_m_max, max_nlm, 2*n_batch) float64
-
-    # Combine and scatter to output
-    result = torch.view_as_complex((RN_ri + RS_ri).unflatten(-1, (-1, 2)))
-    Slm = result.reshape(-1, n_batch)[_result_to_lm]  # (lm_max, n_batch)
+    if _USE_BUCKETED:
+        Slm = torch.zeros(lm_max, n_batch, dtype=CDTYPE, device=DEVICE)
+        for k, (ms, me, nm, mlk) in enumerate(_buckets):
+            f1N_k = f1N[ms:me]  # (nm, NHS, n_batch)
+            f1S_k = f1S[ms:me]
+            f1N_ri = torch.view_as_real(f1N_k).flatten(-2)
+            f1S_ri = torch.view_as_real(f1S_k).flatten(-2)
+            RN_ri = torch.bmm(_wPlm_pad_r_b[k], f1N_ri)
+            RS_ri = torch.bmm(_wPlm_sign_pad_r_b[k], f1S_ri)
+            result = torch.view_as_complex((RN_ri + RS_ri).unflatten(-1, (-1, 2)))
+            lm_pos, flat_pos = _result_to_lm_b[k]
+            Slm[lm_pos] = result.reshape(-1, n_batch)[flat_pos]
+    else:
+        f1N_ri = torch.view_as_real(f1N).flatten(-2)
+        f1S_ri = torch.view_as_real(f1S).flatten(-2)
+        RN_ri = torch.bmm(_wPlm_pad_r, f1N_ri)
+        RS_ri = torch.bmm(_wPlm_sign_pad_r, f1S_ri)
+        result = torch.view_as_complex((RN_ri + RS_ri).unflatten(-1, (-1, 2)))
+        Slm = result.reshape(-1, n_batch)[_result_to_lm]
 
     if not batched:
         Slm = Slm.squeeze(1)
@@ -300,42 +417,50 @@ def torpol_to_spat(Qlm: torch.Tensor, Slm: torch.Tensor, Tlm: torch.Tensor,
     bhG[0] = 0.0
     bhC[0] = 0.0
 
-    # Gather spectral coefficients for all m-modes: (n_m_max, max_nlm, n_batch)
-    Q_pad = Qlm[_spec_gather]
-    G_pad = bhG[_spec_gather]
-    C_pad = bhC[_spec_gather]
-
-    # Stack inputs matching _torpol_mats_r order:
-    # [plm_N, plm_S, PlmG, PlmC, PlmC_sign, PlmG_sign]
-    inputs_c = torch.cat([Q_pad, Q_pad, G_pad, C_pad, G_pad, C_pad], dim=0)
-
-    # Real bmm: Plm matrices are real, use view_as_real for ~6x speedup
-    inputs_ri = torch.view_as_real(inputs_c).flatten(-2)
-    results_ri = torch.bmm(_torpol_mats_r, inputs_ri)
-    results = torch.view_as_complex(results_ri.unflatten(-1, (-1, 2)))
-
-    # Unpack: (6, n_m_max, NHS, n_batch)
-    brN, brS, N1, N2, S1, S2 = results.view(6, n_m_max, _NHS, n_batch).unbind(0)
-
     # Assemble frequency-domain arrays
     tmpr = torch.zeros(n_theta_max, n_phi_max // 2 + 1, n_batch, dtype=CDTYPE, device=DEVICE)
     tmpt = torch.zeros_like(tmpr)
     tmpp = torch.zeros_like(tmpr)
 
-    # Radial
-    tmpr[0::2, :n_m_max, :] = brN.permute(1, 0, 2)
-    tmpr[1::2, :n_m_max, :] = brS.permute(1, 0, 2)
-
-    # Angular: theta = 0.5*(N1+N2), phi = -ci*0.5*(N1-N2) for each hemisphere
-    half_N1pN2 = half * (N1 + N2)
-    half_S1pS2 = half * (S1 + S2)
-    half_N1mN2 = half * (N1 - N2)
-    half_S1mS2 = half * (S1 - S2)
-
-    tmpt[0::2, :n_m_max, :] = half_N1pN2.permute(1, 0, 2)
-    tmpt[1::2, :n_m_max, :] = half_S1pS2.permute(1, 0, 2)
-    tmpp[0::2, :n_m_max, :] = (-ci * half_N1mN2).permute(1, 0, 2)
-    tmpp[1::2, :n_m_max, :] = (-ci * half_S1mS2).permute(1, 0, 2)
+    if _USE_BUCKETED:
+        for k, (ms, me, nm, mlk) in enumerate(_buckets):
+            Q_k = Qlm[_spec_gather_b[k]]
+            G_k = bhG[_spec_gather_b[k]]
+            C_k = bhC[_spec_gather_b[k]]
+            inputs_c = torch.cat([Q_k, Q_k, G_k, C_k, G_k, C_k], dim=0)
+            inputs_ri = torch.view_as_real(inputs_c).flatten(-2)
+            results_ri = torch.bmm(_torpol_mats_r_b[k], inputs_ri)
+            results = torch.view_as_complex(results_ri.unflatten(-1, (-1, 2)))
+            brN, brS, N1, N2, S1, S2 = results.view(6, nm, _NHS, n_batch).unbind(0)
+            tmpr[0::2, ms:me, :] = brN.permute(1, 0, 2)
+            tmpr[1::2, ms:me, :] = brS.permute(1, 0, 2)
+            half_N1pN2 = half * (N1 + N2)
+            half_S1pS2 = half * (S1 + S2)
+            half_N1mN2 = half * (N1 - N2)
+            half_S1mS2 = half * (S1 - S2)
+            tmpt[0::2, ms:me, :] = half_N1pN2.permute(1, 0, 2)
+            tmpt[1::2, ms:me, :] = half_S1pS2.permute(1, 0, 2)
+            tmpp[0::2, ms:me, :] = (-ci * half_N1mN2).permute(1, 0, 2)
+            tmpp[1::2, ms:me, :] = (-ci * half_S1mS2).permute(1, 0, 2)
+    else:
+        Q_pad = Qlm[_spec_gather]
+        G_pad = bhG[_spec_gather]
+        C_pad = bhC[_spec_gather]
+        inputs_c = torch.cat([Q_pad, Q_pad, G_pad, C_pad, G_pad, C_pad], dim=0)
+        inputs_ri = torch.view_as_real(inputs_c).flatten(-2)
+        results_ri = torch.bmm(_torpol_mats_r, inputs_ri)
+        results = torch.view_as_complex(results_ri.unflatten(-1, (-1, 2)))
+        brN, brS, N1, N2, S1, S2 = results.view(6, n_m_max, _NHS, n_batch).unbind(0)
+        tmpr[0::2, :n_m_max, :] = brN.permute(1, 0, 2)
+        tmpr[1::2, :n_m_max, :] = brS.permute(1, 0, 2)
+        half_N1pN2 = half * (N1 + N2)
+        half_S1pS2 = half * (S1 + S2)
+        half_N1mN2 = half * (N1 - N2)
+        half_S1mS2 = half * (S1 - S2)
+        tmpt[0::2, :n_m_max, :] = half_N1pN2.permute(1, 0, 2)
+        tmpt[1::2, :n_m_max, :] = half_S1pS2.permute(1, 0, 2)
+        tmpp[0::2, :n_m_max, :] = (-ci * half_N1mN2).permute(1, 0, 2)
+        tmpp[1::2, :n_m_max, :] = (-ci * half_S1mS2).permute(1, 0, 2)
 
     brc = torch.fft.irfft(tmpr, n=n_phi_max, dim=1, norm="forward")
     btc = torch.fft.irfft(tmpt, n=n_phi_max, dim=1, norm="forward")
@@ -374,32 +499,40 @@ def scal_to_grad_spat(Slm: torch.Tensor, lcut: int = None):
 
     n_batch = Slm.shape[1]
 
-    # Gather spectral coefficients: (n_m_max, max_nlm, n_batch)
-    Q_pad = Slm[_spec_gather]
-
-    # view_as_real bmm: float64 dgemm for ~3x speedup
-    Q_ri = torch.view_as_real(Q_pad).flatten(-2)  # (n_m_max, max_nlm, 2*n_batch)
-
-    # Theta gradient: dPlm.T @ Q (parity-flipped: S hemisphere negates ES spectral)
-    tN_ri = torch.bmm(_P_dplm_T_r, Q_ri)          # (n_m_max, NHS, 2*n_batch)
-    tS_ri = torch.bmm(_P_dplm_signS_T_r, Q_ri)    # (n_m_max, NHS, 2*n_batch)
-    tN = torch.view_as_complex(tN_ri.unflatten(-1, (-1, 2)))  # (n_m_max, NHS, n_batch)
-    tS = torch.view_as_complex(tS_ri.unflatten(-1, (-1, 2)))
-
-    # Phi gradient: ci * m * Plm.T @ Q (same parity as scal_to_spat)
-    pN_ri = torch.bmm(_P_mPlm_T_r, Q_ri)          # (n_m_max, NHS, 2*n_batch)
-    pS_ri = torch.bmm(_P_mPlm_signS_T_r, Q_ri)    # (n_m_max, NHS, 2*n_batch)
-    pN = torch.view_as_complex(pN_ri.unflatten(-1, (-1, 2)))
-    pS = torch.view_as_complex(pS_ri.unflatten(-1, (-1, 2)))
-
-    # Assemble interleaved theta grid: N at even, S at odd
     tmpt = torch.zeros(n_theta_max, n_phi_max // 2 + 1, n_batch, dtype=CDTYPE, device=DEVICE)
-    tmpt[0::2, :n_m_max, :] = tN.permute(1, 0, 2)
-    tmpt[1::2, :n_m_max, :] = tS.permute(1, 0, 2)
+    tmpp = torch.zeros_like(tmpt)
 
-    tmpp = torch.zeros(n_theta_max, n_phi_max // 2 + 1, n_batch, dtype=CDTYPE, device=DEVICE)
-    tmpp[0::2, :n_m_max, :] = (ci * pN).permute(1, 0, 2)
-    tmpp[1::2, :n_m_max, :] = (ci * pS).permute(1, 0, 2)
+    if _USE_BUCKETED:
+        for k, (ms, me, nm, mlk) in enumerate(_buckets):
+            Q_k = Slm[_spec_gather_b[k]]
+            Q_ri = torch.view_as_real(Q_k).flatten(-2)
+            tN_ri = torch.bmm(_P_dplm_T_r_b[k], Q_ri)
+            tS_ri = torch.bmm(_P_dplm_signS_T_r_b[k], Q_ri)
+            tN = torch.view_as_complex(tN_ri.unflatten(-1, (-1, 2)))
+            tS = torch.view_as_complex(tS_ri.unflatten(-1, (-1, 2)))
+            pN_ri = torch.bmm(_P_mPlm_T_r_b[k], Q_ri)
+            pS_ri = torch.bmm(_P_mPlm_signS_T_r_b[k], Q_ri)
+            pN = torch.view_as_complex(pN_ri.unflatten(-1, (-1, 2)))
+            pS = torch.view_as_complex(pS_ri.unflatten(-1, (-1, 2)))
+            tmpt[0::2, ms:me, :] = tN.permute(1, 0, 2)
+            tmpt[1::2, ms:me, :] = tS.permute(1, 0, 2)
+            tmpp[0::2, ms:me, :] = (ci * pN).permute(1, 0, 2)
+            tmpp[1::2, ms:me, :] = (ci * pS).permute(1, 0, 2)
+    else:
+        Q_pad = Slm[_spec_gather]
+        Q_ri = torch.view_as_real(Q_pad).flatten(-2)
+        tN_ri = torch.bmm(_P_dplm_T_r, Q_ri)
+        tS_ri = torch.bmm(_P_dplm_signS_T_r, Q_ri)
+        tN = torch.view_as_complex(tN_ri.unflatten(-1, (-1, 2)))
+        tS = torch.view_as_complex(tS_ri.unflatten(-1, (-1, 2)))
+        pN_ri = torch.bmm(_P_mPlm_T_r, Q_ri)
+        pS_ri = torch.bmm(_P_mPlm_signS_T_r, Q_ri)
+        pN = torch.view_as_complex(pN_ri.unflatten(-1, (-1, 2)))
+        pS = torch.view_as_complex(pS_ri.unflatten(-1, (-1, 2)))
+        tmpt[0::2, :n_m_max, :] = tN.permute(1, 0, 2)
+        tmpt[1::2, :n_m_max, :] = tS.permute(1, 0, 2)
+        tmpp[0::2, :n_m_max, :] = (ci * pN).permute(1, 0, 2)
+        tmpp[1::2, :n_m_max, :] = (ci * pS).permute(1, 0, 2)
 
     gradtc = torch.fft.irfft(tmpt, n=n_phi_max, dim=1, norm="forward")
     gradpc = torch.fft.irfft(tmpp, n=n_phi_max, dim=1, norm="forward")
@@ -461,34 +594,46 @@ def spat_to_sphertor(vt: torch.Tensor, vp: torch.Tensor, lcut: int = None):
     f2N = f2_N.permute(2, 1, 0).contiguous()
     f2S = f2_S.permute(2, 1, 0).contiguous()
 
-    # Real bmm: separate real (wdPlm=D) and imaginary (wPlm_dm=j*C) matrix groups.
-    # D (real): positions [1,2,5,6], inputs [f2N, f1N, f2S, f1S]
-    # C (imag coeff -dm*wPlm): positions [0,3,4,7], inputs [f1N, f2N, f1S, f2S]
-    D_inputs = torch.cat([f2N, f1N, f2S, f1S], dim=0)  # (4*nm, NHS, nb) complex
-    D_ri = torch.view_as_real(D_inputs).flatten(-2)      # (4*nm, NHS, 2*nb) float64
-    D_out = torch.view_as_complex(
-        torch.bmm(_sphertor_D_r, D_ri).unflatten(-1, (-1, 2)))
-    D_parts = D_out.view(4, n_m_max, _max_n_lm, n_batch)  # [Bf2N, Bf1N, Bf2S, Bf1S]
-
-    # For j*C @ x: result = complex(-C@x_imag, C@x_real)
-    # Achieved by feeding [-x_imag, x_real] interleaved as the "real" input
-    C_inputs = torch.cat([f1N, f2N, f1S, f2S], dim=0)
-    C_swapped = torch.stack([-C_inputs.imag, C_inputs.real], dim=-1).flatten(-2)
-    C_out = torch.view_as_complex(
-        torch.bmm(_sphertor_C_r, C_swapped).unflatten(-1, (-1, 2)))
-    C_parts = C_out.view(4, n_m_max, _max_n_lm, n_batch)  # [Af1N, Af2N, Af1S, Af2S]
-
-    # Combine using ES/EA parity:
-    # Slm = (Af1N + Bf2N) + sign * (Af1S - Bf2S)
-    # Tlm = (-Bf1N + Af2N) + sign * (Bf1S + Af2S)
-    sign = _sign_ea_neg.unsqueeze(1)  # (max_nlm, 1) complex
-
-    Slm_pad = (C_parts[0] + D_parts[0]) + sign * (C_parts[2] - D_parts[2])
-    Tlm_pad = (-D_parts[1] + C_parts[1]) + sign * (D_parts[3] + C_parts[3])
-
-    # Scatter to output using precomputed index
-    Slm = Slm_pad.reshape(-1, n_batch)[_result_to_lm]
-    Tlm = Tlm_pad.reshape(-1, n_batch)[_result_to_lm]
+    if _USE_BUCKETED:
+        Slm = torch.zeros(lm_max, n_batch, dtype=CDTYPE, device=DEVICE)
+        Tlm = torch.zeros(lm_max, n_batch, dtype=CDTYPE, device=DEVICE)
+        for k, (ms, me, nm, mlk) in enumerate(_buckets):
+            f1N_k = f1N[ms:me]
+            f1S_k = f1S[ms:me]
+            f2N_k = f2N[ms:me]
+            f2S_k = f2S[ms:me]
+            D_inputs = torch.cat([f2N_k, f1N_k, f2S_k, f1S_k], dim=0)
+            D_ri = torch.view_as_real(D_inputs).flatten(-2)
+            D_out = torch.view_as_complex(
+                torch.bmm(_sphertor_D_r_b[k], D_ri).unflatten(-1, (-1, 2)))
+            D_parts = D_out.view(4, nm, mlk, n_batch)
+            C_inputs = torch.cat([f1N_k, f2N_k, f1S_k, f2S_k], dim=0)
+            C_swapped = torch.stack([-C_inputs.imag, C_inputs.real], dim=-1).flatten(-2)
+            C_out = torch.view_as_complex(
+                torch.bmm(_sphertor_C_r_b[k], C_swapped).unflatten(-1, (-1, 2)))
+            C_parts = C_out.view(4, nm, mlk, n_batch)
+            sign_k = _sign_ea_neg_b[k].unsqueeze(1)
+            Slm_pad = (C_parts[0] + D_parts[0]) + sign_k * (C_parts[2] - D_parts[2])
+            Tlm_pad = (-D_parts[1] + C_parts[1]) + sign_k * (D_parts[3] + C_parts[3])
+            lm_pos, flat_pos = _result_to_lm_b[k]
+            Slm[lm_pos] = Slm_pad.reshape(-1, n_batch)[flat_pos]
+            Tlm[lm_pos] = Tlm_pad.reshape(-1, n_batch)[flat_pos]
+    else:
+        D_inputs = torch.cat([f2N, f1N, f2S, f1S], dim=0)
+        D_ri = torch.view_as_real(D_inputs).flatten(-2)
+        D_out = torch.view_as_complex(
+            torch.bmm(_sphertor_D_r, D_ri).unflatten(-1, (-1, 2)))
+        D_parts = D_out.view(4, n_m_max, _max_n_lm, n_batch)
+        C_inputs = torch.cat([f1N, f2N, f1S, f2S], dim=0)
+        C_swapped = torch.stack([-C_inputs.imag, C_inputs.real], dim=-1).flatten(-2)
+        C_out = torch.view_as_complex(
+            torch.bmm(_sphertor_C_r, C_swapped).unflatten(-1, (-1, 2)))
+        C_parts = C_out.view(4, n_m_max, _max_n_lm, n_batch)
+        sign = _sign_ea_neg.unsqueeze(1)
+        Slm_pad = (C_parts[0] + D_parts[0]) + sign * (C_parts[2] - D_parts[2])
+        Tlm_pad = (-D_parts[1] + C_parts[1]) + sign * (D_parts[3] + C_parts[3])
+        Slm = Slm_pad.reshape(-1, n_batch)[_result_to_lm]
+        Tlm = Tlm_pad.reshape(-1, n_batch)[_result_to_lm]
 
     # Division by l(l+1)
     Slm *= _inv_dLh
