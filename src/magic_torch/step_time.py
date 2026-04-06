@@ -298,34 +298,19 @@ def _fused_lm_loop_fast():
     f.w_LMloc[:] = zwp_phys[LM:2 * LM]
     f.p_LMloc[:] = zwp_phys[2 * LM:]
 
-    # === 7. Unified D1+D2+D3 matmul for all fields ===
-    prof.start("lm_loop.d123_matmul")
-    all_phys = torch.cat([sxi_phys, zwp_phys])  # (nTotal*LM, N) complex128
-    # Split real/imag DGEMM: 2× faster than complex ZGEMM since D matrices are real
-    all_r = all_phys.real.contiguous()
-    all_i = all_phys.imag.contiguous()
-    d123 = torch.complex(all_r @ _D123_T, all_i @ _D123_T)  # (nTotal*LM, 3N)
-    d1_all = d123[:, :N]
-    d2_all = d123[:, N:2 * N]
-    d3_all = d123[:, 2 * N:]
-
-    # Extract per-field derivatives
-    off = 0
-    f.ds_LMloc[:] = d1_all[off:off + LM]
-    d2s = d2_all[off:off + LM]
-    off += LM
+    # === 7. Radial derivatives via DCT pipeline: O(N log N) ===
+    prof.start("lm_loop.d123_matmul")  # keep profiler name for comparison
+    # S+[Xi]: d1+d2
+    f.ds_LMloc[:], d2s = get_ddr(sxi_phys[:LM])
     if l_chemical_conv:
-        f.dxi_LMloc[:] = d1_all[off:off + LM]
-        d2xi = d2_all[off:off + LM]
-        off += LM
-    f.dz_LMloc[:] = d1_all[off:off + LM]
-    d2z = d2_all[off:off + LM]
-    off += LM
-    f.dw_LMloc[:] = d1_all[off:off + LM]
-    f.ddw_LMloc[:] = d2_all[off:off + LM]
-    dddw = d3_all[off:off + LM]
-    off += LM
-    f.dp_LMloc[:] = d1_all[off:off + LM]
+        f.dxi_LMloc[:], d2xi = get_ddr(sxi_phys[LM:2 * LM])
+    # Z: d1+d2
+    f.dz_LMloc[:], d2z = get_ddr(zwp_phys[:LM])
+    # W: d1+d2+d3
+    f.dw_LMloc[:], f.ddw_LMloc[:], dddw = get_dddr(zwp_phys[LM:2 * LM])
+    dddw = dddw  # keep name for downstream use
+    # P: d1 only
+    f.dp_LMloc[:] = get_dr(zwp_phys[2 * LM:])
 
     prof.stop("lm_loop.d123_matmul")
     # === 8. Rotate IMEX (BPR353: no-op; CNAB2: shift history) ===
