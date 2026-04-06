@@ -261,3 +261,68 @@ Radial loop now dominated by SHT matmuls (torpol_to_spat 1.4ms, spat_to_sphertor
 
 Memory: ~43MB for 5 solver inverses at N=129 (65×129×129 float64 each).
 Gate: N ≤ 1024. For N > 1024, falls back to batched Thomas/pentadiag.
+
+### B200 profiling (2026-04-05)
+
+CUDA event-based profiling on NVIDIA B200 (192 GB HBM3e, 72 TFLOP/s fp64).
+200 steps, first 2 skipped as warmup.
+
+#### l=128 (N=257, no chunking) — 56 ms/step
+
+| Component | ms/step | % |
+|---|---|---|
+| **radial_loop total** | **18.5** | **33%** |
+| radial_loop.inv_sht | 8.4 | 15% |
+| radial_loop.fwd_sht | 7.5 | 13% |
+| radial_loop.get_td | 1.5 | 3% |
+| radial_loop.get_nl | 0.6 | 1% |
+| **lm_loop total** | **7.8** | **14%** |
+| lm_loop.solve_szw | 5.4 | 10% |
+| lm_loop.d123_matmul | 1.8 | 3% |
+| lm_loop.solve_b | 2.4 | 4% |
+| **Unaccounted (output, alloc, bookkeeping)** | **~30** | **~53%** |
+
+#### l=384 (N=769, chunk_size=32) — 2122 ms/step (corrected profiler)
+
+| Component | ms/step | % |
+|---|---|---|
+| **radial_loop total** | **633** | **30%** |
+| radial_loop.inv_sht | 277 | 13% |
+| radial_loop.fwd_sht | 285 | 13% |
+| radial_loop.get_td | 44 | 2% |
+| radial_loop.get_nl | 16 | 1% |
+| **lm_loop total** | **330** | **16%** |
+| lm_loop.solve_szw | 240 | 11% |
+| lm_loop.d123_matmul | 127 | 6% |
+| lm_loop.solve_b | 90 | 4% |
+| lm_loop.wp_solve | 49 | 2% |
+| lm_loop.scalar_solve | 33 | 2% |
+Key observations:
+- **SHT dominates**: inv_sht (277ms) + fwd_sht (285ms) = 562ms
+- **SHT at l=384**: 50% of bmm FLOPs wasted on zero-padded Plm entries
+- **get_nl**: only 16ms — torch.compile fusion working well
+- Note: profiler TOTAL was double-counting (summing outer + inner timers). Fixed in v3.
+  Real step time = sum of top-level timers only (radial_loop + lm_loop) ≈ 965 ms.
+
+#### l=384 after view_as_real D123 + rotate_imex fix (2026-04-05)
+
+Split real/imag DGEMM for all derivative matmuls (D123, get_dr, get_ddr, get_dddr).
+Removed .clone() from rotate_imex (non-overlapping dim-2 slices don't need it).
+
+| Component | Before | After | Change |
+|---|---|---|---|
+| **radial_loop** | **633** | **626** | -1% |
+| radial_loop.inv_sht | 277 | 278 | — |
+| radial_loop.fwd_sht | 285 | 285 | — |
+| radial_loop.get_td | 44 | 36 | -18% |
+| radial_loop.get_nl | 16 | 16 | — |
+| **lm_loop** | **330** | **253** | **-23%** |
+| lm_loop.solve_szw | 240 | 181 | -25% |
+| lm_loop.d123_matmul | 127 | 70 | **-45%** |
+| lm_loop.solve_b | 90 | 72 | **-20%** |
+| lm_loop.wp_solve | 49 | 49 | — |
+| lm_loop.scalar_solve | 33 | 33 | — |
+| **TOTAL (top-level)** | **~965** | **880** | **-9%** |
+
+SHT now 64% of step time (inv_sht 278 + fwd_sht 285 = 563 ms).
+50% of SHT bmm FLOPs are wasted on zero-padded Plm entries — next optimization target.

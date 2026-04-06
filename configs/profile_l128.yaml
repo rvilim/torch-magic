@@ -1,0 +1,13 @@
+# Profile run: l=128, 200 steps, B200
+l_max: 128
+n_r_max: 257
+
+n_steps: 200
+dt: 5.0e-5
+
+output_dir: ./output/profile_l128
+log_every: 200
+checkpoint_every: 0
+
+device: cuda
+profile: true

@@ -890,12 +890,15 @@ def run(cfg=None, on_log=None):
             t_out = sim_time * tScale
             graph_path = os.path.join(output_dir, f"G_1.{tag}")
             graph_filename = f"G_1.{tag}"
-            write_graph_file(graph_path, t_out,
-                             fields.w_LMloc, fields.dw_LMloc, fields.z_LMloc,
-                             fields.s_LMloc, fields.p_LMloc,
-                             fields.b_LMloc, fields.db_LMloc, fields.aj_LMloc)
-            print(f"  Wrote graph file: {graph_path}")
-            write_log_store(f_log, "graphic", t_out, n_steps + 1, graph_filename)
+            try:
+                write_graph_file(graph_path, t_out,
+                                 fields.w_LMloc, fields.dw_LMloc, fields.z_LMloc,
+                                 fields.s_LMloc, fields.p_LMloc,
+                                 fields.b_LMloc, fields.db_LMloc, fields.aj_LMloc)
+                print(f"  Wrote graph file: {graph_path}")
+                write_log_store(f_log, "graphic", t_out, n_steps + 1, graph_filename)
+            except torch.cuda.OutOfMemoryError:
+                print(f"  Skipped graph file (OOM at high resolution)")
 
         # Write Fortran-format checkpoint at end of run
         if n_steps > 0:
@@ -983,6 +986,9 @@ def run(cfg=None, on_log=None):
     if steps_done > 0:
         print(f"\nDone: {steps_done} steps in {elapsed:.1f}s "
               f"({elapsed / steps_done * 1000:.1f}ms/step)")
+
+    from .profiler import prof
+    prof.report()
 
     return _get_energies()
 

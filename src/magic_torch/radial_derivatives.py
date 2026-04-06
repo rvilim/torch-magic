@@ -15,14 +15,26 @@ from .params import n_r_max, n_cheb_max, l_cond_ic
 from .cosine_transform import costf
 
 
+def _real_matmul(f_complex, D_real_T):
+    """Complex field × real matrix via split real/imag DGEMM (2× faster than ZGEMM).
+
+    For real matrix A: A @ (x_r + i*x_i) = A @ x_r + i * (A @ x_i)
+    Two DGEMMs at full throughput instead of one ZGEMM at half throughput.
+    """
+    fr = f_complex.real.contiguous()  # (..., N) float64
+    fi = f_complex.imag.contiguous()  # (..., N) float64
+    return torch.complex(fr @ D_real_T, fi @ D_real_T)
+
+
 def get_dr(f: torch.Tensor) -> torch.Tensor:
     """First radial derivative.
 
     Uses banded matvec for FD, dense matmul for Chebyshev.
+    Chebyshev path uses split real/imag DGEMM since D matrices are real.
     """
     if _D1_bands is not None:
         return _banded_matvec(_D1_bands, f)
-    return f @ _D1.T
+    return _real_matmul(f, _D1_real_T)
 
 
 def get_ddr(f: torch.Tensor):
@@ -33,8 +45,10 @@ def get_ddr(f: torch.Tensor):
     """
     if _D1_bands is not None:
         return _banded_matvec(_D1_bands, f), _banded_matvec(_D2_bands, f)
-    return f @ _D1.T, f @ _D2.T
-
+    fr = f.real.contiguous()
+    fi = f.imag.contiguous()
+    return (torch.complex(fr @ _D1_real_T, fi @ _D1_real_T),
+            torch.complex(fr @ _D2_real_T, fi @ _D2_real_T))
 
 
 def get_dddr(f: torch.Tensor):
@@ -47,7 +61,11 @@ def get_dddr(f: torch.Tensor):
         return (_banded_matvec(_D1_bands, f),
                 _banded_matvec(_D2_bands, f),
                 _banded_matvec(_D3_bands, f))
-    return f @ _D1.T, f @ _D2.T, f @ _D3.T
+    fr = f.real.contiguous()
+    fi = f.imag.contiguous()
+    return (torch.complex(fr @ _D1_real_T, fi @ _D1_real_T),
+            torch.complex(fr @ _D2_real_T, fi @ _D2_real_T),
+            torch.complex(fr @ _D3_real_T, fi @ _D3_real_T))
 
 
 def _build_diff_matrices():
@@ -77,7 +95,11 @@ def _build_diff_matrices():
 
 
 _D1_real, _D2_real, _D3_real, _D4_real = _build_diff_matrices()
-# Complex versions for use with complex fields
+# Real transposed matrices for view_as_real DGEMM trick
+_D1_real_T = _D1_real.T.contiguous()
+_D2_real_T = _D2_real.T.contiguous()
+_D3_real_T = _D3_real.T.contiguous()
+# Complex versions (kept for backward compat / non-Chebyshev paths)
 _D1 = _D1_real.to(CDTYPE)
 _D2 = _D2_real.to(CDTYPE)
 _D3 = _D3_real.to(CDTYPE)

@@ -10,6 +10,7 @@ Implements:
 import torch
 
 from .precision import DTYPE, CDTYPE, DEVICE
+from .profiler import prof
 from .params import (n_r_max, lm_max, l_max, n_theta_max, n_phi_max, alpha,
                      l_cond_ic, l_rot_ic, l_mag, l_chemical_conv, l_anel,
                      l_correct_AMz, l_correct_AMe, l_heat, l_SRIC,
@@ -47,16 +48,16 @@ if l_chemical_conv:
 _dLh_1d = dLh.to(CDTYPE)  # (lm_max,)
 
 # Pre-allocated velocity buffers for radial_loop (no-slip: boundaries stay zero)
-# In chunked mode, all velocity/curl buffers are chunk-local — skip full-size allocation.
+# Always allocated: needed by non-chunked path, anelastic path, and movie output.
+# Curl-velocity buffers only needed by non-chunked Boussinesq path.
+_vrc = torch.zeros(n_r_max, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
+_vtc = torch.zeros_like(_vrc)
+_vpc = torch.zeros_like(_vrc)
 if radial_chunk_size == 0:
-    _vrc = torch.zeros(n_r_max, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
-    _vtc = torch.zeros_like(_vrc)
-    _vpc = torch.zeros_like(_vrc)
     _cvrc = torch.zeros_like(_vrc)
     _cvtc = torch.zeros_like(_vrc)
     _cvpc = torch.zeros_like(_vrc)
 else:
-    _vrc = _vtc = _vpc = None
     _cvrc = _cvtc = _cvpc = None
 
 # Grid-space fields persisted for movie output (set by radial_loop)
@@ -115,11 +116,10 @@ _m0_mask = (st_lm2m == 0)  # (lm_max,) bool
 # Lorentz torque on IC from most recent radial_loop (for rot.TAG output)
 lorentz_torque_ic_last = 0.0
 
-# Combined D1+D2 matrix for single matmul (saves 1 dispatch per call)
-_D12_T = torch.cat([_D1_cd.T, _D2_cd.T], dim=1)  # (N, 2N)
-
-# Combined D1+D2+D3 for unified derivative computation across all fields
-_D123_T = torch.cat([_D1_cd.T, _D2_cd.T, _D3_cd.T], dim=1)  # (N, 3N)
+# Combined D matrices as float64 for DGEMM (view_as_real trick)
+from .radial_derivatives import _D1_real_T, _D2_real_T, _D3_real_T
+_D12_T = torch.cat([_D1_real_T, _D2_real_T], dim=1)    # (N, 2N) float64
+_D123_T = torch.cat([_D1_real_T, _D2_real_T, _D3_real_T], dim=1)  # (N, 3N) float64
 
 # Precomputed combined coefficients for impl terms (saves multiplications)
 _two_or1_r = (two * _or1_r)  # (1, N) complex
@@ -241,6 +241,7 @@ def _fused_lm_loop_fast():
     rhs_scalar[(nS - 1) * LM:, N - 1] = 0.0
 
     # === 2. Scalar solve (single bmm) ===
+    prof.start("lm_loop.scalar_solve")
     sol_scalar = chunked_solve_complex(_scalar_inv, _scalar_lidx, rhs_scalar)
     sol_scalar[_scalar_m0] = sol_scalar[_scalar_m0].real.to(CDTYPE)
     if n_cheb_max < N:
@@ -276,6 +277,8 @@ def _fused_lm_loop_fast():
         p0_rhs[1:] += _ChemFac_rgrav_1d * f.xi_LMloc[lm0, 1:].real
 
     # === 5. WP solve ===
+    prof.stop("lm_loop.scalar_solve")
+    prof.start("lm_loop.wp_solve")
     sol_wp = chunked_solve_complex(update_wp._wp_inv_by_l, st_lm2l, rhs_combined)
     sol_wp[_m0_mask] = sol_wp[_m0_mask].real.to(CDTYPE)
     w_cheb = sol_wp[:, :N]
@@ -287,6 +290,7 @@ def _fused_lm_loop_fast():
         p_cheb[:, n_cheb_max:] = 0.0
 
     # === 6. Batched costf for Z+W+P (1 FFT instead of 2) ===
+    prof.stop("lm_loop.wp_solve")
     z_cheb = sol_scalar[(nS - 1) * LM:]  # Z is the last scalar block
     zwp_cheb = torch.cat([z_cheb, w_cheb, p_cheb])  # single cat, 3 fields
     zwp_phys = costf(zwp_cheb)
@@ -295,8 +299,12 @@ def _fused_lm_loop_fast():
     f.p_LMloc[:] = zwp_phys[2 * LM:]
 
     # === 7. Unified D1+D2+D3 matmul for all fields ===
-    all_phys = torch.cat([sxi_phys, zwp_phys])  # (nTotal*LM, N)
-    d123 = all_phys @ _D123_T  # single matmul → (nTotal*LM, 3N)
+    prof.start("lm_loop.d123_matmul")
+    all_phys = torch.cat([sxi_phys, zwp_phys])  # (nTotal*LM, N) complex128
+    # Split real/imag DGEMM: 2× faster than complex ZGEMM since D matrices are real
+    all_r = all_phys.real.contiguous()
+    all_i = all_phys.imag.contiguous()
+    d123 = torch.complex(all_r @ _D123_T, all_i @ _D123_T)  # (nTotal*LM, 3N)
     d1_all = d123[:, :N]
     d2_all = d123[:, N:2 * N]
     d3_all = d123[:, 2 * N:]
@@ -319,6 +327,7 @@ def _fused_lm_loop_fast():
     off += LM
     f.dp_LMloc[:] = d1_all[off:off + LM]
 
+    prof.stop("lm_loop.d123_matmul")
     # === 8. Rotate IMEX (BPR353: no-op; CNAB2: shift history) ===
     tscheme.rotate_imex(d.dsdt)
     if l_chemical_conv:
@@ -637,6 +646,7 @@ def _radial_loop_chunked():
         need_pad = actual_C < C
 
         # --- 1. Inverse SHT (spectral[:, start:end] → grid (actual_C, nθ, nφ)) ---
+        prof.start("radial_loop.inv_sht")
         # Scalars
         if l_heat or l_chemical_conv:
             scal_inv_list = []
@@ -741,6 +751,8 @@ def _radial_loop_chunked():
         cvpc_chunk = all_p[offset:offset + C]
 
         # --- 2. Nonlinear products (chunk-sized) ---
+        prof.stop("radial_loop.inv_sht")
+        prof.start("radial_loop.get_nl")
         or4_chunk = _or4_3_full[start:end]
         or2_chunk_3 = _or2_3_full[start:end]
         if need_pad:
@@ -751,6 +763,7 @@ def _radial_loop_chunked():
             sc_chunk, brc_chunk, btc_chunk, bpc_chunk, cbrc_chunk, cbtc_chunk, cbpc_chunk,
             xic_chunk, or4_chunk, or2_chunk_3)
         Advr, Advt, Advp, VSr, VSt, VSp, VxBr, VxBt, VxBp, VXir, VXit, VXip = nl_result
+        prof.stop("radial_loop.get_nl")
 
         # --- Per-chunk CFL check (on unpadded data) ---
         dtrkc_c, dthkc_c = courant_check(
@@ -775,6 +788,7 @@ def _radial_loop_chunked():
             bpc_icb = bpc_chunk[local_icb].clone()
 
         # --- 3. Forward SHT on bulk portion of chunk ---
+        prof.start("radial_loop.fwd_sht")
         bulk_start = max(1, start)
         bulk_end = min(N - 1, end)
         if bulk_end > bulk_start:
@@ -826,6 +840,7 @@ def _radial_loop_chunked():
             if l_chemical_conv:
                 VXitLM[:, bulk_start:bulk_end] = S_out[:, v_offset:v_offset + Nb_chunk]
                 v_offset += Nb_chunk
+        prof.stop("radial_loop.fwd_sht")
 
     # === After all chunks ===
     # Movie captures: not available in chunked mode (grid arrays are chunk-local)
@@ -846,6 +861,7 @@ def _radial_loop_chunked():
         VxBtLM[:, icb_nr] = VxBtLM_icb_S[:, 0]
 
     # === 4. Time derivative assembly (full spectral arrays) ===
+    prof.start("radial_loop.get_td")
     if l_double_curl:
         dwdt_expl, dVxVhLM = get_dwdt_double_curl(
             AdvrLM, AdvtLM, f.w_LMloc, f.dw_LMloc, f.ddw_LMloc,
@@ -878,6 +894,7 @@ def _radial_loop_chunked():
         dt_fields.dbdt.expl[:, :, expl_idx] = dbdt_expl
         dt_fields.djdt.expl[:, :, expl_idx] = djdt_expl
 
+    prof.stop("radial_loop.get_td")
     # === 5. IC rotation (uses saved ICB slices) ===
     global lorentz_torque_ic_last
     if l_mag and l_rot_ic and l_cond_ic:
@@ -925,6 +942,7 @@ def radial_loop():
     expl_idx = max(0, tscheme.istage - 1) if tscheme.nstages > 1 else 0
 
     # === 1. Inverse SHT (batched) ===
+    prof.start("radial_loop.inv_sht")
     # Scalars: entropy (all N levels), plus composition if active
     if l_heat or l_chemical_conv:
         scal_inv_list = []
@@ -1012,10 +1030,13 @@ def radial_loop():
     _cvpc[:] = all_p[offset:offset + N]
 
     # === 2. Nonlinear products (all radial levels at once) ===
+    prof.stop("radial_loop.inv_sht")
+    prof.start("radial_loop.get_nl")
     nl_result = get_nl(
         _vrc, _vtc, _vpc, _cvrc, _cvtc, _cvpc,
         sc, brc, btc, bpc, cbrc, cbtc, cbpc, xic)
     Advr, Advt, Advp, VSr, VSt, VSp, VxBr, VxBt, VxBp, VXir, VXit, VXip = nl_result
+    prof.stop("radial_loop.get_nl")
 
     # Persist grid-space fields for movie output
     global last_brc, last_btc, last_bpc, last_sc
@@ -1026,6 +1047,7 @@ def radial_loop():
     last_sc = sc
 
     # === 3. Forward SHT (batched) ===
+    prof.start("radial_loop.fwd_sht")
     # For FD: all N levels (Fortran nBc=0 at boundaries, needed for p0 RHS)
     # For Chebyshev: interior only (bulk), boundaries stay zero (nBc != 0)
     scal_fwd_list = [Advr[bulk], VSr[bulk]]
@@ -1103,6 +1125,8 @@ def radial_loop():
         VxBtLM[:, icb_nr] = VxBtLM_icb_S[:, 0]
 
     # === 4. Time derivative assembly ===
+    prof.stop("radial_loop.fwd_sht")
+    prof.start("radial_loop.get_td")
     # Poloidal velocity
     if l_double_curl:
         dwdt_expl, dVxVhLM = get_dwdt_double_curl(
@@ -1164,6 +1188,7 @@ def radial_loop():
         )
 
     # === 7. CFL Courant condition ===
+    prof.stop("radial_loop.get_td")
     dtrkc, dthkc = courant_check(
         _vrc, _vtc, _vpc,
         brc if l_mag else None,
@@ -1448,6 +1473,7 @@ def lm_loop():
     f = fields
     d = dt_fields
 
+    prof.start("lm_loop.solve_szw")
     if (l_heat and not l_z10mat and not l_anel
             and not l_correct_AMz and not l_correct_AMe and not l_double_curl):
         # Fused path: S + [Xi] + Z + WP all in one optimized pipeline
@@ -1471,7 +1497,9 @@ def lm_loop():
             updateWP(f.s_LMloc, f.w_LMloc, f.dw_LMloc, f.ddw_LMloc,
                      d.dwdt, f.p_LMloc, f.dp_LMloc, d.dpdt, tscheme,
                      xi_LMloc=f.xi_LMloc if l_chemical_conv else None)
+    prof.stop("lm_loop.solve_szw")
 
+    prof.start("lm_loop.solve_b")
     if l_mag:
         if l_cond_ic:
             updateB(f.b_LMloc, f.db_LMloc, f.ddb_LMloc,
@@ -1484,6 +1512,7 @@ def lm_loop():
             updateB(f.b_LMloc, f.db_LMloc, f.ddb_LMloc,
                     f.aj_LMloc, f.dj_LMloc, f.ddj_LMloc,
                     d.dbdt, d.djdt, tscheme)
+    prof.stop("lm_loop.solve_b")
 
 
 def build_all_matrices():
@@ -1568,7 +1597,9 @@ def _one_step_cnab2(n_time_step: int, dt: float) -> float:
         dt_new: the time step size used for the implicit solve
     """
     # 1. Explicit terms + CFL arrays
+    prof.start("radial_loop")
     dtrkc, dthkc = _radial_loop_dispatch()
+    prof.stop("radial_loop")
 
     # 2. CFL decision
     l_new_dt, dt_new = dt_courant(dt, _dtMax, dtrkc, dthkc)
@@ -1586,8 +1617,11 @@ def _one_step_cnab2(n_time_step: int, dt: float) -> float:
         build_all_matrices()
 
     # 6. Implicit solve
+    prof.start("lm_loop")
     lm_loop()
+    prof.stop("lm_loop")
 
+    prof.step_done()
     return dt_new
 
 
@@ -1606,7 +1640,9 @@ def _one_step_dirk(n_time_step: int, dt: float) -> float:
     for n_stage in range(1, tscheme.nstages + 1):
         # Compute explicit terms (skip for stages where l_exp_calc is False)
         if tscheme.l_exp_calc[n_stage - 1]:
+            prof.start("radial_loop")
             dtrkc, dthkc = _radial_loop_dispatch()
+            prof.stop("radial_loop")
 
             # CFL only at first stage
             if n_stage == 1:
@@ -1621,9 +1657,12 @@ def _one_step_dirk(n_time_step: int, dt: float) -> float:
                     build_all_matrices()
 
         # Implicit solve
+        prof.start("lm_loop")
         lm_loop()
+        prof.stop("lm_loop")
 
         # Advance stage counter
         tscheme.istage += 1
 
+    prof.step_done()
     return dt_new

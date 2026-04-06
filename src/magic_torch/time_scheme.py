@@ -128,15 +128,19 @@ class CNAB2:
         return rhs
 
     def rotate_imex(self, dfdt):
-        """Roll time arrays: shift history back by one slot."""
+        """Roll time arrays: shift history back by one slot.
+
+        No .clone() needed: reverse iteration order ensures each source is read
+        before being overwritten, and src/dst are non-overlapping dim-2 slices.
+        """
         for n_o in range(self.nexp - 1, 0, -1):
-            dfdt.expl[:, :, n_o] = dfdt.expl[:, :, n_o - 1].clone()
+            dfdt.expl[:, :, n_o] = dfdt.expl[:, :, n_o - 1]
 
         for n_o in range(self.nold - 1, 0, -1):
-            dfdt.old[:, :, n_o] = dfdt.old[:, :, n_o - 1].clone()
+            dfdt.old[:, :, n_o] = dfdt.old[:, :, n_o - 1]
 
         for n_o in range(self.nimp - 1, 0, -1):
-            dfdt.impl[:, :, n_o] = dfdt.impl[:, :, n_o - 1].clone()
+            dfdt.impl[:, :, n_o] = dfdt.impl[:, :, n_o - 1]
 
     def rotate_imex_scalar(self, dfdt_scalar):
         """Roll scalar time arrays."""

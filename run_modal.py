@@ -94,6 +94,7 @@ def run_remote(cfg: dict, run_name: str):
         "kbotxi": "MAGIC_KBOTXI",
         "intfac": "MAGIC_INTFAC",
         "radial_chunk_size": "MAGIC_RADIAL_CHUNK",
+        "profile": "MAGIC_PROFILE",
     }
     for key, env_var in _CFG_TO_ENV.items():
         if key in cfg:
