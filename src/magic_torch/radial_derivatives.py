@@ -26,75 +26,15 @@ def _real_matmul(f_complex, D_real_T):
     return torch.complex(fr @ D_real_T, fi @ D_real_T)
 
 
-# --- DCT-based Chebyshev derivatives: O(N log N) instead of O(N²) ---
-# Uses the pipeline: costf → dcheb recurrence → costf → drx scaling
-# The backward recurrence dc[n] = dc[n+2] + 2*(n+1)*c[n+1] is sequential
-# in n but vectorized across the batch dimension.
-
-# Precompute chain-rule scaling constants (for linear mapping: drx=const, ddrx=dddrx=0)
-_drx_val = drx[0].item()
-_drx2_val = _drx_val * _drx_val
-_drx3_val = _drx2_val * _drx_val
-_ncheb = n_cheb_max
-
-
-def _dcheb(c):
-    """First Chebyshev spectral derivative via backward recurrence. O(N)."""
-    N = c.shape[-1]
-    nmax = _ncheb
-    dc = torch.zeros_like(c)
-    n = nmax - 2
-    fac = float(n + 1) if nmax == N else float(2 * (n + 1))
-    dc[..., n] = fac * c[..., n + 1]
-    for n in range(nmax - 3, -1, -1):
-        dc[..., n] = dc[..., n + 2] + float(2 * (n + 1)) * c[..., n + 1]
-    return dc
-
-
-def _ddcheb(c):
-    """Simultaneous d1+d2 via chained backward recurrence. O(N)."""
-    N = c.shape[-1]
-    nmax = _ncheb
-    dc = torch.zeros_like(c)
-    ddc = torch.zeros_like(c)
-    n = nmax - 2
-    fac = float(n + 1) if nmax == N else float(2 * (n + 1))
-    dc[..., n] = fac * c[..., n + 1]
-    for n in range(nmax - 3, -1, -1):
-        f = float(2 * (n + 1))
-        dc[..., n] = dc[..., n + 2] + f * c[..., n + 1]
-        ddc[..., n] = ddc[..., n + 2] + f * dc[..., n + 1]
-    return dc, ddc
-
-
-def _dddcheb(c):
-    """Simultaneous d1+d2+d3 via chained backward recurrence. O(N)."""
-    N = c.shape[-1]
-    nmax = _ncheb
-    dc = torch.zeros_like(c)
-    ddc = torch.zeros_like(c)
-    dddc = torch.zeros_like(c)
-    n = nmax - 2
-    fac = float(n + 1) if nmax == N else float(2 * (n + 1))
-    dc[..., n] = fac * c[..., n + 1]
-    for n in range(nmax - 3, -1, -1):
-        f = float(2 * (n + 1))
-        dc[..., n] = dc[..., n + 2] + f * c[..., n + 1]
-        ddc[..., n] = ddc[..., n + 2] + f * dc[..., n + 1]
-        dddc[..., n] = dddc[..., n + 2] + f * ddc[..., n + 1]
-    return dc, ddc, dddc
-
-
 def get_dr(f: torch.Tensor) -> torch.Tensor:
     """First radial derivative.
 
-    Uses banded matvec for FD, DCT pipeline for Chebyshev (O(N log N)).
+    Uses banded matvec for FD, dense matmul for Chebyshev.
+    Chebyshev path uses split real/imag DGEMM since D matrices are real.
     """
     if _D1_bands is not None:
         return _banded_matvec(_D1_bands, f)
-    f_cheb = costf(f)
-    df_cheb = _dcheb(f_cheb)
-    return costf(df_cheb) * _drx_val
+    return _real_matmul(f, _D1_real_T)
 
 
 def get_ddr(f: torch.Tensor):
@@ -105,9 +45,10 @@ def get_ddr(f: torch.Tensor):
     """
     if _D1_bands is not None:
         return _banded_matvec(_D1_bands, f), _banded_matvec(_D2_bands, f)
-    f_cheb = costf(f)
-    dc, ddc = _ddcheb(f_cheb)
-    return costf(dc) * _drx_val, costf(ddc) * _drx2_val
+    fr = f.real.contiguous()
+    fi = f.imag.contiguous()
+    return (torch.complex(fr @ _D1_real_T, fi @ _D1_real_T),
+            torch.complex(fr @ _D2_real_T, fi @ _D2_real_T))
 
 
 def get_dddr(f: torch.Tensor):
@@ -120,9 +61,11 @@ def get_dddr(f: torch.Tensor):
         return (_banded_matvec(_D1_bands, f),
                 _banded_matvec(_D2_bands, f),
                 _banded_matvec(_D3_bands, f))
-    f_cheb = costf(f)
-    dc, ddc, dddc = _dddcheb(f_cheb)
-    return costf(dc) * _drx_val, costf(ddc) * _drx2_val, costf(dddc) * _drx3_val
+    fr = f.real.contiguous()
+    fi = f.imag.contiguous()
+    return (torch.complex(fr @ _D1_real_T, fi @ _D1_real_T),
+            torch.complex(fr @ _D2_real_T, fi @ _D2_real_T),
+            torch.complex(fr @ _D3_real_T, fi @ _D3_real_T))
 
 
 def _build_diff_matrices():
