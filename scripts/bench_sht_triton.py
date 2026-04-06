@@ -41,8 +41,8 @@ def run_benchmark(lmax: int, n_batch_override: int, n_iter: int, n_warmup: int):
 
     t_import_start = time.perf_counter()
     from magic_torch.params import lm_max, n_r_max, n_m_max, n_theta_max, n_phi_max, l_max
-    from magic_torch.sht import scal_to_spat
-    from magic_torch.sht_triton import scal_to_spat_triton, _NHS
+    from magic_torch.sht import scal_to_spat, torpol_to_spat
+    from magic_torch.sht_triton import scal_to_spat_triton, torpol_to_spat_triton, _NHS
     from magic_torch.precision import CDTYPE, DTYPE, DEVICE
     t_import = time.perf_counter() - t_import_start
     print(f"Import time: {t_import:.1f}s (Plm build + module init)")
@@ -112,13 +112,60 @@ def run_benchmark(lmax: int, n_batch_override: int, n_iter: int, n_warmup: int):
         tri_ms = list(results.values())[1]
         print(f"\nSpeedup: {bmm_ms / tri_ms:.2f}x")
 
-    # FLOP estimate
+    # FLOP estimate for scal_to_spat
     total_fma = sum(l_max - m + 1 for m in range(0, l_max + 1, 1))  # = lm_max
     total_flops = total_fma * _NHS * n_batch * 2 * 2  # 2 hemispheres, 2 FMA per step
     gflops = total_flops / 1e9
     for name, ms in results.items():
         tflops = gflops / ms
         print(f"  {name}: {tflops:.1f} GFLOP/s ({gflops:.1f} GFLOP)")
+
+    # === torpol_to_spat benchmark ===
+    print(f"\n{'='*60}")
+    print(f"--- torpol_to_spat (vector SHT, the expensive one) ---")
+
+    # Use 4*n_batch to simulate the actual radial loop batching
+    n_batch_vec = min(4 * n_batch, 4 * n_r_max)
+    Qlm = (torch.randn(lm_max, n_batch_vec, dtype=DTYPE, device=DEVICE)
+           + 1j * torch.randn(lm_max, n_batch_vec, dtype=DTYPE, device=DEVICE)).to(CDTYPE)
+    Slm2 = (torch.randn(lm_max, n_batch_vec, dtype=DTYPE, device=DEVICE)
+            + 1j * torch.randn(lm_max, n_batch_vec, dtype=DTYPE, device=DEVICE)).to(CDTYPE)
+    Tlm2 = (torch.randn(lm_max, n_batch_vec, dtype=DTYPE, device=DEVICE)
+            + 1j * torch.randn(lm_max, n_batch_vec, dtype=DTYPE, device=DEVICE)).to(CDTYPE)
+    print(f"n_batch={n_batch_vec} (simulating 4×radial levels)")
+
+    # Correctness
+    ref_r, ref_t, ref_p = torpol_to_spat(Qlm, Slm2, Tlm2)
+    out_r, out_t, out_p = torpol_to_spat_triton(Qlm, Slm2, Tlm2)
+    for comp, rr, oo in [("br", ref_r, out_r), ("bt", ref_t, out_t), ("bp", ref_p, out_p)]:
+        ae = (rr - oo).abs().max().item()
+        re = ae / rr.abs().max().item() if rr.abs().max().item() > 0 else 0
+        print(f"  {comp}: abs_err={ae:.2e}, rel_err={re:.2e}")
+
+    # Timing
+    results_vec = {}
+    for name, fn, args in [
+        ("bmm", torpol_to_spat, (Qlm, Slm2, Tlm2)),
+        ("triton", torpol_to_spat_triton, (Qlm, Slm2, Tlm2)),
+    ]:
+        for _ in range(n_warmup):
+            _ = fn(*args)
+        torch.cuda.synchronize()
+        start_ev = torch.cuda.Event(enable_timing=True)
+        end_ev = torch.cuda.Event(enable_timing=True)
+        start_ev.record()
+        for _ in range(n_iter):
+            _ = fn(*args)
+        end_ev.record()
+        torch.cuda.synchronize()
+        ms = start_ev.elapsed_time(end_ev) / n_iter
+        results_vec[name] = ms
+        print(f"  {name}: {ms:.3f} ms/call")
+
+    if len(results_vec) == 2:
+        bmm_ms = list(results_vec.values())[0]
+        tri_ms = list(results_vec.values())[1]
+        print(f"\n  torpol speedup: {bmm_ms / tri_ms:.2f}x")
 
     print("\nDone!")
 
