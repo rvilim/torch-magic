@@ -113,18 +113,18 @@ def _scal_to_spat_kernel(
     nlm = tl.load(n_lm_ptr + mc).to(tl.int64)
 
     # Seed: un-normalized P_m^m(θ)
-    P_curr = tl.load(seed_ptr + mc * NHS + th)
-    P_prev = 0.0
+    P_curr = tl.load(seed_ptr + mc * NHS + th).to(tl.float64)
+    P_prev = tl.zeros([], dtype=tl.float64)
 
     # Load spectral coefficient for l=m
     base = lm0 * n_batch + batch_offs
-    f_re = tl.load(slm_re_ptr + base, mask=mask, other=0.0)
-    f_im = tl.load(slm_im_ptr + base, mask=mask, other=0.0)
+    f_re = tl.load(slm_re_ptr + base, mask=mask, other=0.0).to(tl.float64)
+    f_im = tl.load(slm_im_ptr + base, mask=mask, other=0.0).to(tl.float64)
 
     # Accumulate un-normalized Plm * f_lm
     acc_N_re = P_curr * f_re
     acc_N_im = P_curr * f_im
-    sign = 1.0  # (-1)^(l-m) = +1 at l=m (k=0)
+    sign = tl.full([], 1.0, dtype=tl.float64)  # (-1)^(l-m) = +1 at l=m (k=0)
     acc_S_re = P_curr * f_re
     acc_S_im = P_curr * f_im
 
@@ -144,7 +144,7 @@ def _scal_to_spat_kernel(
 
             acc_N_re += P_curr * f_re
             acc_N_im += P_curr * f_im
-            sign = -sign
+            sign = sign * tl.full([], -1.0, dtype=tl.float64)
             acc_S_re += sign * P_curr * f_re
             acc_S_im += sign * P_curr * f_im
 
