@@ -2299,3 +2299,47 @@ Dominant cost: dt_fields (6 × 5 slots × lm_max × N × complex128 = 65% of tot
 - **Volume sync**: `on_log` callback commits Modal volume every `log_every` steps for live TensorBoard monitoring
 - **Movie rendering on Modal**: `scripts/make_movie_modal.py` — parallel frame rendering on Modal, downloads mp4 locally
 - **Recursive volume download**: fixed `_download_from_volume` to handle subdirectories
+
+---
+
+## 2026-04-05: GPU Memory Optimization + Performance Tuning
+
+### Radial chunking for GPU memory
+Added `radial_chunk_size` config parameter. When set, `radial_loop` processes radial levels in chunks of size C instead of all N at once, reducing peak grid-space memory from O(N) to O(C).
+- Per-chunk CFL: moved `courant_check` inside chunk loop with running scalar min
+- Eliminated all persistent grid buffers (velocity, magnetic, entropy) — CFL done per-chunk, IC coupling uses saved ICB slices, movies disabled in chunked mode
+- SHT matrix deduplication: deleted 6 intermediate matrices + 8 per-m lists after building stacked versions (~11 GB saved at l=512)
+- Net persistent grid memory in chunked mode: 0
+
+### Performance profiling infrastructure
+Added CUDA event profiler (`profiler.py`) behind `profile` config flag. Handles repeated start/stop pairs within a step (chunk loops). Reports top-level and sub-component timings.
+
+### Performance optimizations at l=384 on B200
+
+Starting point: **965 ms/step** (measured via CUDA events)
+
+| Change | SHT ms | Total ms | Cumulative |
+|--------|--------|----------|-----------|
+| Baseline | 563 | 965 | — |
+| view_as_real on all derivative matmuls (D123, get_dr/ddr/dddr) | 563 | 880 | -9% |
+| Bucketed SHT (K=4 buckets by nlm size) | 480 | 798 | -17% |
+| Polar optimization (per-bucket NHS truncation) | 452 | 768 | -20% |
+
+**Key findings:**
+- **view_as_real**: D123 derivative matmul was using complex ZGEMM despite matrices having zero imaginary parts. Split real/imag DGEMM gives 2× speedup on derivatives. D123: 127→70 ms. solve_b: 90→72 ms.
+- **Bucketed SHT**: Padded bmm wasted 50% FLOPs. 4 buckets reduce waste to ~20%. SHT: 563→480 ms.
+- **Polar opt**: High-m Plm values are zero near poles. Truncate NHS dimension per bucket. SHT: 480→452 ms.
+- **Chunk size sweep**: chunk=64 vs chunk=32 had ZERO effect (765 vs 768 ms). Kernel launch count is NOT the bottleneck — SHT is compute/bandwidth-bound in the bmm itself. Rules out CUTLASS grouped GEMM and more-buckets approaches.
+
+**Current breakdown at 768 ms/step:**
+
+| Component | ms | % |
+|---|---|---|
+| SHT (inv+fwd) | 452 | 59% |
+| Solvers (S+Z+WP) | 181 | 24% |
+| solve_b | 72 | 9% |
+| D123 matmul | 70 | 9% |
+| get_td | 36 | 5% |
+| get_nl | 16 | 2% |
+
+**Next target**: Triton on-the-fly SHT kernel (Plm recurrence in registers, eliminating Plm matrix HBM reads). Estimated 2-4× SHT speedup.
