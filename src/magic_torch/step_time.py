@@ -298,42 +298,34 @@ def _fused_lm_loop_fast():
     f.w_LMloc[:] = zwp_phys[LM:2 * LM]
     f.p_LMloc[:] = zwp_phys[2 * LM:]
 
-    # === 7. Radial derivatives ===
-    # On CUDA: compiled DCT pipeline O(N log N). On CPU: fused DGEMM O(N²).
-    prof.start("lm_loop.d123_matmul")  # keep profiler name for comparison
-    from .radial_derivatives import _use_dct
-    if _use_dct:
-        # Per-field DCT derivatives (avoids computing unneeded d3 for S/Xi/Z/P)
-        f.ds_LMloc[:], d2s = get_ddr(sxi_phys[:LM])
-        if l_chemical_conv:
-            f.dxi_LMloc[:], d2xi = get_ddr(sxi_phys[LM:2 * LM])
-        f.dz_LMloc[:], d2z = get_ddr(zwp_phys[:LM])
-        f.dw_LMloc[:], f.ddw_LMloc[:], dddw = get_dddr(zwp_phys[LM:2 * LM])
-        f.dp_LMloc[:] = get_dr(zwp_phys[2 * LM:])
-    else:
-        all_phys = torch.cat([sxi_phys, zwp_phys])
-        all_r = all_phys.real.contiguous()
-        all_i = all_phys.imag.contiguous()
-        d123 = torch.complex(all_r @ _D123_T, all_i @ _D123_T)
-        d1_all = d123[:, :N]
-        d2_all = d123[:, N:2 * N]
-        d3_all = d123[:, 2 * N:]
-        off = 0
-        f.ds_LMloc[:] = d1_all[off:off + LM]
-        d2s = d2_all[off:off + LM]
+    # === 7. Unified D1+D2+D3 matmul for all fields ===
+    prof.start("lm_loop.d123_matmul")
+    all_phys = torch.cat([sxi_phys, zwp_phys])  # (nTotal*LM, N) complex128
+    # Split real/imag DGEMM: 2× faster than complex ZGEMM since D matrices are real
+    all_r = all_phys.real.contiguous()
+    all_i = all_phys.imag.contiguous()
+    d123 = torch.complex(all_r @ _D123_T, all_i @ _D123_T)  # (nTotal*LM, 3N)
+    d1_all = d123[:, :N]
+    d2_all = d123[:, N:2 * N]
+    d3_all = d123[:, 2 * N:]
+
+    # Extract per-field derivatives
+    off = 0
+    f.ds_LMloc[:] = d1_all[off:off + LM]
+    d2s = d2_all[off:off + LM]
+    off += LM
+    if l_chemical_conv:
+        f.dxi_LMloc[:] = d1_all[off:off + LM]
+        d2xi = d2_all[off:off + LM]
         off += LM
-        if l_chemical_conv:
-            f.dxi_LMloc[:] = d1_all[off:off + LM]
-            d2xi = d2_all[off:off + LM]
-            off += LM
-        f.dz_LMloc[:] = d1_all[off:off + LM]
-        d2z = d2_all[off:off + LM]
-        off += LM
-        f.dw_LMloc[:] = d1_all[off:off + LM]
-        f.ddw_LMloc[:] = d2_all[off:off + LM]
-        dddw = d3_all[off:off + LM]
-        off += LM
-        f.dp_LMloc[:] = d1_all[off:off + LM]
+    f.dz_LMloc[:] = d1_all[off:off + LM]
+    d2z = d2_all[off:off + LM]
+    off += LM
+    f.dw_LMloc[:] = d1_all[off:off + LM]
+    f.ddw_LMloc[:] = d2_all[off:off + LM]
+    dddw = d3_all[off:off + LM]
+    off += LM
+    f.dp_LMloc[:] = d1_all[off:off + LM]
 
     prof.stop("lm_loop.d123_matmul")
     # === 8. Rotate IMEX (BPR353: no-op; CNAB2: shift history) ===
