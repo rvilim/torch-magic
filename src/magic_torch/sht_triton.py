@@ -90,7 +90,6 @@ def _scal_to_spat_kernel(
     n_lm_ptr,
     n_batch,
     NHS: tl.constexpr,
-    MAX_NLM: tl.constexpr,
     THETA_BLOCK: tl.constexpr,
     BATCH_BLOCK: tl.constexpr,
 ):
@@ -133,30 +132,29 @@ def _scal_to_spat_kernel(
     acc_S_re = P_curr[:, None] * f_re[None, :]
     acc_S_im = P_curr[:, None] * f_im[None, :]
 
-    for k in range(1, MAX_NLM):
-        if k < nlm:
-            lm_k = lm0 + k
-            a = tl.load(a_ptr + lm_k).to(tl.float64)
-            b = tl.load(b_ptr + lm_k).to(tl.float64)
+    for k in range(1, nlm):
+        lm_k = lm0 + k
+        a = tl.load(a_ptr + lm_k).to(tl.float64)
+        b = tl.load(b_ptr + lm_k).to(tl.float64)
 
-            # Recurrence vectorized across theta: (THETA_BLOCK,)
-            P_next = a * cos_th * P_curr - b * P_prev
-            P_prev = P_curr
-            P_curr = P_next
+        # Recurrence vectorized across theta: (THETA_BLOCK,)
+        P_next = a * cos_th * P_curr - b * P_prev
+        P_prev = P_curr
+        P_curr = P_next
 
-            # Load spectral data: (BATCH_BLOCK,)
-            off_k = lm_k * n_batch + batch_offs
-            f_re = tl.load(slm_re_ptr + off_k, mask=batch_mask, other=0.0).to(tl.float64)
-            f_im = tl.load(slm_im_ptr + off_k, mask=batch_mask, other=0.0).to(tl.float64)
+        # Load spectral data: (BATCH_BLOCK,)
+        off_k = lm_k * n_batch + batch_offs
+        f_re = tl.load(slm_re_ptr + off_k, mask=batch_mask, other=0.0).to(tl.float64)
+        f_im = tl.load(slm_im_ptr + off_k, mask=batch_mask, other=0.0).to(tl.float64)
 
-            # Outer product accumulate: (THETA_BLOCK, BATCH_BLOCK)
-            P_2d = P_curr[:, None]
-            acc_N_re += P_2d * f_re[None, :]
-            acc_N_im += P_2d * f_im[None, :]
-            sign = sign * tl.full([1], -1.0, dtype=tl.float64)
-            sP_2d = sign * P_2d
-            acc_S_re += sP_2d * f_re[None, :]
-            acc_S_im += sP_2d * f_im[None, :]
+        # Outer product accumulate: (THETA_BLOCK, BATCH_BLOCK)
+        P_2d = P_curr[:, None]
+        acc_N_re += P_2d * f_re[None, :]
+        acc_N_im += P_2d * f_im[None, :]
+        sign = sign * tl.full([1], -1.0, dtype=tl.float64)
+        sP_2d = sign * P_2d
+        acc_S_re += sP_2d * f_re[None, :]
+        acc_S_im += sP_2d * f_im[None, :]
 
     # Apply normalization
     osq4pi: tl.constexpr = 0.28209479177387814
@@ -208,7 +206,7 @@ def scal_to_spat_triton(Slm: torch.Tensor) -> torch.Tensor:
         out_N_re, out_N_im, out_S_re, out_S_im,
         _a_coeff, _b_coeff, _seed_table, _cos_theta_N,
         _lm_start, _n_lm,
-        n_batch, _NHS, _MAX_NLM,
+        n_batch, _NHS,
         THETA_BLOCK=THETA_BLOCK, BATCH_BLOCK=BATCH_BLOCK,
     )
 
