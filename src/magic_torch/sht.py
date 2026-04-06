@@ -180,6 +180,9 @@ _sphertor_C_r = torch.cat([_wPlm_dm_imag_pad_r] * 4, dim=0)
 _N_BUCKETS = 4
 _USE_BUCKETED = (n_m_max >= 64)
 
+from .params import l_polar_opt as _l_polar_opt
+_POLAR_EPS = 1e-14  # threshold for treating Plm as zero
+
 if _USE_BUCKETED:
     _bucket_size = n_m_max // _N_BUCKETS
     _buckets = []
@@ -236,41 +239,53 @@ if _USE_BUCKETED:
     _P_dplm_signS_T_r_b = []
     _P_mPlm_T_r_b = []
     _P_mPlm_signS_T_r_b = []
+    _polar_skip_b = []  # number of polar theta rows to skip per bucket
     for _ms, _me, _nm, _max_nlm_k in _buckets:
         _r = range(_ms, _me)
         _plm = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _Plm_c_m)
+        # Polar optimization: find how many leading theta rows are all-zero
+        _skip = 0
+        if _l_polar_opt:
+            _all_zero = torch.all(_plm.abs() < _POLAR_EPS, dim=(0, 2))  # (NHS,)
+            _nz = (~_all_zero).nonzero()
+            _skip = _nz[0].item() if len(_nz) > 0 else 0
+        _polar_skip_b.append(_skip)
+        # Truncate polar rows from forward matrices: (nm, NHS-skip, nlm)
+        _plm = _plm[:, _skip:, :].contiguous()
         _plmS = _plm * _sign_ea_neg_r[:_max_nlm_k]
-        _plmG = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _PlmG_c_m)
-        _plmC = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _PlmC_c_m)
+        _plmG = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _PlmG_c_m)[:, _skip:, :].contiguous()
+        _plmC = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _PlmC_c_m)[:, _skip:, :].contiguous()
         _plmCsign = _plmC * _sign_es_neg_r[:_max_nlm_k]
         _plmGsign = _plmG * _sign_es_neg_r[:_max_nlm_k]
         _torpol_mats_r_b.append(torch.cat([_plm, _plmS, _plmG, _plmC, _plmCsign, _plmGsign], dim=0))
         _P_plm_T_r_b.append(_plm)
         _P_plm_signS_T_r_b.append(_plmS)
-        _dplm = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _dPlm_c_m)
+        _dplm = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _dPlm_c_m)[:, _skip:, :].contiguous()
         _P_dplm_T_r_b.append(_dplm)
         _P_dplm_signS_T_r_b.append(_dplm * _sign_es_neg_r[:_max_nlm_k])
         _mplm_c_map = {mc: _dm_m[mc] * _Plm_c_m[mc] for mc in _r}
-        _mplm = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _mplm_c_map)
+        _mplm = _build_padded_T_r_b(_r, _nm, _max_nlm_k, _mplm_c_map)[:, _skip:, :].contiguous()
         _P_mPlm_T_r_b.append(_mplm)
         _P_mPlm_signS_T_r_b.append(_mplm * _sign_ea_neg_r[:_max_nlm_k])
 
-    # Per-bucket inverse SHT matrices
+    # Per-bucket inverse SHT matrices (truncate NHS for polar opt)
     _wPlm_pad_r_b = []
     _wPlm_sign_pad_r_b = []
     _sphertor_D_r_b = []
     _sphertor_C_r_b = []
-    for _ms, _me, _nm, _max_nlm_k in _buckets:
+    for _bk, (_ms, _me, _nm, _max_nlm_k) in enumerate(_buckets):
+        _skip = _polar_skip_b[_bk]
         _r = range(_ms, _me)
-        _wp = _build_padded_r_b(_r, _nm, _max_nlm_k, _wPlm_c_m)
+        _wp = _build_padded_r_b(_r, _nm, _max_nlm_k, _wPlm_c_m)[:, :, _skip:].contiguous()
         _wPlm_pad_r_b.append(_wp)
         _wPlm_sign_pad_r_b.append(_wp * _sign_ea_neg_r[:_max_nlm_k].unsqueeze(1))
-        _wd = _build_padded_r_b(_r, _nm, _max_nlm_k, _wdPlm_c_m)
+        _wd = _build_padded_r_b(_r, _nm, _max_nlm_k, _wdPlm_c_m)[:, :, _skip:].contiguous()
         _sphertor_D_r_b.append(torch.cat([_wd] * 4, dim=0))
-        _wdm = torch.zeros(_nm, _max_nlm_k, _NHS, dtype=DTYPE, device=DEVICE)
+        _nhs_eff = _NHS - _skip
+        _wdm = torch.zeros(_nm, _max_nlm_k, _nhs_eff, dtype=DTYPE, device=DEVICE)
         for i, mc in enumerate(_r):
             nlm = _n_lm_m[mc]
-            _wdm[i, :nlm, :] = (-_dm_m[mc]) * _wPlm_c_m[mc].real
+            _wdm[i, :nlm, :] = (-_dm_m[mc]) * _wPlm_c_m[mc][:nlm, _skip:].real
         _sphertor_C_r_b.append(torch.cat([_wdm] * 4, dim=0))
 
 # Free intermediate matrices only used to build the stacked/bucketed versions above
@@ -304,14 +319,15 @@ def scal_to_spat(Slm: torch.Tensor, lcut: int = None) -> torch.Tensor:
 
     if _USE_BUCKETED:
         for k, (ms, me, nm, mlk) in enumerate(_buckets):
+            skip = _polar_skip_b[k]
             Q_k = Slm[_spec_gather_b[k]]  # (nm, mlk, n_batch)
             Q_ri = torch.view_as_real(Q_k).flatten(-2)
-            sN_ri = torch.bmm(_P_plm_T_r_b[k], Q_ri)
+            sN_ri = torch.bmm(_P_plm_T_r_b[k], Q_ri)  # (nm, NHS_eff, 2*nb)
             sS_ri = torch.bmm(_P_plm_signS_T_r_b[k], Q_ri)
             sN = torch.view_as_complex(sN_ri.unflatten(-1, (-1, 2)))
             sS = torch.view_as_complex(sS_ri.unflatten(-1, (-1, 2)))
-            tmp[0::2, ms:me, :] = sN.permute(1, 0, 2)
-            tmp[1::2, ms:me, :] = sS.permute(1, 0, 2)
+            tmp[2*skip::2, ms:me, :] = sN.permute(1, 0, 2)
+            tmp[2*skip+1::2, ms:me, :] = sS.permute(1, 0, 2)
     else:
         Q_pad = Slm[_spec_gather]
         Q_ri = torch.view_as_real(Q_pad).flatten(-2)
@@ -365,8 +381,9 @@ def scal_to_SH(sc: torch.Tensor, lcut: int = None) -> torch.Tensor:
     if _USE_BUCKETED:
         Slm = torch.zeros(lm_max, n_batch, dtype=CDTYPE, device=DEVICE)
         for k, (ms, me, nm, mlk) in enumerate(_buckets):
-            f1N_k = f1N[ms:me]  # (nm, NHS, n_batch)
-            f1S_k = f1S[ms:me]
+            skip = _polar_skip_b[k]
+            f1N_k = f1N[ms:me, skip:]  # (nm, NHS_eff, n_batch)
+            f1S_k = f1S[ms:me, skip:]
             f1N_ri = torch.view_as_real(f1N_k).flatten(-2)
             f1S_ri = torch.view_as_real(f1S_k).flatten(-2)
             RN_ri = torch.bmm(_wPlm_pad_r_b[k], f1N_ri)
@@ -424,6 +441,8 @@ def torpol_to_spat(Qlm: torch.Tensor, Slm: torch.Tensor, Tlm: torch.Tensor,
 
     if _USE_BUCKETED:
         for k, (ms, me, nm, mlk) in enumerate(_buckets):
+            skip = _polar_skip_b[k]
+            nhs_eff = _NHS - skip
             Q_k = Qlm[_spec_gather_b[k]]
             G_k = bhG[_spec_gather_b[k]]
             C_k = bhC[_spec_gather_b[k]]
@@ -431,17 +450,17 @@ def torpol_to_spat(Qlm: torch.Tensor, Slm: torch.Tensor, Tlm: torch.Tensor,
             inputs_ri = torch.view_as_real(inputs_c).flatten(-2)
             results_ri = torch.bmm(_torpol_mats_r_b[k], inputs_ri)
             results = torch.view_as_complex(results_ri.unflatten(-1, (-1, 2)))
-            brN, brS, N1, N2, S1, S2 = results.view(6, nm, _NHS, n_batch).unbind(0)
-            tmpr[0::2, ms:me, :] = brN.permute(1, 0, 2)
-            tmpr[1::2, ms:me, :] = brS.permute(1, 0, 2)
+            brN, brS, N1, N2, S1, S2 = results.view(6, nm, nhs_eff, n_batch).unbind(0)
+            tmpr[2*skip::2, ms:me, :] = brN.permute(1, 0, 2)
+            tmpr[2*skip+1::2, ms:me, :] = brS.permute(1, 0, 2)
             half_N1pN2 = half * (N1 + N2)
             half_S1pS2 = half * (S1 + S2)
             half_N1mN2 = half * (N1 - N2)
             half_S1mS2 = half * (S1 - S2)
-            tmpt[0::2, ms:me, :] = half_N1pN2.permute(1, 0, 2)
-            tmpt[1::2, ms:me, :] = half_S1pS2.permute(1, 0, 2)
-            tmpp[0::2, ms:me, :] = (-ci * half_N1mN2).permute(1, 0, 2)
-            tmpp[1::2, ms:me, :] = (-ci * half_S1mS2).permute(1, 0, 2)
+            tmpt[2*skip::2, ms:me, :] = half_N1pN2.permute(1, 0, 2)
+            tmpt[2*skip+1::2, ms:me, :] = half_S1pS2.permute(1, 0, 2)
+            tmpp[2*skip::2, ms:me, :] = (-ci * half_N1mN2).permute(1, 0, 2)
+            tmpp[2*skip+1::2, ms:me, :] = (-ci * half_S1mS2).permute(1, 0, 2)
     else:
         Q_pad = Qlm[_spec_gather]
         G_pad = bhG[_spec_gather]
@@ -504,6 +523,7 @@ def scal_to_grad_spat(Slm: torch.Tensor, lcut: int = None):
 
     if _USE_BUCKETED:
         for k, (ms, me, nm, mlk) in enumerate(_buckets):
+            skip = _polar_skip_b[k]
             Q_k = Slm[_spec_gather_b[k]]
             Q_ri = torch.view_as_real(Q_k).flatten(-2)
             tN_ri = torch.bmm(_P_dplm_T_r_b[k], Q_ri)
@@ -514,10 +534,10 @@ def scal_to_grad_spat(Slm: torch.Tensor, lcut: int = None):
             pS_ri = torch.bmm(_P_mPlm_signS_T_r_b[k], Q_ri)
             pN = torch.view_as_complex(pN_ri.unflatten(-1, (-1, 2)))
             pS = torch.view_as_complex(pS_ri.unflatten(-1, (-1, 2)))
-            tmpt[0::2, ms:me, :] = tN.permute(1, 0, 2)
-            tmpt[1::2, ms:me, :] = tS.permute(1, 0, 2)
-            tmpp[0::2, ms:me, :] = (ci * pN).permute(1, 0, 2)
-            tmpp[1::2, ms:me, :] = (ci * pS).permute(1, 0, 2)
+            tmpt[2*skip::2, ms:me, :] = tN.permute(1, 0, 2)
+            tmpt[2*skip+1::2, ms:me, :] = tS.permute(1, 0, 2)
+            tmpp[2*skip::2, ms:me, :] = (ci * pN).permute(1, 0, 2)
+            tmpp[2*skip+1::2, ms:me, :] = (ci * pS).permute(1, 0, 2)
     else:
         Q_pad = Slm[_spec_gather]
         Q_ri = torch.view_as_real(Q_pad).flatten(-2)
@@ -598,10 +618,11 @@ def spat_to_sphertor(vt: torch.Tensor, vp: torch.Tensor, lcut: int = None):
         Slm = torch.zeros(lm_max, n_batch, dtype=CDTYPE, device=DEVICE)
         Tlm = torch.zeros(lm_max, n_batch, dtype=CDTYPE, device=DEVICE)
         for k, (ms, me, nm, mlk) in enumerate(_buckets):
-            f1N_k = f1N[ms:me]
-            f1S_k = f1S[ms:me]
-            f2N_k = f2N[ms:me]
-            f2S_k = f2S[ms:me]
+            skip = _polar_skip_b[k]
+            f1N_k = f1N[ms:me, skip:]  # (nm, NHS_eff, n_batch)
+            f1S_k = f1S[ms:me, skip:]
+            f2N_k = f2N[ms:me, skip:]
+            f2S_k = f2S[ms:me, skip:]
             D_inputs = torch.cat([f2N_k, f1N_k, f2S_k, f1S_k], dim=0)
             D_ri = torch.view_as_real(D_inputs).flatten(-2)
             D_out = torch.view_as_complex(

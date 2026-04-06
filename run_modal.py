@@ -95,6 +95,7 @@ def run_remote(cfg: dict, run_name: str):
         "intfac": "MAGIC_INTFAC",
         "radial_chunk_size": "MAGIC_RADIAL_CHUNK",
         "profile": "MAGIC_PROFILE",
+        "polar_opt": "MAGIC_POLAR_OPT",
     }
     for key, env_var in _CFG_TO_ENV.items():
         if key in cfg:
