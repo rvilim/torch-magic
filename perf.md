@@ -326,3 +326,23 @@ Removed .clone() from rotate_imex (non-overlapping dim-2 slices don't need it).
 
 SHT now 64% of step time (inv_sht 278 + fwd_sht 285 = 563 ms).
 50% of SHT bmm FLOPs are wasted on zero-padded Plm entries — next optimization target.
+
+#### l=384 after bucketed SHT (K=4 buckets) (2026-04-05)
+
+Split m-modes into 4 buckets by nlm size to reduce padding waste from 50% to ~20%.
+Each bucket has its own Plm matrices padded to local max_nlm.
+
+| Component | Before | After | Change |
+|---|---|---|---|
+| **radial_loop** | **626** | **545** | **-13%** |
+| radial_loop.inv_sht | 278 | 239 | **-14%** |
+| radial_loop.fwd_sht | 285 | 241 | **-15%** |
+| radial_loop.get_td | 36 | 36 | — |
+| radial_loop.get_nl | 16 | 16 | — |
+| **lm_loop** | **253** | **254** | — |
+| **TOTAL (top-level)** | **880** | **798** | **-9%** |
+
+SHT: 563 → 480 ms (-15%). Total: 880 → 798 ms (-9%).
+Savings less than the 37% FLOP reduction because low-m buckets (largest matrices)
+are compute-bound — GPU wasn't fully utilizing the padding zeros anyway.
+Polar optimization (per-bucket NHS truncation) is the next target.
