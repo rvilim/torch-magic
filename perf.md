@@ -346,3 +346,17 @@ SHT: 563 → 480 ms (-15%). Total: 880 → 798 ms (-9%).
 Savings less than the 37% FLOP reduction because low-m buckets (largest matrices)
 are compute-bound — GPU wasn't fully utilizing the padding zeros anyway.
 Polar optimization (per-bucket NHS truncation) is the next target.
+
+#### l=384 after polar optimization (2026-04-05)
+
+Per-bucket NHS truncation: skip polar theta rows where Plm < 1e-14.
+Bucket 0: skip 0/288, Bucket 1: skip 27, Bucket 2: skip 69, Bucket 3: skip 121.
+
+| Component | Before | After | Change |
+|---|---|---|---|
+| radial_loop.inv_sht | 239 | 225 | -6% |
+| radial_loop.fwd_sht | 241 | 227 | -6% |
+| **TOTAL (top-level)** | **798** | **768** | **-4%** |
+
+SHT: 480 → 452 ms (-6%). Modest gain — high-m buckets benefit most but have
+fewest modes. Cumulative: 965 → 768 ms (**-20% from baseline**).
