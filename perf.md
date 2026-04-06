@@ -360,3 +360,30 @@ Bucket 0: skip 0/288, Bucket 1: skip 27, Bucket 2: skip 69, Bucket 3: skip 121.
 
 SHT: 480 → 452 ms (-6%). Modest gain — high-m buckets benefit most but have
 fewest modes. Cumulative: 965 → 768 ms (**-20% from baseline**).
+
+#### l=384 chunk size analysis (2026-04-05)
+
+At l=384, spectral fields + solver inverses + SHT matrices consume ~160 GB on B200 (178 GB
+usable). This leaves ~18 GB for grid-space temporaries during each chunk iteration.
+
+torpol_to_spat batches 4 field groups (B, curlB, V, curlV) so n_batch = 4 × chunk_size.
+The irfft output is 3 × (n_theta × n_phi × n_batch × 8 bytes). Memory per chunk:
+- C=32: ~1.6 GB grid temps → OK (current, 25 chunks, 768 ms/step)
+- C=64: ~3.2 GB → OK (12 chunks, profile pending)
+- C=128: ~6.4 GB → borderline (~18 GB headroom)
+- C=256: ~12.8 GB → OOM (tried, failed at irfft needing 5 GB with only 4.5 GB free)
+
+Investigation: critique agent suggested kernel launch overhead might dominate.
+Result: **chunk=64 gives 765 ms vs chunk=32's 768 ms — no improvement.**
+
+| chunk_size | Chunks | SHT (inv+fwd) | Total |
+|---|---|---|---|
+| 32 | 25 | 452 ms | 768 ms |
+| 64 | 12 | 450 ms | 765 ms |
+| 128 | — | not tested (borderline OOM) | — |
+| 256 | — | OOM | — |
+
+**Conclusion: kernel launch count is NOT the bottleneck.** The SHT cost is compute/bandwidth-bound
+in the bmm itself, not launch overhead. This means CUTLASS grouped GEMM (which mainly reduces
+launches) would also have limited impact. The path to further SHT speedup requires changing the
+algorithm — either Triton on-the-fly recurrence or an external SHT library (SHTns).
