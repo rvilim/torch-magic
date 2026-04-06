@@ -1,0 +1,14 @@
+# Profile run: l=384, 200 steps, B200, chunk_size=256
+l_max: 384
+n_r_max: 769
+
+n_steps: 200
+dt: 1.5e-6
+
+output_dir: ./output/profile_l384_chunk256
+log_every: 200
+checkpoint_every: 0
+
+device: cuda
+profile: true
+radial_chunk_size: 256
