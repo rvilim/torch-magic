@@ -1,0 +1,21 @@
+# Turbulent dynamo: Ek=1e-5, Ra=5e7, Pr=1, Pm=3
+# Moderately turbulent, Earth-like regime transition
+# Target: GB200 (192 GB), ~9 days to saturation with CNAB2
+
+l_max: 384
+n_r_max: 769
+
+ra: 5.0e7
+ek: 1.0e-5
+pr: 1.0
+prmag: 3.0
+
+n_steps: 10000000
+dt: 1.5e-6
+
+output_dir: ./output/turbulent_dynamo
+log_every: 100
+checkpoint_every: 1000
+
+device: cuda
+radial_chunk_size: 32

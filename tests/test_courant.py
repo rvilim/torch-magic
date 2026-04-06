@@ -48,6 +48,10 @@ class TestGridSpacing:
         np.testing.assert_allclose(py, ref, atol=1e-17, rtol=1e-15)
 
 
+@pytest.mark.skipif(
+    int(os.environ.get("MAGIC_RADIAL_CHUNK", "0")) > 0,
+    reason="Per-level CFL arrays not available in chunked mode"
+)
 class TestCFLStep1:
     """dtrkc, dthkc at step 1 vs Fortran courant.f90."""
 
@@ -57,12 +61,29 @@ class TestCFLStep1:
         from magic_torch.init_fields import initialize_fields
         from magic_torch.step_time import (
             setup_initial_state, initialize_dt, _radial_loop_dispatch,
+            _vrc, _vtc, _vpc,
         )
+        from magic_torch.courant import courant_check
+        from magic_torch.time_scheme import tscheme
 
         initialize_fields()
         setup_initial_state()
         initialize_dt(1e-4)
-        dtrkc, dthkc = _radial_loop_dispatch()
+        # Run the radial loop (fills velocity buffers in non-chunked mode)
+        _radial_loop_dispatch()
+        # Get per-level CFL arrays by calling courant_check directly
+        from magic_torch.step_time import last_brc, last_btc, last_bpc
+        from magic_torch.params import l_mag
+        from magic_torch import fields
+        # In non-chunked mode, velocity buffers are filled; use them
+        dtrkc, dthkc = courant_check(
+            _vrc, _vtc, _vpc,
+            last_brc if l_mag else None,
+            last_btc if l_mag else None,
+            last_bpc if l_mag else None,
+            courfac=tscheme.courfac,
+            alffac=tscheme.alffac,
+        )
         return dtrkc.cpu().numpy(), dthkc.cpu().numpy()
 
     def test_dtrkc(self, cfl_arrays):
@@ -79,14 +100,10 @@ class TestCFLStep1:
 
     def test_cfl_does_not_change_dt(self, cfl_arrays):
         """With dtMax=1e-4, CFL should NOT trigger a dt change."""
-        import torch
-        from magic_torch.precision import DTYPE, DEVICE
-
         py_dtrkc, py_dthkc = cfl_arrays
-        dtrkc = torch.tensor(py_dtrkc, dtype=DTYPE, device=DEVICE)
-        dthkc = torch.tensor(py_dthkc, dtype=DTYPE, device=DEVICE)
-
-        l_new_dt, dt_new = dt_courant(1e-4, 1e-4, dtrkc, dthkc)
+        l_new_dt, dt_new = dt_courant(1e-4, 1e-4,
+                                       float(py_dtrkc.min()),
+                                       float(py_dthkc.min()))
         assert not l_new_dt
         assert dt_new == 1e-4
 
@@ -94,50 +111,36 @@ class TestCFLStep1:
 class TestDtCourant:
     """Unit tests for dt_courant decision logic (all 4 branches)."""
 
-    @staticmethod
-    def _make_tensors(dtrkc_min, dthkc_min):
-        import torch
-        from magic_torch.precision import DTYPE, DEVICE
-
-        dtrkc = torch.tensor([dtrkc_min], dtype=DTYPE, device=DEVICE)
-        dthkc = torch.tensor([dthkc_min], dtype=DTYPE, device=DEVICE)
-        return dtrkc, dthkc
-
     def test_branch1_dt_exceeds_dtmax(self):
         """dt > dtMax: clamp to dtMax."""
-        dtrkc, dthkc = self._make_tensors(1.0, 1.0)
-        l_new, dt_new = dt_courant(0.5, 0.1, dtrkc, dthkc)
+        l_new, dt_new = dt_courant(0.5, 0.1, 1.0, 1.0)
         assert l_new
         assert dt_new == 0.1
 
     def test_branch2_dt_exceeds_cfl_min(self):
         """dt > dtMin: decrease to dt_2."""
-        dtrkc, dthkc = self._make_tensors(0.05, 1.0)
-        l_new, dt_new = dt_courant(0.1, 0.2, dtrkc, dthkc)
+        l_new, dt_new = dt_courant(0.1, 0.2, 0.05, 1.0)
         assert l_new
         dt_2 = min(0.5 * (1.0 / 2.0 + 1.0) * 0.05, 0.2)  # = 0.0375
         assert abs(dt_new - dt_2) < 1e-15
 
     def test_branch3_dt_too_small(self):
         """dt_fac * dt < dtMin and dt < dtMax: increase to dt_2."""
-        dtrkc, dthkc = self._make_tensors(1.0, 1.0)
-        l_new, dt_new = dt_courant(0.1, 0.5, dtrkc, dthkc)
+        l_new, dt_new = dt_courant(0.1, 0.5, 1.0, 1.0)
         assert l_new
         dt_2 = min(0.5 * (1.0 / 2.0 + 1.0) * 1.0, 0.5)  # = 0.5
         assert abs(dt_new - dt_2) < 1e-15
 
     def test_branch4_dt_in_range(self):
         """dt in comfortable range: no change."""
-        dtrkc, dthkc = self._make_tensors(0.15, 1.0)
-        l_new, dt_new = dt_courant(0.1, 0.2, dtrkc, dthkc)
+        l_new, dt_new = dt_courant(0.1, 0.2, 0.15, 1.0)
         # dt=0.1 < dtMin=0.15, dt_fac*dt=0.2 >= dtMin=0.15 → no increase
         assert not l_new
         assert dt_new == 0.1
 
     def test_branch4_dt_equals_dtmax(self):
         """dt == dtMax and CFL is satisfied: no change (like dynamo_benchmark)."""
-        dtrkc, dthkc = self._make_tensors(3.66e-4, 5.14e-4)
-        l_new, dt_new = dt_courant(1e-4, 1e-4, dtrkc, dthkc)
+        l_new, dt_new = dt_courant(1e-4, 1e-4, 3.66e-4, 5.14e-4)
         # dt_fac*dt=2e-4 < dtMin=3.66e-4 but dt=1e-4 is NOT < dtMax=1e-4
         assert not l_new
         assert dt_new == 1e-4
@@ -151,6 +154,7 @@ _NOMAG_RUNNER_CODE = '''\
 """CFL runner for doubleDiffusion (nomag path)."""
 import os
 os.environ["MAGIC_TIME_SCHEME"] = "BPR353"
+os.environ["MAGIC_RADIAL_CHUNK"] = "0"
 os.environ["MAGIC_LMAX"] = "64"
 os.environ["MAGIC_NR"] = "33"
 os.environ["MAGIC_MINC"] = "4"
@@ -177,7 +181,13 @@ setup_initial_state()
 initialize_dt(3.0e-4)
 
 # Call radial loop once — matches Fortran stage 1 of step 1
-dtrkc, dthkc = _radial_loop_dispatch()
+_radial_loop_dispatch()
+# Get per-level CFL arrays for comparison with Fortran reference
+from magic_torch.courant import courant_check
+from magic_torch.step_time import _vrc, _vtc, _vpc
+from magic_torch.time_scheme import tscheme
+dtrkc, dthkc = courant_check(_vrc, _vtc, _vpc,
+                              courfac=tscheme.courfac, alffac=tscheme.alffac)
 np.save(os.path.join(out_dir, "dtrkc.npy"), dtrkc.cpu().numpy())
 np.save(os.path.join(out_dir, "dthkc.npy"), dthkc.cpu().numpy())
 print("nomag CFL runner completed")
@@ -261,13 +271,10 @@ class TestCFLStep1NoMag:
 
     def test_nomag_cfl_no_change(self, nomag_cfl):
         """With dtMax=3e-4, CFL should NOT trigger a dt change for DD."""
-        import torch
-        from magic_torch.precision import DTYPE, DEVICE
+        dtrkc_min = float(nomag_cfl["dtrkc"].min())
+        dthkc_min = float(nomag_cfl["dthkc"].min())
 
-        dtrkc = torch.tensor(nomag_cfl["dtrkc"], dtype=DTYPE, device=DEVICE)
-        dthkc = torch.tensor(nomag_cfl["dthkc"], dtype=DTYPE, device=DEVICE)
-
-        l_new_dt, dt_new = dt_courant(3e-4, 3e-4, dtrkc, dthkc)
+        l_new_dt, dt_new = dt_courant(3e-4, 3e-4, dtrkc_min, dthkc_min)
         assert not l_new_dt
         assert dt_new == 3e-4
 

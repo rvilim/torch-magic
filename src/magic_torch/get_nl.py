@@ -29,12 +29,14 @@ _or2_3 = or2.reshape(n_r_max, 1, 1)
 
 @torch.compile
 def get_nl(vrc, vtc, vpc, cvrc, cvtc, cvpc,
-           sc, brc, btc, bpc, cbrc, cbtc, cbpc, xic):
+           sc, brc, btc, bpc, cbrc, cbtc, cbpc, xic,
+           or4_3=_or4_3, or2_3=_or2_3):
     """Compute all nonlinear products in grid space.
 
     Uses l_adv_curl=.true. formulation: advection = -(curl u) × u.
 
-    All inputs shape (n_r_max, n_theta_max, n_phi_max).
+    All inputs shape (n_batch, n_theta_max, n_phi_max).
+    or4_3, or2_3 shape (n_batch, 1, 1) — radial profile slices.
 
     Args:
         vrc, vtc, vpc: velocity components
@@ -43,6 +45,8 @@ def get_nl(vrc, vtc, vpc, cvrc, cvtc, cvpc,
         brc, btc, bpc: magnetic field components
         cbrc, cbtc, cbpc: current density (curl B) components
         xic: composition (zeros when inactive)
+        or4_3: 1/r^4 radial profile, shape (n_batch, 1, 1)
+        or2_3: 1/r^2 radial profile, shape (n_batch, 1, 1)
 
     Returns:
         Advr, Advt, Advp: momentum equation RHS (advection + Lorentz)
@@ -52,13 +56,13 @@ def get_nl(vrc, vtc, vpc, cvrc, cvtc, cvpc,
     """
     # --- Lorentz force: (curl B) × B ---
     LFr = LFfac * _Ost2 * (cbtc * bpc - cbpc * btc)
-    LFt = LFfac * _or4_3 * (cbpc * brc - cbrc * bpc)
-    LFp = LFfac * _or4_3 * (cbrc * btc - cbtc * brc)
+    LFt = LFfac * or4_3 * (cbpc * brc - cbrc * bpc)
+    LFp = LFfac * or4_3 * (cbrc * btc - cbtc * brc)
 
     # --- Advection: -(curl u) × u  (l_adv_curl=.true.) ---
     Advr = -_Ost2 * (cvtc * vpc - cvpc * vtc)
-    Advt = -_or4_3 * (cvpc * vrc - cvrc * vpc)
-    Advp = -_or4_3 * (cvrc * vtc - cvtc * vrc)
+    Advt = -or4_3 * (cvpc * vrc - cvrc * vpc)
+    Advp = -or4_3 * (cvrc * vtc - cvtc * vrc)
 
     # --- Add Lorentz force to advection ---
     Advr = Advr + LFr
@@ -67,17 +71,17 @@ def get_nl(vrc, vtc, vpc, cvrc, cvtc, cvpc,
 
     # --- Entropy advection: v*S (divergence taken spectrally) ---
     VSr = vrc * sc
-    VSt = _or2_3 * vtc * sc
-    VSp = _or2_3 * vpc * sc
+    VSt = or2_3 * vtc * sc
+    VSp = or2_3 * vpc * sc
 
     # --- Induction: v × B (Boussinesq: orho1=1) ---
     VxBr = _Ost2 * (vtc * bpc - vpc * btc)
-    VxBt = _or4_3 * (vpc * brc - vrc * bpc)
-    VxBp = _or4_3 * (vrc * btc - vtc * brc)
+    VxBt = or4_3 * (vpc * brc - vrc * bpc)
+    VxBp = or4_3 * (vrc * btc - vtc * brc)
 
     # --- Composition advection: v*Xi (same structure as entropy) ---
     VXir = vrc * xic
-    VXit = _or2_3 * vtc * xic
-    VXip = _or2_3 * vpc * xic
+    VXit = or2_3 * vtc * xic
+    VXip = or2_3 * vpc * xic
 
     return Advr, Advt, Advp, VSr, VSt, VSp, VxBr, VxBt, VxBp, VXir, VXit, VXip

@@ -1,6 +1,7 @@
 """CFL runner for doubleDiffusion (nomag path)."""
 import os
 os.environ["MAGIC_TIME_SCHEME"] = "BPR353"
+os.environ["MAGIC_RADIAL_CHUNK"] = "0"
 os.environ["MAGIC_LMAX"] = "64"
 os.environ["MAGIC_NR"] = "33"
 os.environ["MAGIC_MINC"] = "4"
@@ -27,7 +28,13 @@ setup_initial_state()
 initialize_dt(3.0e-4)
 
 # Call radial loop once — matches Fortran stage 1 of step 1
-dtrkc, dthkc = _radial_loop_dispatch()
+_radial_loop_dispatch()
+# Get per-level CFL arrays for comparison with Fortran reference
+from magic_torch.courant import courant_check
+from magic_torch.step_time import _vrc, _vtc, _vpc
+from magic_torch.time_scheme import tscheme
+dtrkc, dthkc = courant_check(_vrc, _vtc, _vpc,
+                              courfac=tscheme.courfac, alffac=tscheme.alffac)
 np.save(os.path.join(out_dir, "dtrkc.npy"), dtrkc.cpu().numpy())
 np.save(os.path.join(out_dir, "dthkc.npy"), dthkc.cpu().numpy())
 print("nomag CFL runner completed")

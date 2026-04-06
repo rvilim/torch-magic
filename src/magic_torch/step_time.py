@@ -13,9 +13,9 @@ from .precision import DTYPE, CDTYPE, DEVICE
 from .params import (n_r_max, lm_max, l_max, n_theta_max, n_phi_max, alpha,
                      l_cond_ic, l_rot_ic, l_mag, l_chemical_conv, l_anel,
                      l_correct_AMz, l_correct_AMe, l_heat, l_SRIC,
-                     l_double_curl, l_finite_diff)
+                     l_double_curl, l_finite_diff, radial_chunk_size)
 from .courant import courant_check, dt_courant
-from .radial_functions import or2, lambda_, dLlambda
+from .radial_functions import or2, or4 as _or4_full, lambda_, dLlambda
 from .horizontal_data import dLh, hdif_S, hdif_V, hdif_B, hdif_Xi
 from .pre_calculations import opr, opm, BuoFac, ChemFac, CorFac, LFfac, l_z10mat, osc
 from .blocking import st_lm2l, st_lm2m
@@ -47,18 +47,36 @@ if l_chemical_conv:
 _dLh_1d = dLh.to(CDTYPE)  # (lm_max,)
 
 # Pre-allocated velocity buffers for radial_loop (no-slip: boundaries stay zero)
-_vrc = torch.zeros(n_r_max, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
-_vtc = torch.zeros_like(_vrc)
-_vpc = torch.zeros_like(_vrc)
-_cvrc = torch.zeros_like(_vrc)
-_cvtc = torch.zeros_like(_vrc)
-_cvpc = torch.zeros_like(_vrc)
+# In chunked mode, all velocity/curl buffers are chunk-local — skip full-size allocation.
+if radial_chunk_size == 0:
+    _vrc = torch.zeros(n_r_max, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
+    _vtc = torch.zeros_like(_vrc)
+    _vpc = torch.zeros_like(_vrc)
+    _cvrc = torch.zeros_like(_vrc)
+    _cvtc = torch.zeros_like(_vrc)
+    _cvpc = torch.zeros_like(_vrc)
+else:
+    _vrc = _vtc = _vpc = None
+    _cvrc = _cvtc = _cvpc = None
 
 # Grid-space fields persisted for movie output (set by radial_loop)
 last_brc = None  # (n_r, n_theta, n_phi)
 last_btc = None
 last_bpc = None
 last_sc = None
+
+# Pre-computed radial constants for chunked radial_loop (get_nl + courant_check)
+if radial_chunk_size > 0:
+    _or4_3_full = _or4_full.reshape(n_r_max, 1, 1)
+    _or2_3_full = or2.reshape(n_r_max, 1, 1)
+    from .radial_functions import orho1 as _orho1_full, orho2 as _orho2_full
+    from .radial_functions import delxr2 as _delxr2, delxh2 as _delxh2
+    _orho1_3_full = _orho1_full.reshape(n_r_max, 1, 1)
+    _orho2_3_full = _orho2_full.reshape(n_r_max, 1, 1)
+else:
+    _or4_3_full = _or2_3_full = None
+    _orho1_3_full = _orho2_3_full = None
+    _delxr2 = _delxh2 = None
 
 # Precompute broadcast arrays for initial rhs_imp
 _hdif_S_lm = hdif_S[st_lm2l].to(CDTYPE).unsqueeze(1)
@@ -578,6 +596,309 @@ def setup_initial_state():
             f.omega_ic = c_z10_omega_ic * z10_icb
 
 
+def _radial_loop_chunked():
+    """Chunked version of radial_loop for reduced GPU memory.
+
+    Processes radial levels in chunks of size C instead of all N at once.
+    Grid-space memory is O(C) instead of O(N). Spectral arrays remain full (lm, N).
+
+    Operations INSIDE the chunk loop (independent per radial level):
+      - Inverse SHT, get_nl, forward SHT
+    Operations OUTSIDE (need full spectral arrays):
+      - get_td, finish_exp_*, CFL check, IC rotation, movie captures
+    """
+    f = fields
+    N = n_r_max
+    C = radial_chunk_size
+
+    expl_idx = max(0, tscheme.istage - 1) if tscheme.nstages > 1 else 0
+
+    # Pre-allocate spectral output arrays (lm, N) with zeros
+    AdvrLM = torch.zeros(lm_max, N, dtype=CDTYPE, device=DEVICE)
+    dVSrLM = torch.zeros_like(AdvrLM)
+    AdvtLM = torch.zeros_like(AdvrLM)
+    AdvpLM = torch.zeros_like(AdvrLM)
+    VStLM = torch.zeros_like(AdvrLM)
+    VxBrLM = torch.zeros_like(AdvrLM) if l_mag else None
+    VxBtLM = torch.zeros_like(AdvrLM) if l_mag else None
+    VxBpLM = torch.zeros_like(AdvrLM) if l_mag else None
+    dVXirLM = torch.zeros_like(AdvrLM) if l_chemical_conv else None
+    VXitLM = torch.zeros_like(AdvrLM) if l_chemical_conv else None
+
+    # Running CFL minimums and ICB slices
+    dtrkc_min = 1e10
+    dthkc_min = 1e10
+    brc_icb = None  # (nθ, nφ) slice at ICB for IC coupling
+    bpc_icb = None
+
+    for start in range(0, N, C):
+        end = min(start + C, N)
+        actual_C = end - start
+        need_pad = actual_C < C
+
+        # --- 1. Inverse SHT (spectral[:, start:end] → grid (actual_C, nθ, nφ)) ---
+        # Scalars
+        if l_heat or l_chemical_conv:
+            scal_inv_list = []
+            if l_heat:
+                s_chunk = f.s_LMloc[:, start:end]
+                if need_pad:
+                    s_chunk = torch.nn.functional.pad(s_chunk, (0, C - actual_C))
+                scal_inv_list.append(s_chunk)
+            if l_chemical_conv:
+                xi_chunk = f.xi_LMloc[:, start:end]
+                if need_pad:
+                    xi_chunk = torch.nn.functional.pad(xi_chunk, (0, C - actual_C))
+                scal_inv_list.append(xi_chunk)
+            scal_inv_all = scal_to_spat(torch.cat(scal_inv_list, dim=1))
+            off = 0
+            if l_heat:
+                sc_chunk = scal_inv_all[:C]
+                off = C
+            else:
+                sc_chunk = torch.zeros(C, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
+            if l_chemical_conv:
+                xic_chunk = scal_inv_all[off:off + C]
+            else:
+                xic_chunk = torch.zeros(C, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
+        else:
+            sc_chunk = torch.zeros(C, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
+            xic_chunk = torch.zeros(C, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
+
+        # Vectors (magnetic + velocity + curls)
+        Q_parts = []
+        S_parts = []
+        T_parts = []
+
+        or2_chunk_2d = or2[start:end].unsqueeze(0).to(CDTYPE)  # (1, actual_C)
+        if need_pad:
+            or2_chunk_2d = torch.nn.functional.pad(or2_chunk_2d, (0, C - actual_C))
+
+        if l_mag:
+            b_chunk = f.b_LMloc[:, start:end]
+            db_chunk = f.db_LMloc[:, start:end]
+            aj_chunk = f.aj_LMloc[:, start:end]
+            dj_chunk = f.dj_LMloc[:, start:end]
+            ddb_chunk = f.ddb_LMloc[:, start:end]
+            if need_pad:
+                b_chunk = torch.nn.functional.pad(b_chunk, (0, C - actual_C))
+                db_chunk = torch.nn.functional.pad(db_chunk, (0, C - actual_C))
+                aj_chunk = torch.nn.functional.pad(aj_chunk, (0, C - actual_C))
+                dj_chunk = torch.nn.functional.pad(dj_chunk, (0, C - actual_C))
+                ddb_chunk = torch.nn.functional.pad(ddb_chunk, (0, C - actual_C))
+            Q_parts.append(_dLh_2d * b_chunk)
+            S_parts.append(db_chunk)
+            T_parts.append(aj_chunk)
+            Q_parts.append(_dLh_2d * aj_chunk)
+            S_parts.append(dj_chunk)
+            T_parts.append(or2_chunk_2d * _dLh_2d * b_chunk - ddb_chunk)
+
+        w_chunk = f.w_LMloc[:, start:end]
+        dw_chunk = f.dw_LMloc[:, start:end]
+        z_chunk = f.z_LMloc[:, start:end]
+        dz_chunk = f.dz_LMloc[:, start:end]
+        ddw_chunk = f.ddw_LMloc[:, start:end]
+        if need_pad:
+            w_chunk = torch.nn.functional.pad(w_chunk, (0, C - actual_C))
+            dw_chunk = torch.nn.functional.pad(dw_chunk, (0, C - actual_C))
+            z_chunk = torch.nn.functional.pad(z_chunk, (0, C - actual_C))
+            dz_chunk = torch.nn.functional.pad(dz_chunk, (0, C - actual_C))
+            ddw_chunk = torch.nn.functional.pad(ddw_chunk, (0, C - actual_C))
+        Q_parts.append(_dLh_2d * w_chunk)
+        S_parts.append(dw_chunk)
+        T_parts.append(z_chunk)
+        Q_parts.append(_dLh_2d * z_chunk)
+        S_parts.append(dz_chunk)
+        T_parts.append(or2_chunk_2d * _dLh_2d * w_chunk - ddw_chunk)
+
+        Q_all = torch.cat(Q_parts, dim=1)
+        S_all = torch.cat(S_parts, dim=1)
+        T_all = torch.cat(T_parts, dim=1)
+        all_r, all_t, all_p = torpol_to_spat(Q_all, S_all, T_all)
+
+        # Split results
+        offset = 0
+        if l_mag:
+            brc_chunk = all_r[offset:offset + C]
+            btc_chunk = all_t[offset:offset + C]
+            bpc_chunk = all_p[offset:offset + C]
+            offset += C
+            cbrc_chunk = all_r[offset:offset + C]
+            cbtc_chunk = all_t[offset:offset + C]
+            cbpc_chunk = all_p[offset:offset + C]
+            offset += C
+        else:
+            _zeros_chunk = torch.zeros(C, n_theta_max, n_phi_max, dtype=DTYPE, device=DEVICE)
+            brc_chunk = btc_chunk = bpc_chunk = _zeros_chunk
+            cbrc_chunk = cbtc_chunk = cbpc_chunk = _zeros_chunk
+
+        vrc_chunk = all_r[offset:offset + C]
+        vtc_chunk = all_t[offset:offset + C]
+        vpc_chunk = all_p[offset:offset + C]
+        offset += C
+        cvrc_chunk = all_r[offset:offset + C]
+        cvtc_chunk = all_t[offset:offset + C]
+        cvpc_chunk = all_p[offset:offset + C]
+
+        # --- 2. Nonlinear products (chunk-sized) ---
+        or4_chunk = _or4_3_full[start:end]
+        or2_chunk_3 = _or2_3_full[start:end]
+        if need_pad:
+            or4_chunk = torch.nn.functional.pad(or4_chunk, (0, 0, 0, 0, 0, C - actual_C))
+            or2_chunk_3 = torch.nn.functional.pad(or2_chunk_3, (0, 0, 0, 0, 0, C - actual_C))
+        nl_result = get_nl(
+            vrc_chunk, vtc_chunk, vpc_chunk, cvrc_chunk, cvtc_chunk, cvpc_chunk,
+            sc_chunk, brc_chunk, btc_chunk, bpc_chunk, cbrc_chunk, cbtc_chunk, cbpc_chunk,
+            xic_chunk, or4_chunk, or2_chunk_3)
+        Advr, Advt, Advp, VSr, VSt, VSp, VxBr, VxBt, VxBp, VXir, VXit, VXip = nl_result
+
+        # --- Per-chunk CFL check (on unpadded data) ---
+        dtrkc_c, dthkc_c = courant_check(
+            vrc_chunk[:actual_C], vtc_chunk[:actual_C], vpc_chunk[:actual_C],
+            brc_chunk[:actual_C] if l_mag else None,
+            btc_chunk[:actual_C] if l_mag else None,
+            bpc_chunk[:actual_C] if l_mag else None,
+            courfac=tscheme.courfac, alffac=tscheme.alffac,
+            or4_3=_or4_3_full[start:end],
+            or2_3=_or2_3_full[start:end],
+            orho1_3=_orho1_3_full[start:end],
+            orho2_3=_orho2_3_full[start:end],
+            delxr2_in=_delxr2[start:end],
+            delxh2_in=_delxh2[start:end])
+        dtrkc_min = min(dtrkc_min, dtrkc_c.min().item())
+        dthkc_min = min(dthkc_min, dthkc_c.min().item())
+
+        # --- Save ICB slices for IC coupling ---
+        if l_mag and (l_cond_ic or l_rot_ic) and start <= N - 1 < end:
+            local_icb = N - 1 - start
+            brc_icb = brc_chunk[local_icb].clone()
+            bpc_icb = bpc_chunk[local_icb].clone()
+
+        # --- 3. Forward SHT on bulk portion of chunk ---
+        bulk_start = max(1, start)
+        bulk_end = min(N - 1, end)
+        if bulk_end > bulk_start:
+            # Local indices within the chunk
+            local_bs = bulk_start - start
+            local_be = bulk_end - start
+            Nb_chunk = local_be - local_bs
+
+            # Scalar forward SHT
+            scal_fwd_list = [Advr[local_bs:local_be], VSr[local_bs:local_be]]
+            if l_mag:
+                scal_fwd_list.append(VxBr[local_bs:local_be])
+            if l_chemical_conv:
+                scal_fwd_list.append(VXir[local_bs:local_be])
+            scal_in = torch.cat(scal_fwd_list, dim=0)
+            scal_out = scal_to_SH(scal_in)
+
+            s_offset = 0
+            AdvrLM[:, bulk_start:bulk_end] = scal_out[:, s_offset:s_offset + Nb_chunk]; s_offset += Nb_chunk
+            dVSrLM[:, bulk_start:bulk_end] = scal_out[:, s_offset:s_offset + Nb_chunk]; s_offset += Nb_chunk
+            if l_mag:
+                VxBrLM[:, bulk_start:bulk_end] = scal_out[:, s_offset:s_offset + Nb_chunk]; s_offset += Nb_chunk
+            if l_chemical_conv:
+                dVXirLM[:, bulk_start:bulk_end] = scal_out[:, s_offset:s_offset + Nb_chunk]; s_offset += Nb_chunk
+
+            # Vector forward SHT
+            vt_fwd_list = [Advt[local_bs:local_be], VSt[local_bs:local_be]]
+            vp_fwd_list = [Advp[local_bs:local_be], VSp[local_bs:local_be]]
+            if l_mag:
+                vt_fwd_list.append(VxBt[local_bs:local_be])
+                vp_fwd_list.append(VxBp[local_bs:local_be])
+            if l_chemical_conv:
+                vt_fwd_list.append(VXit[local_bs:local_be])
+                vp_fwd_list.append(VXip[local_bs:local_be])
+            vt_in = torch.cat(vt_fwd_list, dim=0)
+            vp_in = torch.cat(vp_fwd_list, dim=0)
+            S_out, T_out = spat_to_sphertor(vt_in, vp_in)
+
+            v_offset = 0
+            AdvtLM[:, bulk_start:bulk_end] = S_out[:, v_offset:v_offset + Nb_chunk]
+            AdvpLM[:, bulk_start:bulk_end] = T_out[:, v_offset:v_offset + Nb_chunk]
+            v_offset += Nb_chunk
+            VStLM[:, bulk_start:bulk_end] = S_out[:, v_offset:v_offset + Nb_chunk]
+            v_offset += Nb_chunk
+            if l_mag:
+                VxBtLM[:, bulk_start:bulk_end] = S_out[:, v_offset:v_offset + Nb_chunk]
+                VxBpLM[:, bulk_start:bulk_end] = T_out[:, v_offset:v_offset + Nb_chunk]
+                v_offset += Nb_chunk
+            if l_chemical_conv:
+                VXitLM[:, bulk_start:bulk_end] = S_out[:, v_offset:v_offset + Nb_chunk]
+                v_offset += Nb_chunk
+
+    # === After all chunks ===
+    # Movie captures: not available in chunked mode (grid arrays are chunk-local)
+    global last_brc, last_btc, last_bpc, last_sc
+    last_brc = last_btc = last_bpc = last_sc = None
+
+    # === 3b. Boundary VxBt from rigid rotation (conducting IC, uses saved ICB slice) ===
+    if l_mag and l_cond_ic and f.omega_ic != 0.0:
+        from .horizontal_data import sinTheta_grid
+        icb_nr = N - 1
+        vpc_icb_grid = _r_icb_py ** 2 * _orho1_icb_py * sinTheta_grid ** 2 * f.omega_ic
+        VxBt_grid_icb = (_or4_icb_py * _orho1_icb_py
+                         * vpc_icb_grid.unsqueeze(1) * brc_icb)
+        VxBtLM_icb_S, _ = spat_to_sphertor(
+            VxBt_grid_icb.unsqueeze(0),
+            torch.zeros_like(VxBt_grid_icb).unsqueeze(0)
+        )
+        VxBtLM[:, icb_nr] = VxBtLM_icb_S[:, 0]
+
+    # === 4. Time derivative assembly (full spectral arrays) ===
+    if l_double_curl:
+        dwdt_expl, dVxVhLM = get_dwdt_double_curl(
+            AdvrLM, AdvtLM, f.w_LMloc, f.dw_LMloc, f.ddw_LMloc,
+            f.z_LMloc, f.dz_LMloc)
+        dwdt_expl = finish_exp_pol(dwdt_expl, dVxVhLM)
+    else:
+        dwdt_expl = get_dwdt(AdvrLM, f.dw_LMloc, f.z_LMloc)
+    dt_fields.dwdt.expl[:, :, expl_idx] = dwdt_expl
+
+    dzdt_expl = get_dzdt(AdvpLM, f.w_LMloc, f.dw_LMloc, f.z_LMloc)
+    dt_fields.dzdt.expl[:, :, expl_idx] = dzdt_expl
+
+    if not l_double_curl:
+        dpdt_expl = get_dpdt(AdvtLM, f.w_LMloc, f.dw_LMloc, f.z_LMloc)
+        dt_fields.dpdt.expl[:, :, expl_idx] = dpdt_expl
+
+    if l_heat:
+        dsdt_partial, dVSrLM_out = get_dsdt(VStLM, dVSrLM)
+        dsdt_expl = finish_exp_entropy(dsdt_partial, dVSrLM_out)
+        dt_fields.dsdt.expl[:, :, expl_idx] = dsdt_expl
+
+    if l_chemical_conv:
+        dxidt_partial, dVXirLM_out = get_dxidt(VXitLM, dVXirLM)
+        dxidt_expl = finish_exp_comp(dxidt_partial, dVXirLM_out)
+        dt_fields.dxidt.expl[:, :, expl_idx] = dxidt_expl
+
+    if l_mag:
+        dbdt_expl, djdt_partial, dVxBhLM = get_dbdt(VxBrLM, VxBtLM, VxBpLM)
+        djdt_expl = finish_exp_mag(djdt_partial, dVxBhLM)
+        dt_fields.dbdt.expl[:, :, expl_idx] = dbdt_expl
+        dt_fields.djdt.expl[:, :, expl_idx] = djdt_expl
+
+    # === 5. IC rotation (uses saved ICB slices) ===
+    global lorentz_torque_ic_last
+    if l_mag and l_rot_ic and l_cond_ic:
+        from .horizontal_data import gauss_grid
+        fac_lt = LFfac * two * math.pi / float(n_phi_max)
+        lorentz_torque_ic = fac_lt * (gauss_grid.unsqueeze(1) * brc_icb * bpc_icb).sum().item()
+        lorentz_torque_ic_last = lorentz_torque_ic
+        domega_ic_exp = finish_exp_tor(f.omega_ic, lorentz_torque_ic)
+        dt_fields.domega_ic_dt.expl[expl_idx] = domega_ic_exp
+
+    # === 6. IC magnetic advection ===
+    if l_mag and l_cond_ic:
+        finish_exp_mag_ic(
+            f.b_ic, f.aj_ic, f.omega_ic,
+            dt_fields.dbdt_ic.expl[:, :, expl_idx],
+            dt_fields.djdt_ic.expl[:, :, expl_idx]
+        )
+
+    return dtrkc_min, dthkc_min
+
+
 def radial_loop():
     """Inverse SHT → nonlinear products → forward SHT → time derivative assembly.
 
@@ -588,7 +909,12 @@ def radial_loop():
     All SHT calls are batched over radial levels to minimize Python overhead.
     Multiple transforms are combined into single calls where possible.
     Dynamic batching based on l_mag and l_chemical_conv flags.
+
+    When radial_chunk_size > 0, dispatches to _radial_loop_chunked() to
+    reduce peak GPU memory by processing radial levels in chunks.
     """
+    if 0 < radial_chunk_size < n_r_max:
+        return _radial_loop_chunked()
     f = fields
     N = n_r_max
     Nb = N - 2
@@ -846,7 +1172,7 @@ def radial_loop():
         courfac=tscheme.courfac,
         alffac=tscheme.alffac,
     )
-    return dtrkc, dthkc
+    return dtrkc.min().item(), dthkc.min().item()
 
 
 def radial_loop_anel():
@@ -1109,7 +1435,7 @@ def radial_loop_anel():
         courfac=tscheme.courfac,
         alffac=tscheme.alffac,
     )
-    return dtrkc, dthkc
+    return dtrkc.min().item(), dthkc.min().item()
 
 
 def lm_loop():

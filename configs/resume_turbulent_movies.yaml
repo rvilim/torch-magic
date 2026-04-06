@@ -1,0 +1,28 @@
+# Resume turbulent dynamo (Ek=1e-5, l=384) with movie output
+# No chunking needed — ~72 GB fits on B200 (192 GB)
+
+l_max: 384
+n_r_max: 769
+
+ra: 5.0e7
+ek: 1.0e-5
+pr: 1.0
+prmag: 3.0
+
+n_steps: 10000000
+dt: 1.5e-6
+
+output_dir: ./output/turbulent_dynamo_movies
+log_every: 100
+checkpoint_every: 1000
+
+device: cuda
+
+# Restart from previous run's .pt checkpoint on the output volume
+restart: /output/20260405_172206/checkpoint_002000.pt
+
+# Movie output
+n_movie_step: 100
+movies:
+  - "Br CMB"
+  - "Vr CMB"

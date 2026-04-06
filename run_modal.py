@@ -93,6 +93,7 @@ def run_remote(cfg: dict, run_name: str):
         "ktopxi": "MAGIC_KTOPXI",
         "kbotxi": "MAGIC_KBOTXI",
         "intfac": "MAGIC_INTFAC",
+        "radial_chunk_size": "MAGIC_RADIAL_CHUNK",
     }
     for key, env_var in _CFG_TO_ENV.items():
         if key in cfg:
@@ -123,7 +124,8 @@ def main(config: str):
 
     # Upload Fortran checkpoint to input volume if needed
     fortran_restart = cfg.get("fortran_restart")
-    if fortran_restart and not fortran_restart.startswith("/input/"):
+    if fortran_restart and not (fortran_restart.startswith("/input/") or
+                                  fortran_restart.startswith("/output/")):
         local_path = fortran_restart
         remote_name = os.path.basename(local_path)
         print(f"Uploading checkpoint {local_path} to Modal input volume...")

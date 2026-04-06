@@ -174,6 +174,12 @@ _sphertor_D_r = torch.cat([_wdPlm_pad_r] * 4, dim=0)
 # Imag coeff group: 4 copies of -dm*wPlm (for input positions [f1N, f2N, f1S, f2S])
 _sphertor_C_r = torch.cat([_wPlm_dm_imag_pad_r] * 4, dim=0)
 
+# Free intermediate matrices only used to build the stacked versions above
+del _P_PlmG_T_r, _P_PlmC_T_r, _P_PlmC_sign_T_r, _P_PlmG_sign_T_r
+del _wdPlm_pad_r, _wPlm_dm_imag_pad_r
+del _Plm_c_m, _dPlm_c_m, _wPlm_c_m, _wdPlm_c_m, _PlmG_c_m, _PlmC_c_m
+del _mPlm_c_m, _wPlm_dm_imag_m
+
 
 def scal_to_spat(Slm: torch.Tensor, lcut: int = None) -> torch.Tensor:
     """Scalar spherical harmonic to spatial grid.

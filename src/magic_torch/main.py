@@ -462,6 +462,10 @@ def run(cfg=None, on_log=None):
         # Movie files
         movie_files = []
         movie_configs = []
+        from .params import radial_chunk_size as _rcs
+        if _rcs > 0 and n_movie_step > 0 and movie_list:
+            print("  Warning: movies disabled in chunked radial mode")
+            movie_list = []
         if n_movie_step > 0 and movie_list:
             from .movie_output import (parse_movie_string, write_movie_header,
                                        write_movie_frame, extract_surface_field,

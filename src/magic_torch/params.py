@@ -110,6 +110,7 @@ alpha = _cfg_float("alpha", "MAGIC_ALPHA", 0.6)
 courfac = _cfg_float("courfac", "MAGIC_COURFAC", 1e3)
 alffac = _cfg_float("alffac", "MAGIC_ALFFAC", 1e3)
 intfac = _cfg_float("intfac", "MAGIC_INTFAC", 1e3)
+radial_chunk_size = _cfg_int("radial_chunk_size", "MAGIC_RADIAL_CHUNK", 0)
 
 # --- Time scheme ---
 time_scheme = _cfg_str("time_scheme", "MAGIC_TIME_SCHEME", "CNAB2")
