@@ -16,24 +16,15 @@ GPU_TYPE = os.environ.get("MAGIC_MODAL_GPU", "H100")
 app = modal.App("sht-shtns-bench")
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    # Use CUDA base image so nvcc and CUDA libs are available at build time
+    modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.12")
     .apt_install("libfftw3-dev", "build-essential", "autoconf", "libtool")
     .pip_install("torch", "numpy")
     .run_commands(
-        # Find CUDA libs and build SHTns from source with GPU support
-        "find / -name 'libcudart.so*' 2>/dev/null | head -5 && "
-        "which nvcc && nvcc --version && "
-        # pip install --no-binary forces source build
-        "pip install --no-binary shtns shtns || ("
-        # If pip fails, try manual build with explicit CUDA path
-        "  pip download --no-binary shtns shtns && "
-        "  tar xf shtns-*.tar.gz && cd shtns-* && "
-        "  CUDA_LIB=$(dirname $(find / -name 'libcudart.so' 2>/dev/null | head -1)) && "
-        "  CUDA_PATH=$(dirname $CUDA_LIB) && "
-        "  echo \"Using CUDA_PATH=$CUDA_PATH\" && "
-        "  ./configure --enable-python --enable-cuda && "
-        "  make -j && pip install ."
-        ")",
+        # Build SHTns from source with CUDA support
+        "pip download --no-binary shtns shtns && "
+        "tar xf shtns-*.tar.gz && cd shtns-* && "
+        "CUDA_PATH=/usr/local/cuda pip install .",
     )
     .add_local_dir("src", remote_path="/root/src")
 )
