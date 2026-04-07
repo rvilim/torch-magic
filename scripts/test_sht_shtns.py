@@ -44,6 +44,8 @@ def run_tests(lmax: int):
                                   scal_to_SH as bmm_scal_to_SH,
                                   torpol_to_spat as bmm_torpol_to_spat,
                                   spat_to_sphertor as bmm_spat_to_sphertor)
+    import magic_torch.sht_shtns as _sht_shtns_mod
+    print(f"sht_shtns version: {_sht_shtns_mod.__doc__[:60]}")
     from magic_torch.sht_shtns import (scal_to_spat as shtns_scal_to_spat,
                                         scal_to_SH as shtns_scal_to_SH,
                                         torpol_to_spat as shtns_torpol_to_spat,
@@ -156,7 +158,7 @@ def run_tests(lmax: int):
     # SHTns: use cu_SHsphtor_to_spat directly
     sh_diag = shtns_scal_to_spat  # just to get a config
     sh1 = shtns_torpol_to_spat  # trigger config creation
-    from magic_torch.sht_shtns import _get_config, _spat_from_shtns, _spec_to_shtns, _inv_sin_theta_sorted, _grid_idx
+    from magic_torch.sht_shtns import _get_config, _spat_from_shtns, _spec_to_shtns, _grid_idx
     sh_cfg = _get_config(1)
     s_gpu = _spec_to_shtns(S_test.unsqueeze(1))
     t_gpu = _spec_to_shtns(T_test.unsqueeze(1))
@@ -166,18 +168,13 @@ def run_tests(lmax: int):
     sh_cfg.cu_SHsphtor_to_spat(s_gpu.data_ptr(), t_gpu.data_ptr(),
                                  vt_out.data_ptr(), vp_out.data_ptr())
     torch.cuda.synchronize()
-    # Raw SHTns output (sorted, Robert form = *sin(theta))
+    # Raw SHTns output (sorted, no Robert form)
     vt_sorted = vt_out.transpose(-1, -2)  # (1, n_theta_sorted, n_phi)
-    # Try with and without sin(theta) correction
     vt_raw = vt_sorted[0, _grid_idx, :]
-    vt_div = (vt_sorted * _inv_sin_theta_sorted)[0, _grid_idx, :]
     err_raw = (vt_raw - vt_bmm).abs().max().item()
-    err_div = (vt_div - vt_bmm).abs().max().item()
-    print(f"  vt raw (no sin correction): err={err_raw:.2e}")
-    print(f"  vt / sin(theta): err={err_div:.2e}")
+    print(f"  vt raw: err={err_raw:.2e}")
     print(f"  vt bmm range: [{vt_bmm.min():.2e}, {vt_bmm.max():.2e}]")
     print(f"  vt shtns raw range: [{vt_raw.min():.2e}, {vt_raw.max():.2e}]")
-    print(f"  vt shtns/sin range: [{vt_div.min():.2e}, {vt_div.max():.2e}]")
 
     # === Test 7: Y_1^0 theta ordering verification ===
     print("\n--- Y_1^0 theta ordering ---")
