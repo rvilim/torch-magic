@@ -202,63 +202,117 @@ def run_batch_sweep(lmax: int, batch_sizes: list):
     os.environ["MAGIC_DEVICE"] = "cuda"
     sys.path.insert(0, "/root/src")
     from magic_torch.params import lm_max, n_theta_max, n_phi_max
-    from magic_torch.sht import scal_to_spat
+    from magic_torch.sht import scal_to_spat, torpol_to_spat
     from magic_torch.precision import CDTYPE, DTYPE, DEVICE
+    from magic_torch.horizontal_data import dLh
     import torch
     import shtns
+    import ctypes
+    import _shtns_cuda as _shtns_mod
+
+    lib = ctypes.CDLL(_shtns_mod.__file__)
+    lib.shtns_set_many.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+    lib.shtns_set_many.restype = ctypes.c_int
+
+    _dLh_1d = dLh.to(CDTYPE).unsqueeze(1)  # for torpol pre-multiply
 
     print(f"lm_max={lm_max}, n_theta={n_theta_max}, n_phi={n_phi_max}\n")
+
+    # === Scalar SHT sweep ===
+    print("=== scal_to_spat (scalar forward SHT) ===")
     print(f"{'n_batch':>8} {'bmm ms':>10} {'shtns ms':>10} {'speedup':>8}")
     print("-" * 40)
 
     for nb in batch_sizes:
-        # Fresh SHTns config for each batch size
         sh = shtns.sht(lmax, lmax, mres=1, norm=shtns.sht_orthonormal | shtns.SHT_NO_CS_PHASE)
-        try:
-            import ctypes
-            import _shtns_cuda as _shtns_mod
-            lib = ctypes.CDLL(_shtns_mod.__file__)
-            lib.shtns_set_many.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
-            lib.shtns_set_many.restype = ctypes.c_int
-            lib.shtns_set_many(ctypes.c_void_p(int(sh.this)), nb, sh.nlm)
-        except Exception:
-            pass
+        lib.shtns_set_many(ctypes.c_void_p(int(sh.this)), nb, sh.nlm)
         sh.set_grid(nlat=n_theta_max, nphi=n_phi_max,
                      flags=shtns.SHT_ALLOW_GPU | shtns.SHT_THETA_CONTIGUOUS)
 
-        # Test data
         torch.manual_seed(42)
         Slm_torch = (torch.randn(lm_max, nb, dtype=DTYPE, device=DEVICE)
                       + 1j * torch.randn(lm_max, nb, dtype=DTYPE, device=DEVICE)).to(CDTYPE)
-        slm_gpu = Slm_torch.T.contiguous()  # (nb, lm_max) for SHTns
+        slm_gpu = Slm_torch.T.contiguous()
         out_gpu = torch.zeros(nb, sh.nphi, sh.nlat, dtype=DTYPE, device=DEVICE).contiguous()
 
         n_iter = 50
-
-        # BMM timing
-        for _ in range(5):
-            scal_to_spat(Slm_torch)
-        torch.cuda.synchronize()
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
+
+        # BMM
+        for _ in range(5): scal_to_spat(Slm_torch)
+        torch.cuda.synchronize()
         s.record()
-        for _ in range(n_iter):
-            scal_to_spat(Slm_torch)
+        for _ in range(n_iter): scal_to_spat(Slm_torch)
         e.record()
         torch.cuda.synchronize()
         bmm_ms = s.elapsed_time(e) / n_iter
 
-        # SHTns timing
+        # SHTns
         torch.cuda.synchronize()
-        for _ in range(5):
-            sh.cu_SH_to_spat(slm_gpu.data_ptr(), out_gpu.data_ptr())
+        for _ in range(5): sh.cu_SH_to_spat(slm_gpu.data_ptr(), out_gpu.data_ptr())
         torch.cuda.synchronize()
         s.record()
-        for _ in range(n_iter):
-            sh.cu_SH_to_spat(slm_gpu.data_ptr(), out_gpu.data_ptr())
+        for _ in range(n_iter): sh.cu_SH_to_spat(slm_gpu.data_ptr(), out_gpu.data_ptr())
         e.record()
         torch.cuda.synchronize()
         shtns_ms = s.elapsed_time(e) / n_iter
+
+        print(f"{nb:>8} {bmm_ms:>10.3f} {shtns_ms:>10.3f} {bmm_ms/shtns_ms:>7.2f}x")
+
+    # === Vector SHT sweep (torpol_to_spat / cu_SHqst_to_spat) ===
+    print(f"\n=== torpol_to_spat (vector forward SHT, the expensive one) ===")
+    print(f"{'n_batch':>8} {'bmm ms':>10} {'shtns ms':>10} {'speedup':>8}")
+    print("-" * 40)
+
+    for nb in batch_sizes:
+        sh = shtns.sht(lmax, lmax, mres=1, norm=shtns.sht_orthonormal | shtns.SHT_NO_CS_PHASE)
+        lib.shtns_set_many(ctypes.c_void_p(int(sh.this)), nb, sh.nlm)
+        sh.set_grid(nlat=n_theta_max, nphi=n_phi_max,
+                     flags=shtns.SHT_ALLOW_GPU | shtns.SHT_THETA_CONTIGUOUS)
+
+        torch.manual_seed(42)
+        Qlm = (torch.randn(lm_max, nb, dtype=DTYPE, device=DEVICE)
+               + 1j * torch.randn(lm_max, nb, dtype=DTYPE, device=DEVICE)).to(CDTYPE)
+        Slm2 = (torch.randn(lm_max, nb, dtype=DTYPE, device=DEVICE)
+                + 1j * torch.randn(lm_max, nb, dtype=DTYPE, device=DEVICE)).to(CDTYPE)
+        Tlm = (torch.randn(lm_max, nb, dtype=DTYPE, device=DEVICE)
+               + 1j * torch.randn(lm_max, nb, dtype=DTYPE, device=DEVICE)).to(CDTYPE)
+
+        # SHTns inputs: (nb, lm_max) contiguous
+        q_gpu = Qlm.T.contiguous()
+        s_gpu = Slm2.T.contiguous()
+        t_gpu = Tlm.T.contiguous()
+        vr_gpu = torch.zeros(nb, sh.nphi, sh.nlat, dtype=DTYPE, device=DEVICE).contiguous()
+        vt_gpu = torch.zeros_like(vr_gpu)
+        vp_gpu = torch.zeros_like(vr_gpu)
+
+        n_iter = 50
+        s_ev = torch.cuda.Event(enable_timing=True)
+        e_ev = torch.cuda.Event(enable_timing=True)
+
+        # BMM torpol_to_spat
+        for _ in range(3): torpol_to_spat(Qlm, Slm2, Tlm)
+        torch.cuda.synchronize()
+        s_ev.record()
+        for _ in range(n_iter): torpol_to_spat(Qlm, Slm2, Tlm)
+        e_ev.record()
+        torch.cuda.synchronize()
+        bmm_ms = s_ev.elapsed_time(e_ev) / n_iter
+
+        # SHTns cu_SHqst_to_spat
+        torch.cuda.synchronize()
+        for _ in range(3):
+            sh.cu_SHqst_to_spat(q_gpu.data_ptr(), s_gpu.data_ptr(), t_gpu.data_ptr(),
+                                 vr_gpu.data_ptr(), vt_gpu.data_ptr(), vp_gpu.data_ptr())
+        torch.cuda.synchronize()
+        s_ev.record()
+        for _ in range(n_iter):
+            sh.cu_SHqst_to_spat(q_gpu.data_ptr(), s_gpu.data_ptr(), t_gpu.data_ptr(),
+                                 vr_gpu.data_ptr(), vt_gpu.data_ptr(), vp_gpu.data_ptr())
+        e_ev.record()
+        torch.cuda.synchronize()
+        shtns_ms = s_ev.elapsed_time(e_ev) / n_iter
 
         print(f"{nb:>8} {bmm_ms:>10.3f} {shtns_ms:>10.3f} {bmm_ms/shtns_ms:>7.2f}x")
 
