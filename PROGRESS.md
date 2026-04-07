@@ -2342,4 +2342,51 @@ Starting point: **965 ms/step** (measured via CUDA events)
 | get_td | 36 | 5% |
 | get_nl | 16 | 2% |
 
-**Next target**: Triton on-the-fly SHT kernel (Plm recurrence in registers, eliminating Plm matrix HBM reads). Estimated 2-4× SHT speedup.
+### Approaches tried and abandoned
+
+**Triton on-the-fly SHT kernel** (scalar FMA recurrence):
+- Each thread computes Plm via 3-term recurrence, accumulates spectral sum
+- Result: 2× SLOWER than cuBLAS bmm (33 ms vs 15.6 ms for torpol_to_spat)
+- Reason: scalar FMA loop cannot match cuBLAS tensor core (DMMA) throughput
+- Also had correctness issues in dPlm (angular components ~10% error)
+- Deleted: commit fb9b876
+
+**DCT-based Chebyshev derivatives** (O(N log N) instead of O(N²)):
+- costf → dcheb backward recurrence → costf pipeline
+- Without torch.compile: 2.2× SLOWER (157 vs 70 ms) — 769 sequential CUDA kernel launches
+- With torch.compile: compilation hangs (769-iteration loop too complex for Inductor)
+- The dense DGEMM (single kernel launch) beats the O(N log N) algorithm at these sizes
+- Reverted: commits 688736d, 5f8edaa
+
+**Chunk size sweep** (C=32 vs C=64):
+- No improvement (765 vs 768 ms) — kernel launch count is NOT the SHT bottleneck
+- The bmm is compute-bound at ~13% of peak fp64 throughput (not launch-bound)
+
+### SHT bottleneck analysis
+
+The SHT at 452 ms achieves only 13% of B200 peak fp64 throughput (10 TFLOP/s out of 72 TFLOP/s).
+Root causes identified by deep analysis:
+- Individual GEMMs are medium-sized (288×385 @ 385×256) with misaligned dimensions for tensor
+  core tiles (K=385 not multiple of 4 for DMMA, M=288 creates tiling waste)
+- ~61% of SHT time is cuBLAS compute at ~22% efficiency
+- ~11% Python dispatch overhead from ~10K PyTorch ops per step
+- ~8% FFT, ~7% data shuffling (gather, cat, permute)
+
+### Next target: SHTns library integration
+
+Research confirmed that SHTns (the library Fortran MagIC already uses) has GPU support with:
+- **On-the-fly Legendre recurrence** via JIT-compiled CUDA kernels (NVRTC)
+- **Explicit H100 tuning** (sm_90 detection + kernel parameter optimization)
+- **B200 support** via dynamic compute capability detection (sm_100 ≥ sm_90)
+- **Same spectral ordering** as our code (m-major, orthonormal, no CS phase)
+- **Same grid** (Gauss-Legendre, interleaved N/S theta)
+- **Batched transforms** via `shtns_set_many()` for multiple radial levels
+- **Direct PyTorch interop** possible via `tensor.data_ptr()` → `cu_*` functions
+
+The cunuSHT paper confirms: "modern top-performing CPU and GPU codes like SHTns use on-the-fly
+calculation of P_ℓ^m(θ) using efficient recurrence formulas." SHTns's hand-tuned CUDA kernels
+should significantly outperform our cuBLAS bmm approach.
+
+SHTns source is available at `/Users/rvilim/dynamo/master/`. All 5 transforms we need have
+direct SHTns equivalents. Integration effort: ~2-3 days (build with CUDA, write PyTorch wrapper,
+validate against current bmm output).

@@ -387,3 +387,19 @@ Result: **chunk=64 gives 765 ms vs chunk=32's 768 ms — no improvement.**
 in the bmm itself, not launch overhead. This means CUTLASS grouped GEMM (which mainly reduces
 launches) would also have limited impact. The path to further SHT speedup requires changing the
 algorithm — either Triton on-the-fly recurrence or an external SHT library (SHTns).
+
+#### Approaches that failed (2026-04-05)
+
+**Triton on-the-fly SHT** (scalar FMA recurrence in registers):
+- scal_to_spat: 2.2 ms Triton vs 1.2 ms bmm (0.55×)
+- torpol_to_spat: 33 ms Triton vs 15.6 ms bmm (0.47×)
+- Scalar FMA cannot match cuBLAS DMMA (tensor core) throughput
+- dPlm recurrence had correctness issues (~10% error in angular components)
+
+**DCT-based Chebyshev derivatives** (O(N log N) to replace 70 ms D123 DGEMM):
+- Uncompiled Python loop: 157 ms (2.2× slower) — 769 sequential kernel launches
+- torch.compile: compilation hangs (769-iteration loop too complex for Inductor)
+- Dense DGEMM (single kernel) beats O(N log N) at N=769 on GPU
+
+**Next target: SHTns library integration** — on-the-fly Legendre recurrence via
+JIT-compiled CUDA kernels with H100/B200 tuning. Same algorithm as Fortran MagIC uses.
