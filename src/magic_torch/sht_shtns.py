@@ -45,8 +45,11 @@ def _make_shtns_config(n_batch):
     """Create an SHTns config for a given batch size."""
     sh = shtns.sht(l_max, l_max, mres=minc,
                    norm=shtns.sht_orthonormal | shtns.SHT_NO_CS_PHASE)
-    # Do NOT enable Robert form — SHTns outputs raw physical fields without it,
-    # which matches our bmm convention. Verified by unit test diagnostic.
+    # Enable Robert form: with Robert form, SHTns's vector synthesis outputs
+    # sin(theta)*dPlm-based fields which matches our bmm convention (our Plm
+    # derivatives are sin(theta)*dP/dtheta, not raw dP/dtheta).
+    # No post-correction needed — the output directly matches our bmm.
+    sh.robert_form(1)
     # Set batching via ctypes
     cfg_ptr = ctypes.c_void_p(int(sh.this))
     ret = _lib.shtns_set_many(cfg_ptr, n_batch, sh.nlm)
