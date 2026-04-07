@@ -23,7 +23,7 @@ image = (
     .apt_install("libfftw3-dev", "build-essential", "autoconf", "libtool")
     .pip_install("torch", "numpy")
     # Upload full SHTns source (includes GPU kernel generators)
-    .add_local_dir(SHTNS_SRC, remote_path="/root/shtns_src")
+    .add_local_dir(SHTNS_SRC, remote_path="/root/shtns_src", copy=True)
     .run_commands(
         "cd /root/shtns_src && CUDA_PATH=/usr/local/cuda pip install .",
     )
