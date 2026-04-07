@@ -193,9 +193,26 @@ def run_tests(lmax: int):
     S_sin = _spec_from_shtns(slm1, 1).squeeze(1) * _inv_dLh.squeeze(1)
     T_sin = _spec_from_shtns(tlm1, 1).squeeze(1) * _inv_dLh.squeeze(1)
     err_sin = (S_sin - Sref).abs().max().item()
-    print(f"  S raw input: err={err_raw:.2e}")
-    print(f"  S sin(theta) input: err={err_sin:.2e}")
+    print(f"  S raw input: err={err_raw:.2e}, S range=[{S_raw.abs().min():.2e}, {S_raw.abs().max():.2e}]")
+    print(f"  S sin(theta) input: err={err_sin:.2e}, S range=[{S_sin.abs().min():.2e}, {S_sin.abs().max():.2e}]")
     print(f"  S ref range: [{Sref.abs().min():.2e}, {Sref.abs().max():.2e}]")
+    # Try scalar analysis (cu_spat_to_SH) on the same grid to check if analysis works at all
+    from magic_torch.sht_shtns import scal_to_SH as shtns_scal_to_SH_fn
+    _, btc_test, _ = bmm_torpol_to_spat(Q1, S1, T1)
+    Slm_from_bt = shtns_scal_to_SH_fn(btc_test)
+    Slm_from_bt_bmm = bmm_scal_to_SH(btc_test)
+    err_scal_anal = (Slm_from_bt - Slm_from_bt_bmm).abs().max().item()
+    print(f"  scalar analysis of bt: err={err_scal_anal:.2e} (sanity check)")
+    # Try SHTns's cu_spat_to_SHqst (3-component analysis) instead
+    vr_shtns = _spat_to_shtns(torch.zeros_like(btc1).unsqueeze(0))
+    qlm1 = torch.empty(1, lm_max, dtype=CDTYPE, device=DEVICE)
+    torch.cuda.synchronize()
+    sh1.cu_spat_to_SHqst(vr_shtns.data_ptr(), vt_raw.data_ptr(), vp_raw.data_ptr(),
+                          qlm1.data_ptr(), slm1.data_ptr(), tlm1.data_ptr())
+    torch.cuda.synchronize()
+    S_qst = _spec_from_shtns(slm1, 1).squeeze(1) * _inv_dLh.squeeze(1)
+    err_qst = (S_qst - Sref).abs().max().item()
+    print(f"  S via cu_spat_to_SHqst (raw): err={err_qst:.2e}, range=[{S_qst.abs().min():.2e}, {S_qst.abs().max():.2e}]")
 
     # === Test 6: Direct SHTns sphtor synthesis vs bmm ===
     print("\n--- sphtor synthesis diagnostic ---")
