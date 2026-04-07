@@ -76,7 +76,7 @@ def run_tests(lmax: int):
     def rand_spec(nb):
         s = (torch.randn(lm_max, nb, dtype=DTYPE, device=DEVICE)
              + 1j * torch.randn(lm_max, nb, dtype=DTYPE, device=DEVICE)).to(CDTYPE)
-        s[0] = s[0].real  # m=0 must be real for real spatial fields
+        s[0] = s[0].real.clone()  # m=0 must be real for real spatial fields
         return s
 
     # === Test 1: scal_to_spat ===
