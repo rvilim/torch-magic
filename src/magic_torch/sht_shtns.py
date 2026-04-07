@@ -19,11 +19,18 @@ import shtns
 
 from .precision import DTYPE, CDTYPE, DEVICE
 from .params import l_max, lm_max, n_theta_max, n_phi_max, n_m_max, minc, radial_chunk_size
-from .horizontal_data import _grid_idx, n_theta_cal2ord, dLh
+from .horizontal_data import _grid_idx, n_theta_cal2ord, dLh, sinTheta
 
 # Inverse dLh for spat_to_sphertor post-processing: 1/[l(l+1)], zero for l=0
 _inv_dLh = torch.zeros(lm_max, 1, dtype=CDTYPE, device=DEVICE)
 _inv_dLh[1:, 0] = 1.0 / dLh[1:].to(CDTYPE)
+
+# sin(theta) in sorted order for Robert form conversion:
+# Robert form synthesis outputs v*sin(theta), we need raw v → divide by sin(theta)
+# Robert form analysis expects v*sin(theta), we have raw v → multiply by sin(theta)
+_sin_theta_sorted = sinTheta.to(DEVICE)  # (n_theta_max,) sorted order
+_inv_sin_theta_sorted = (1.0 / _sin_theta_sorted).reshape(1, -1, 1)  # (1, n_theta, 1) for broadcast
+_sin_theta_sorted_3d = _sin_theta_sorted.reshape(1, -1, 1)  # (1, n_theta, 1)
 
 # --- SHTns initialization ---
 
@@ -45,7 +52,9 @@ def _make_shtns_config(n_batch):
     """Create an SHTns config for a given batch size."""
     sh = shtns.sht(l_max, l_max, mres=minc,
                    norm=shtns.sht_orthonormal | shtns.SHT_NO_CS_PHASE)
-    # DO NOT enable Robert form
+    # Enable Robert form: synthesis outputs v*sin(theta), analysis expects v*sin(theta).
+    # We convert at the wrapper boundary (divide/multiply by sin(theta)).
+    sh.robert_form(1)
     # Set batching via ctypes
     cfg_ptr = ctypes.c_void_p(int(sh.this))
     ret = _lib.shtns_set_many(cfg_ptr, n_batch, sh.nlm)
@@ -177,9 +186,14 @@ def torpol_to_spat(Qlm: torch.Tensor, Slm: torch.Tensor, Tlm: torch.Tensor,
                          vr.data_ptr(), vt.data_ptr(), vp.data_ptr())
     torch.cuda.synchronize()
 
+    # Robert form: SHTns outputs vr (unchanged), vt*sin(theta), vp*sin(theta)
+    # Radial component: no sin(theta) factor
     brc = _spat_from_shtns(vr)
-    btc = _spat_from_shtns(vt)
-    bpc = _spat_from_shtns(vp)
+    # Angular components: divide by sin(theta) in sorted order, then permute
+    vt_sorted = vt.transpose(-1, -2)  # (nb, n_theta_sorted, n_phi)
+    vp_sorted = vp.transpose(-1, -2)
+    btc = (vt_sorted * _inv_sin_theta_sorted)[:, _grid_idx, :]
+    bpc = (vp_sorted * _inv_sin_theta_sorted)[:, _grid_idx, :]
 
     if not batched:
         brc = brc.squeeze(0)
@@ -201,8 +215,12 @@ def spat_to_sphertor(vt: torch.Tensor, vp: torch.Tensor, lcut: int = None):
     n_batch = vt.shape[0]
 
     sh = _get_config(n_batch)
-    vt_shtns = _spat_to_shtns(vt)
-    vp_shtns = _spat_to_shtns(vp)
+    # Robert form: SHTns expects vt*sin(theta), vp*sin(theta)
+    # Our input is raw vt, vp → multiply by sin(theta) in sorted order
+    vt_sorted = vt[:, n_theta_cal2ord, :]  # interleaved → sorted
+    vp_sorted = vp[:, n_theta_cal2ord, :]
+    vt_shtns = (vt_sorted * _sin_theta_sorted_3d).transpose(-1, -2).contiguous()
+    vp_shtns = (vp_sorted * _sin_theta_sorted_3d).transpose(-1, -2).contiguous()
     slm_gpu = torch.empty(n_batch, lm_max, dtype=CDTYPE, device=DEVICE)
     tlm_gpu = torch.empty_like(slm_gpu)
 
