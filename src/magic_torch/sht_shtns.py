@@ -19,15 +19,7 @@ import shtns
 
 from .precision import DTYPE, CDTYPE, DEVICE
 from .params import l_max, lm_max, n_theta_max, n_phi_max, n_m_max, minc, radial_chunk_size
-from .horizontal_data import _grid_idx, n_theta_cal2ord, dLh, sinTheta
-
-# Inverse dLh for spat_to_sphertor post-processing: 1/[l(l+1)], zero for l=0
-_inv_dLh = torch.zeros(lm_max, 1, dtype=CDTYPE, device=DEVICE)
-_inv_dLh[1:, 0] = 1.0 / dLh[1:].to(CDTYPE)
-
-# sin(theta) in sorted order for Robert form analysis conversion.
-# Robert form analysis expects v*sin(theta) as input; our code has raw v.
-_sin_theta_sorted_3d = sinTheta.to(DEVICE).reshape(1, -1, 1)  # (1, n_theta, 1)
+from .horizontal_data import _grid_idx, n_theta_cal2ord
 
 # --- SHTns initialization ---
 
@@ -199,8 +191,9 @@ def torpol_to_spat(Qlm: torch.Tensor, Slm: torch.Tensor, Tlm: torch.Tensor,
 def spat_to_sphertor(vt: torch.Tensor, vp: torch.Tensor, lcut: int = None):
     """Vector SHT: (vtheta, vphi) → spheroidal (S) and toroidal (T) via SHTns GPU.
 
-    SHTns handles 1/sin(theta) weighting internally — do NOT pre-multiply by O_sin_theta_E2.
-    SHTns does NOT divide by l(l+1) — we apply _inv_dLh after.
+    Our spatial fields are already in Robert form (v*sinθ) because our Plm
+    derivatives are sinθ*dP/dθ. SHTns with robert_form=1 expects this convention.
+    No sin(theta) correction needed. SHTns divides by l(l+1) internally.
     """
     batched = vt.dim() == 3
     if not batched:
@@ -209,12 +202,11 @@ def spat_to_sphertor(vt: torch.Tensor, vp: torch.Tensor, lcut: int = None):
     n_batch = vt.shape[0]
 
     sh = _get_config(n_batch)
-    # Robert form: SHTns expects v*sin(theta) as input for vector analysis.
-    # Our input is raw v → multiply by sin(theta) in sorted order before SHTns.
-    vt_sorted = vt[:, n_theta_cal2ord, :]  # interleaved → sorted
-    vp_sorted = vp[:, n_theta_cal2ord, :]
-    vt_shtns = (vt_sorted * _sin_theta_sorted_3d).transpose(-1, -2).contiguous()
-    vp_shtns = (vp_sorted * _sin_theta_sorted_3d).transpose(-1, -2).contiguous()
+    # Our spatial fields are already in Robert form (v*sinθ) because our Plm
+    # derivatives are sinθ*dP/dθ. SHTns with robert_form=1 expects v*sinθ.
+    # No sin(theta) correction needed — just convert layout.
+    vt_shtns = _spat_to_shtns(vt)
+    vp_shtns = _spat_to_shtns(vp)
     slm_gpu = torch.empty(n_batch, lm_max, dtype=CDTYPE, device=DEVICE)
     tlm_gpu = torch.empty_like(slm_gpu)
 
