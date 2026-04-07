@@ -1,4 +1,4 @@
-"""SHTns GPU backend for spherical harmonic transforms. [v3 no-robert-form]
+"""SHTns GPU backend for spherical harmonic transforms. [v4 no-robert-no-sin]
 
 Drop-in replacements for the 4 hot-path SHT functions in sht.py.
 Uses SHTns's JIT-compiled CUDA kernels with on-the-fly Legendre recurrence.
