@@ -19,7 +19,7 @@ GPU_TYPE = os.environ.get("MAGIC_MODAL_GPU", "H100")
 
 app = modal.App("magic-torch")
 
-SHTNS_SRC = os.path.join(os.path.dirname(__file__), "..", "master")
+SHTNS_SRC = os.path.join(os.path.dirname(__file__), "..", "..", "master")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
