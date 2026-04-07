@@ -13,7 +13,7 @@ import os
 import modal
 
 GPU_TYPE = os.environ.get("MAGIC_MODAL_GPU", "H100")
-SHTNS_SRC = os.path.join(os.path.dirname(__file__), "..", "..", "master")
+SHTNS_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "master")
 
 app = modal.App("sht-shtns-test")
 
@@ -23,7 +23,7 @@ image = (
     .pip_install("torch", "numpy")
     .add_local_dir(SHTNS_SRC, remote_path="/root/shtns_src", copy=True)
     .run_commands("cd /root/shtns_src && CC=gcc CUDA_PATH=/usr/local/cuda pip install .")
-    .add_local_dir(os.path.join(os.path.dirname(__file__), "..", "src"),
+    .add_local_dir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"),
                    remote_path="/root/src")
 )
 
