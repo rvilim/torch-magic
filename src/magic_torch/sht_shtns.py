@@ -226,9 +226,7 @@ def spat_to_sphertor(vt: torch.Tensor, vp: torch.Tensor, lcut: int = None):
     Slm = _spec_from_shtns(slm_gpu, n_batch)
     Tlm = _spec_from_shtns(tlm_gpu, n_batch)
 
-    # SHTns does NOT divide by l(l+1) — apply manually
-    Slm = Slm * _inv_dLh
-    Tlm = Tlm * _inv_dLh
+    # SHTns DOES divide by l(l+1) internally (ish2sphtor_kernel) — do NOT apply again
 
     if not batched:
         Slm = Slm.squeeze(1)
