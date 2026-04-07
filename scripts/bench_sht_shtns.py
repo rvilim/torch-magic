@@ -20,7 +20,12 @@ image = (
     .apt_install("libfftw3-dev", "build-essential", "autoconf", "libtool")
     .pip_install("torch", "numpy")
     .run_commands(
-        "CUDA_PATH=/usr/local/cuda pip install shtns",
+        # Find CUDA installation path in the container
+        "CUDA_PATH=$(dirname $(dirname $(which nvcc))) && "
+        "echo \"CUDA_PATH=$CUDA_PATH\" && "
+        "ls $CUDA_PATH/lib64/libcudart* 2>/dev/null || ls $CUDA_PATH/lib/libcudart* 2>/dev/null || "
+        "find / -name 'libcudart.so*' 2>/dev/null | head -5 && "
+        "CUDA_PATH=$CUDA_PATH pip install shtns",
     )
     .add_local_dir("src", remote_path="/root/src")
 )
