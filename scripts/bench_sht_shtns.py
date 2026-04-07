@@ -19,7 +19,7 @@ SHTNS_SRC = "/Users/rvilim/dynamo/master"
 
 image = (
     # Use CUDA base image so nvcc and CUDA libs are available at build time
-    modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.12")
+    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .apt_install("libfftw3-dev", "build-essential", "autoconf", "libtool")
     .pip_install("torch", "numpy")
     # Upload full SHTns source (includes GPU kernel generators)
