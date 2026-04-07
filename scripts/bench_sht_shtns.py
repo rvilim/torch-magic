@@ -267,7 +267,7 @@ def run_batch_sweep(lmax: int, batch_sizes: list):
 def main(lmax: int = 128, n_batch: int = 32, sweep: bool = False):
     if sweep:
         print(f"Launching SHTns batch sweep: l_max={lmax}, GPU={GPU_TYPE}")
-        run_batch_sweep.remote(lmax, [1, 4, 16, 32, 64, 128, 256, 512])
+        run_batch_sweep.remote(lmax, [1, 4, 16, 32, 64, 128, 256, 512, 769, 1024])
     else:
         print(f"Launching SHTns benchmark: l_max={lmax}, n_batch={n_batch}, GPU={GPU_TYPE}")
         run_benchmark.remote(lmax, n_batch)
