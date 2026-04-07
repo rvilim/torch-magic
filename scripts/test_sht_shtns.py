@@ -113,6 +113,21 @@ def run_tests(lmax: int):
     if ok: n_pass += 1
     else: n_fail += 1
     print(f"  {status}: roundtrip error: {err:.2e}")
+    if not ok:
+        # Diagnostic: check if it's a constant factor
+        mask = Slm.abs() > Slm.abs().max() * 0.01
+        if mask.sum() > 0:
+            ratio = (Slm_back[mask] / Slm[mask]).abs()
+            print(f"    ratio (back/orig): mean={ratio.mean():.6f}, std={ratio.std():.6f}")
+        # Also try bmm roundtrip for comparison
+        grid_bmm = bmm_scal_to_spat(Slm)
+        Slm_back_bmm = bmm_scal_to_SH(grid_bmm)
+        err_bmm = (Slm - Slm_back_bmm).abs().max().item()
+        print(f"    bmm roundtrip error: {err_bmm:.2e}")
+        # And cross: shtns synthesis → bmm analysis
+        Slm_cross = bmm_scal_to_SH(grid)
+        err_cross = (Slm - Slm_cross).abs().max().item()
+        print(f"    cross (shtns synth → bmm anal): {err_cross:.2e}")
 
     # === Test 4: torpol_to_spat ===
     print("\n--- torpol_to_spat ---")
