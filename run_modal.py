@@ -19,9 +19,18 @@ GPU_TYPE = os.environ.get("MAGIC_MODAL_GPU", "H100")
 
 app = modal.App("magic-torch")
 
+SHTNS_SRC = os.path.join(os.path.dirname(__file__), "..", "master")
+
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
+    .apt_install("libfftw3-dev", "build-essential")
     .pip_install("torch", "numpy", "pyyaml", "tensorboard")
+    .add_local_dir(SHTNS_SRC, remote_path="/root/shtns_src", copy=True)
+    .run_commands(
+        # Build SHTns with CUDA support (optional — simulation works without it)
+        "cd /root/shtns_src && CC=gcc CUDA_PATH=/usr/local/cuda pip install . || "
+        "echo 'WARNING: SHTns build failed, GPU SHT will use bmm fallback'",
+    )
     .add_local_dir("src", remote_path="/root/src")
 )
 
@@ -96,6 +105,7 @@ def run_remote(cfg: dict, run_name: str):
         "radial_chunk_size": "MAGIC_RADIAL_CHUNK",
         "profile": "MAGIC_PROFILE",
         "polar_opt": "MAGIC_POLAR_OPT",
+        "use_shtns": "MAGIC_USE_SHTNS",
     }
     for key, env_var in _CFG_TO_ENV.items():
         if key in cfg:

@@ -113,6 +113,7 @@ intfac = _cfg_float("intfac", "MAGIC_INTFAC", 1e3)
 radial_chunk_size = _cfg_int("radial_chunk_size", "MAGIC_RADIAL_CHUNK", 0)
 l_profile = _cfg_bool("profile", "MAGIC_PROFILE", False)
 l_polar_opt = _cfg_bool("polar_opt", "MAGIC_POLAR_OPT", True)
+use_shtns = _cfg_bool("use_shtns", "MAGIC_USE_SHTNS", True)
 
 # --- Time scheme ---
 time_scheme = _cfg_str("time_scheme", "MAGIC_TIME_SCHEME", "CNAB2")

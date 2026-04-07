@@ -28,6 +28,18 @@ from . import dt_fields
 from .sht import (scal_to_spat, scal_to_SH, torpol_to_spat,
                   torpol_to_curl_spat, spat_to_sphertor,
                   pol_to_grad_spat, pol_to_curlr_spat, torpol_to_dphspat)
+
+# SHTns GPU backend: shadow the 4 hot-path SHT functions when available + CUDA
+from .params import use_shtns as _cfg_use_shtns
+_use_shtns = False
+if _cfg_use_shtns and DEVICE.type == "cuda":
+    try:
+        from .sht_shtns import (scal_to_spat, scal_to_SH,  # noqa: F811
+                                 torpol_to_spat, spat_to_sphertor)  # noqa: F811
+        _use_shtns = True
+    except ImportError:
+        pass  # SHTns not available, keep bmm
+
 from .get_nl import get_nl
 from .get_td import get_dwdt, get_dwdt_double_curl, get_dzdt, get_dpdt, get_dsdt, get_dbdt
 from .update_s import (build_s_matrices, finish_exp_entropy, updateS)
