@@ -46,6 +46,18 @@ def run_benchmark(lmax: int, n_batch: int):
 
     sh = shtns.sht(lmax, lmax, mres=1, norm=shtns.sht_orthonormal | shtns.SHT_NO_CS_PHASE)
 
+    # Get our grid sizes for matching
+    os.environ["MAGIC_LMAX"] = str(lmax)
+    os.environ["MAGIC_DEVICE"] = "cuda"
+    sys.path.insert(0, "/root/src")
+    t0 = time.perf_counter()
+    from magic_torch.params import lm_max, n_r_max, n_m_max, n_theta_max, n_phi_max
+    from magic_torch.precision import CDTYPE, DTYPE, DEVICE
+    import torch
+    t_import = time.perf_counter() - t0
+    print(f"magic_torch import: {t_import:.1f}s")
+    print(f"lm_max={lm_max}, n_theta={n_theta_max}, n_phi={n_phi_max}")
+
     # Try to set batching via ctypes
     batched = False
     try:
@@ -55,7 +67,6 @@ def run_benchmark(lmax: int, n_batch: int):
         lib = ctypes.CDLL(lib_path)
         lib.shtns_set_many.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
         lib.shtns_set_many.restype = ctypes.c_int
-        # Extract the internal shtns_cfg pointer from SWIG object
         cfg_ptr = ctypes.c_void_p(int(sh.this))
         ret = lib.shtns_set_many(cfg_ptr, n_batch, sh.nlm)
         if ret > 0:
@@ -66,29 +77,21 @@ def run_benchmark(lmax: int, n_batch: int):
     except Exception as e:
         print(f"Cannot set batching: {e}")
 
-    # Set grid with GPU
+    # Set grid with GPU — use OUR grid sizes to match
     try:
-        sh.set_grid(flags=shtns.SHT_ALLOW_GPU | shtns.SHT_THETA_CONTIGUOUS)
+        sh.set_grid(nlat=n_theta_max, nphi=n_phi_max,
+                     flags=shtns.SHT_ALLOW_GPU | shtns.SHT_THETA_CONTIGUOUS)
         print(f"Grid: nlat={sh.nlat}, nphi={sh.nphi}, nlm={sh.nlm}, spat_shape={sh.spat_shape}")
         sh.print_info()
         gpu_ok = True
     except Exception as e:
         print(f"GPU grid setup failed: {e}, falling back to CPU")
-        sh.set_grid(flags=shtns.SHT_THETA_CONTIGUOUS)
+        sh.set_grid(nlat=n_theta_max, nphi=n_phi_max,
+                     flags=shtns.SHT_THETA_CONTIGUOUS)
         gpu_ok = False
 
     # --- Our bmm SHT setup ---
-    os.environ["MAGIC_LMAX"] = str(lmax)
-    os.environ["MAGIC_DEVICE"] = "cuda"
-    sys.path.insert(0, "/root/src")
-    t0 = time.perf_counter()
     from magic_torch.sht import scal_to_spat, torpol_to_spat
-    from magic_torch.params import lm_max, n_m_max, n_theta_max, n_phi_max
-    from magic_torch.precision import CDTYPE, DTYPE, DEVICE
-    import torch
-    t_import = time.perf_counter() - t0
-    print(f"\nmagic_torch import: {t_import:.1f}s")
-    print(f"lm_max={lm_max}, n_theta={n_theta_max}, n_phi={n_phi_max}")
 
     # --- Create test data ---
     torch.manual_seed(42)
