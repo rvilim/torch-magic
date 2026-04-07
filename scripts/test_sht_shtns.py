@@ -123,6 +123,15 @@ def run_tests(lmax: int):
         ref = bmm_torpol_to_spat(Q, S, T)
         out = shtns_torpol_to_spat(Q, S, T)
         check(f"torpol_to_spat(nb={nb})", ref, out)
+        if nb == 1:
+            # Diagnostic: check if angular components are related by a simple factor
+            for comp, name in [(1, "bt"), (2, "bp")]:
+                r = ref[comp].flatten()
+                o = out[comp].flatten()
+                mask = r.abs() > r.abs().max() * 0.01
+                if mask.sum() > 0:
+                    ratio = (o[mask] / r[mask])
+                    print(f"    {name} ratio (shtns/bmm) mean={ratio.mean():.4f} std={ratio.std():.4f}")
 
     # === Test 5: spat_to_sphertor ===
     print("\n--- spat_to_sphertor ---")
@@ -137,7 +146,40 @@ def run_tests(lmax: int):
         out = shtns_spat_to_sphertor(btc, bpc)
         check(f"spat_to_sphertor(nb={nb})", ref, out)
 
-    # === Test 6: Y_1^0 theta ordering verification ===
+    # === Test 6: Direct SHTns sphtor synthesis vs bmm ===
+    print("\n--- sphtor synthesis diagnostic ---")
+    from magic_torch.sht import sphtor_to_spat as bmm_sphtor_to_spat
+    S_test = rand_spec(1).squeeze(1)
+    T_test = rand_spec(1).squeeze(1)
+    # bmm sphtor_to_spat
+    vt_bmm, vp_bmm = bmm_sphtor_to_spat(S_test, T_test)
+    # SHTns: use cu_SHsphtor_to_spat directly
+    sh_diag = shtns_scal_to_spat  # just to get a config
+    sh1 = shtns_torpol_to_spat  # trigger config creation
+    from magic_torch.sht_shtns import _get_config, _spat_from_shtns, _spec_to_shtns, _inv_sin_theta_sorted, _grid_idx
+    sh_cfg = _get_config(1)
+    s_gpu = _spec_to_shtns(S_test.unsqueeze(1))
+    t_gpu = _spec_to_shtns(T_test.unsqueeze(1))
+    vt_out = torch.empty(1, sh_cfg.nphi, sh_cfg.nlat, dtype=DTYPE, device=DEVICE)
+    vp_out = torch.empty_like(vt_out)
+    torch.cuda.synchronize()
+    sh_cfg.cu_SHsphtor_to_spat(s_gpu.data_ptr(), t_gpu.data_ptr(),
+                                 vt_out.data_ptr(), vp_out.data_ptr())
+    torch.cuda.synchronize()
+    # Raw SHTns output (sorted, Robert form = *sin(theta))
+    vt_sorted = vt_out.transpose(-1, -2)  # (1, n_theta_sorted, n_phi)
+    # Try with and without sin(theta) correction
+    vt_raw = vt_sorted[0, _grid_idx, :]
+    vt_div = (vt_sorted * _inv_sin_theta_sorted)[0, _grid_idx, :]
+    err_raw = (vt_raw - vt_bmm).abs().max().item()
+    err_div = (vt_div - vt_bmm).abs().max().item()
+    print(f"  vt raw (no sin correction): err={err_raw:.2e}")
+    print(f"  vt / sin(theta): err={err_div:.2e}")
+    print(f"  vt bmm range: [{vt_bmm.min():.2e}, {vt_bmm.max():.2e}]")
+    print(f"  vt shtns raw range: [{vt_raw.min():.2e}, {vt_raw.max():.2e}]")
+    print(f"  vt shtns/sin range: [{vt_div.min():.2e}, {vt_div.max():.2e}]")
+
+    # === Test 7: Y_1^0 theta ordering verification ===
     print("\n--- Y_1^0 theta ordering ---")
     Slm_y10 = torch.zeros(lm_max, dtype=CDTYPE, device=DEVICE)
     Slm_y10[1] = 1.0  # l=1, m=0
