@@ -27,9 +27,7 @@ image = (
     .pip_install("torch", "numpy", "pyyaml", "tensorboard")
     .add_local_dir(SHTNS_SRC, remote_path="/root/shtns_src", copy=True)
     .run_commands(
-        # Build SHTns with CUDA support (optional — simulation works without it)
-        "cd /root/shtns_src && CC=gcc CUDA_PATH=/usr/local/cuda pip install . || "
-        "echo 'WARNING: SHTns build failed, GPU SHT will use bmm fallback'",
+        "cd /root/shtns_src && CC=gcc CUDA_PATH=/usr/local/cuda pip install .",
     )
     .add_local_dir("src", remote_path="/root/src")
 )
